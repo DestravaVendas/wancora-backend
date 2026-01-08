@@ -7,18 +7,24 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const sessions = new Map();
 
 export const startSession = async (sessionId, companyId) => {
-  if (sessions.has(sessionId)) return sessions.get(sessionId);
+  console.log(`[CONTROLLER] Iniciando sessão para ${sessionId} (Empresa: ${companyId})`);
 
+  if (sessions.has(sessionId)) {
+      console.log("[CONTROLLER] Sessão já existe em memória.");
+      return sessions.get(sessionId);
+  }
+
+  // Carrega o Auth
+  console.log("[CONTROLLER] Carregando estado de autenticação...");
   const { state, saveCreds } = await useSupabaseAuthState(sessionId);
   
-  // 🔥 CORREÇÃO AQUI: Removemos o ".default"
-  // Antes: makeWASocket.default({...})
-  // Agora: makeWASocket({...})
+  console.log("[CONTROLLER] Criando Socket do Baileys...");
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false,
-    logger: pino({ level: "silent" }),
+    printQRInTerminal: true, // Útil para ver no log do Render também
+    logger: pino({ level: "info" }), // ATENÇÃO: Mudado de silent para info para DEBUG
     browser: ["Wancora CRM", "Chrome", "1.0.0"],
+    connectTimeoutMs: 60000, // Aumentando timeout
   });
 
   sessions.set(sessionId, sock);
@@ -27,19 +33,23 @@ export const startSession = async (sessionId, companyId) => {
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
+    
+    console.log(`[CONNECTION UPDATE] Status: ${connection || 'mudando'} | QR: ${!!qr}`);
 
     if (qr) {
-      // Atualiza o QR Code no banco
-      await supabase.from("instances").upsert({ 
+      console.log("[DB] Salvando QR Code no Supabase...");
+      const { error } = await supabase.from("instances").upsert({ 
         session_id: sessionId, 
         qrcode_url: qr, 
         status: "qrcode",
         company_id: companyId 
       });
+      if (error) console.error("[DB ERROR] Erro ao salvar QR:", error.message);
     }
 
     if (connection === "close") {
       const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log(`[CONNECTION CLOSE] Desconectado. Reconectar? ${shouldReconnect}`);
       
       await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
       
@@ -51,6 +61,7 @@ export const startSession = async (sessionId, companyId) => {
     }
 
     if (connection === "open") {
+      console.log("[CONNECTION OPEN] Conectado com sucesso!");
       await supabase.from("instances").update({ 
         status: "connected", 
         qrcode_url: null 
@@ -59,6 +70,7 @@ export const startSession = async (sessionId, companyId) => {
   });
 
   sock.ev.on("messages.upsert", async ({ messages }) => {
+    // Mantive a lógica de mensagens igual, pois ela não impede a conexão
     const msg = messages[0];
     if (!msg.message || msg.key.fromMe) return;
 
@@ -68,7 +80,7 @@ export const startSession = async (sessionId, companyId) => {
 
     if (!messageContent) return; 
 
-    // 1. Lead Capture Logic (Busca o Lead)
+    // Lead Capture Logic
     let { data: lead } = await supabase
       .from("leads")
       .select("id")
@@ -76,20 +88,17 @@ export const startSession = async (sessionId, companyId) => {
       .eq("company_id", companyId)
       .single();
 
-    // 2. Se não existir, Cria e Recupera o ID (UUID)
     if (!lead) {
-      const { data: newLead, error } = await supabase.from("leads").insert({
+      const { data: newLead } = await supabase.from("leads").insert({
         phone,
         name: msg.pushName || "Novo Contato",
         company_id: companyId,
         lead_score: 0,
         tags: ["novo"]
       }).select("id").single();
-      
       if (newLead) lead = newLead;
     }
 
-    // 3. Salva Mensagem (Usando o UUID correto)
     if (lead) {
         await supabase.from("messages").insert({
         company_id: companyId,
@@ -108,7 +117,6 @@ export const startSession = async (sessionId, companyId) => {
 export const sendMessage = async (sessionId, to, text) => {
   const sock = sessions.get(sessionId);
   if (!sock) throw new Error("Sessão não ativa");
-  
   const jid = `${to}@s.whatsapp.net`;
   return await sock.sendMessage(jid, { text });
 };
