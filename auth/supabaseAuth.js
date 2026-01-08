@@ -4,18 +4,13 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-// Validação de segurança
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
-    console.error("❌ ERRO FATAL: SUPABASE_URL ou SUPABASE_KEY não definidos no .env");
-    process.exit(1);
-}
-
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 export const useSupabaseAuthState = async (sessionId) => {
   // Função auxiliar para escrever dados no banco
   const writeData = async (data, type, id) => {
     try {
+        // Serializa o buffer para JSON antes de salvar
         const payload = JSON.parse(JSON.stringify(data, BufferJSON.replacer));
         
         const { error } = await supabase.from("baileys_auth_state").upsert({
@@ -26,9 +21,11 @@ export const useSupabaseAuthState = async (sessionId) => {
           updated_at: new Date()
         }, { onConflict: 'session_id, data_type, key_id' });
 
-        if (error) console.error(`Erro ao salvar auth (${type}):`, error.message);
+        if (error) {
+            console.error(`[AUTH ERROR] Falha ao salvar ${type}:`, error.message);
+        }
     } catch (e) {
-        console.error("Erro no writeData:", e);
+        console.error("[AUTH CRITICAL] Erro no writeData:", e);
     }
   };
 
@@ -44,8 +41,10 @@ export const useSupabaseAuthState = async (sessionId) => {
           .single();
 
         if (error || !data) return null;
+        // Reconverte o JSON para Buffer
         return JSON.parse(JSON.stringify(data.payload), BufferJSON.reviver);
     } catch (e) {
+        console.error("[AUTH READ ERROR]", e);
         return null;
     }
   };
@@ -59,12 +58,12 @@ export const useSupabaseAuthState = async (sessionId) => {
           .eq("data_type", type)
           .eq("key_id", id);
     } catch (e) {
-        console.error("Erro ao remover auth:", e);
+        console.error("[AUTH REMOVE ERROR]", e);
     }
   };
 
-  // 🔥 CORREÇÃO PRINCIPAL AQUI:
-  // Em vez de gerar chaves na mão com Curve.generate..., usamos initAuthCreds()
+  // Inicializa as credenciais (Se não existir no banco, cria novas)
+  console.log(`[AUTH] Carregando credenciais para sessão: ${sessionId}`);
   const creds = await readData("creds", "main") || initAuthCreds();
 
   return {
