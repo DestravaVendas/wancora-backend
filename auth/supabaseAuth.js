@@ -1,59 +1,71 @@
-import { BufferJSON, Curve, proto } from "@whiskeysockets/baileys";
+import { BufferJSON, initAuthCreds, proto } from "@whiskeysockets/baileys";
 import { createClient } from "@supabase/supabase-js";
-import { randomBytes } from "crypto"; // Importação correta do crypto
 import dotenv from "dotenv";
 
 dotenv.config();
 
+// Validação de segurança
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+    console.error("❌ ERRO FATAL: SUPABASE_URL ou SUPABASE_KEY não definidos no .env");
+    process.exit(1);
+}
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 export const useSupabaseAuthState = async (sessionId) => {
+  // Função auxiliar para escrever dados no banco
   const writeData = async (data, type, id) => {
-    const payload = JSON.parse(JSON.stringify(data, BufferJSON.replacer));
-    
-    await supabase.from("baileys_auth_state").upsert({
-      session_id: sessionId,
-      data_type: type,
-      key_id: id,
-      payload: payload,
-      updated_at: new Date()
-    }, { onConflict: 'session_id, data_type, key_id' });
+    try {
+        const payload = JSON.parse(JSON.stringify(data, BufferJSON.replacer));
+        
+        const { error } = await supabase.from("baileys_auth_state").upsert({
+          session_id: sessionId,
+          data_type: type,
+          key_id: id,
+          payload: payload,
+          updated_at: new Date()
+        }, { onConflict: 'session_id, data_type, key_id' });
+
+        if (error) console.error(`Erro ao salvar auth (${type}):`, error.message);
+    } catch (e) {
+        console.error("Erro no writeData:", e);
+    }
   };
 
+  // Função auxiliar para ler dados do banco
   const readData = async (type, id) => {
-    const { data, error } = await supabase
-      .from("baileys_auth_state")
-      .select("payload")
-      .eq("session_id", sessionId)
-      .eq("data_type", type)
-      .eq("key_id", id)
-      .single();
+    try {
+        const { data, error } = await supabase
+          .from("baileys_auth_state")
+          .select("payload")
+          .eq("session_id", sessionId)
+          .eq("data_type", type)
+          .eq("key_id", id)
+          .single();
 
-    if (error || !data) return null;
-    return JSON.parse(JSON.stringify(data.payload), BufferJSON.reviver);
+        if (error || !data) return null;
+        return JSON.parse(JSON.stringify(data.payload), BufferJSON.reviver);
+    } catch (e) {
+        return null;
+    }
   };
 
   const removeData = async (type, id) => {
-    await supabase
-      .from("baileys_auth_state")
-      .delete()
-      .eq("session_id", sessionId)
-      .eq("data_type", type)
-      .eq("key_id", id);
+    try {
+        await supabase
+          .from("baileys_auth_state")
+          .delete()
+          .eq("session_id", sessionId)
+          .eq("data_type", type)
+          .eq("key_id", id);
+    } catch (e) {
+        console.error("Erro ao remover auth:", e);
+    }
   };
 
-  // Carregar credenciais iniciais
-  // CORREÇÃO: Usando os imports do topo em vez de require()
-  const creds = await readData("creds", "main") || {
-    noiseKey: Curve.generateKeyPair(),
-    signedIdentityKey: Curve.generateKeyPair(),
-    signedPreKey: Curve.generatePreKey(Curve.generateKeyPair().private, 1),
-    registrationId: Math.floor(Math.random() * 16383),
-    advSecretKey: randomBytes(32).toString('base64'),
-    nextPreKeyId: 1,
-    firstUnuploadedPreKeyId: 1,
-    accountSettings: { unarchiveChats: false }
-  };
+  // 🔥 CORREÇÃO PRINCIPAL AQUI:
+  // Em vez de gerar chaves na mão com Curve.generate..., usamos initAuthCreds()
+  const creds = await readData("creds", "main") || initAuthCreds();
 
   return {
     state: {
