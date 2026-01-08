@@ -5,18 +5,28 @@ import { createClient } from "@supabase/supabase-js";
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// Rota para Iniciar Sessão
 router.post("/session/start", async (req, res) => {
   const { sessionId, companyId } = req.body;
+  console.log(`[ROUTE] Recebido pedido de start: Session ${sessionId}, Company ${companyId}`);
+  
+  if (!sessionId || !companyId) {
+      return res.status(400).json({ error: "sessionId e companyId são obrigatórios" });
+  }
+
   try {
-    await whatsappController.startSession(sessionId, companyId);
+    // Não usamos 'await' aqui de propósito para não travar a resposta HTTP
+    // Mas chamamos a função para iniciar o processo em background
+    whatsappController.startSession(sessionId, companyId).catch(err => {
+        console.error("[BACKGROUND ERROR] Erro fatal no controller:", err);
+    });
+    
     res.status(200).json({ message: "Iniciando sessão..." });
   } catch (error) {
+    console.error("[ROUTE ERROR]", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Rota para Status/QR Code
 router.get("/session/status/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const { data, error } = await supabase
@@ -29,35 +39,28 @@ router.get("/session/status/:sessionId", async (req, res) => {
   res.json(data);
 });
 
-// Rota para Enviar Mensagem (CORRIGIDA)
 router.post("/message/send", async (req, res) => {
   const { sessionId, to, text, companyId } = req.body;
   try {
-    // 1. Envia via WhatsApp (Baileys)
     await whatsappController.sendMessage(sessionId, to, text);
     
-    // 2. Busca o ID do Lead para salvar no banco corretamente
-    // (Se o lead não existir, a gente ignora o log ou cria um 'ghost lead'. 
-    // Por segurança, vamos buscar apenas.)
+    // Log Opcional (Ghost Lead check)
     const { data: lead } = await supabase
       .from("leads")
       .select("id")
-      .eq("phone", to) // 'to' é o número
+      .eq("phone", to) 
       .eq("company_id", companyId)
       .single();
 
     if (lead) {
-      // 3. Salva no histórico com o UUID correto
       await supabase.from("messages").insert({
         company_id: companyId,
-        lead_id: lead.id, // <--- CORREÇÃO: Usando UUID
+        lead_id: lead.id,
         direction: "outbound",
         type: "text",
         content: text,
         status: "sent"
       });
-    } else {
-        console.warn(`Mensagem enviada para ${to}, mas lead não encontrado no banco para salvar histórico.`);
     }
 
     res.json({ success: true });
