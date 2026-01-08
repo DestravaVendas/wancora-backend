@@ -36,13 +36,14 @@ export const startSession = async (sessionId, companyId) => {
     
     console.log(`[CONNECTION UPDATE] Status: ${connection || 'mudando'} | QR: ${!!qr}`);
 
-    if (qr) {
+   if (qr) {
       console.log("[DB] Salvando QR Code no Supabase...");
       const { error } = await supabase.from("instances").upsert({ 
         session_id: sessionId, 
         qrcode_url: qr, 
         status: "qrcode",
-        company_id: companyId 
+        company_id: companyId,
+        name: "WhatsApp Principal" // 🔥 CORREÇÃO: Dando um nome para satisfazer o banco
       });
       if (error) console.error("[DB ERROR] Erro ao salvar QR:", error.message);
     }
