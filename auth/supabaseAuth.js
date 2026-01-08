@@ -1,5 +1,6 @@
-import { BufferJSON } from "@whiskeysockets/baileys";
+import { BufferJSON, Curve, proto } from "@whiskeysockets/baileys";
 import { createClient } from "@supabase/supabase-js";
+import { randomBytes } from "crypto"; // Importação correta do crypto
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -42,14 +43,13 @@ export const useSupabaseAuthState = async (sessionId) => {
   };
 
   // Carregar credenciais iniciais
+  // CORREÇÃO: Usando os imports do topo em vez de require()
   const creds = await readData("creds", "main") || {
-    noiseKey: require("@whiskeysockets/baileys").Curve.generateKeyPair(),
-    signedIdentityKey: require("@whiskeysockets/baileys").Curve.generateKeyPair(),
-    signedPreKey: require("@whiskeysockets/baileys").Curve.generatePreKey(
-      require("@whiskeysockets/baileys").Curve.generateKeyPair().private, 1
-    ),
+    noiseKey: Curve.generateKeyPair(),
+    signedIdentityKey: Curve.generateKeyPair(),
+    signedPreKey: Curve.generatePreKey(Curve.generateKeyPair().private, 1),
     registrationId: Math.floor(Math.random() * 16383),
-    advSecretKey: require("crypto").randomBytes(32).toString('base64'),
+    advSecretKey: randomBytes(32).toString('base64'),
     nextPreKeyId: 1,
     firstUnuploadedPreKeyId: 1,
     accountSettings: { unarchiveChats: false }
@@ -64,7 +64,7 @@ export const useSupabaseAuthState = async (sessionId) => {
           await Promise.all(ids.map(async (id) => {
             let value = await readData(type, id);
             if (type === "app-state-sync-key" && value) {
-              value = require("@whiskeysockets/baileys").proto.Message.AppStateSyncKeyData.fromObject(value);
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
             }
             res[id] = value;
           }));
