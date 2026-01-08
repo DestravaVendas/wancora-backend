@@ -11,7 +11,10 @@ export const startSession = async (sessionId, companyId) => {
 
   const { state, saveCreds } = await useSupabaseAuthState(sessionId);
   
-  const sock = makeWASocket.default({
+  // 🔥 CORREÇÃO AQUI: Removemos o ".default"
+  // Antes: makeWASocket.default({...})
+  // Agora: makeWASocket({...})
+  const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
     logger: pino({ level: "silent" }),
@@ -26,6 +29,7 @@ export const startSession = async (sessionId, companyId) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      // Atualiza o QR Code no banco
       await supabase.from("instances").upsert({ 
         session_id: sessionId, 
         qrcode_url: qr, 
@@ -36,8 +40,14 @@ export const startSession = async (sessionId, companyId) => {
 
     if (connection === "close") {
       const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+      
       await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
-      if (shouldReconnect) startSession(sessionId, companyId);
+      
+      if (shouldReconnect) {
+          startSession(sessionId, companyId);
+      } else {
+          sessions.delete(sessionId);
+      }
     }
 
     if (connection === "open") {
@@ -56,9 +66,9 @@ export const startSession = async (sessionId, companyId) => {
     const phone = remoteJid.replace("@s.whatsapp.net", "");
     const messageContent = msg.message.conversation || msg.message.extendedTextMessage?.text;
 
-    if (!messageContent) return; // Ignora status/presença
+    if (!messageContent) return; 
 
-    // 1. Lead Capture Logic (Tenta achar o Lead)
+    // 1. Lead Capture Logic (Busca o Lead)
     let { data: lead } = await supabase
       .from("leads")
       .select("id")
@@ -66,7 +76,7 @@ export const startSession = async (sessionId, companyId) => {
       .eq("company_id", companyId)
       .single();
 
-    // 2. Se não existir, Cria e Recupera o ID
+    // 2. Se não existir, Cria e Recupera o ID (UUID)
     if (!lead) {
       const { data: newLead, error } = await supabase.from("leads").insert({
         phone,
@@ -79,11 +89,11 @@ export const startSession = async (sessionId, companyId) => {
       if (newLead) lead = newLead;
     }
 
-    // 3. Save Message (Usando o UUID correto)
+    // 3. Salva Mensagem (Usando o UUID correto)
     if (lead) {
         await supabase.from("messages").insert({
         company_id: companyId,
-        lead_id: lead.id, // <--- CORREÇÃO AQUI (Era lead_phone)
+        lead_id: lead.id, 
         direction: "inbound",
         type: "text",
         content: messageContent,
