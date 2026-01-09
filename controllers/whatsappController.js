@@ -208,3 +208,21 @@ export const sendMessage = async (sessionId, to, text) => {
   const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
   return await sock.sendMessage(jid, { text });
 };
+
+// --- Adição para o Motor de Campanhas ---
+
+/**
+ * Retorna a instância do socket do WhatsApp ativa para uma empresa.
+ * Usado pelos Workers de fila.
+ * @param {string} companyId - ID da empresa (ou sessionId dependendo da sua lógica atual)
+ */
+export const getSession = (companyId) => {
+    // SE O SEU CÓDIGO USA UM MAPA CHAMADO 'sessions':
+    if (global.sessions) {
+        return global.sessions.get(companyId);
+    }
+    
+    // SE O SEU CÓDIGO USA UMA VARIÁVEL LOCAL (NÃO RECOMENDADO PARA PROD, MAS COMUM EM MVP):
+    // Você precisará refatorar para usar 'global.sessions = new Map()' no topo do arquivo.
+    return null;
+};
