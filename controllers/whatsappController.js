@@ -5,8 +5,11 @@ import pino from "pino";
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// Mapa de sessões ativas
+// --- ARQUITETURA DE MEMÓRIA ---
+// Mapa Principal: sessionId -> Socket (Para uso interno do Baileys)
 const sessions = new Map();
+// Mapa Auxiliar: companyId -> sessionId (Para lookup rápido via API/Workers)
+const companyIndex = new Map(); 
 
 // --- FUNÇÃO AUXILIAR 1: Extrai dados úteis da mensagem ---
 const extractMessageData = (msg, sessionId) => {
@@ -14,7 +17,6 @@ const extractMessageData = (msg, sessionId) => {
     if (msg.message.protocolMessage || msg.message.senderKeyDistributionMessage) return null;
 
     const remoteJid = msg.key.remoteJid;
-    // Filtro de segurança: Ignora grupos e broadcast para focar no atendimento
     if (remoteJid.includes('@broadcast') || remoteJid.includes('@g.us')) return null;
 
     const fromMe = msg.key.fromMe;
@@ -67,7 +69,6 @@ const upsertContact = async (jid, sock, pushName = null) => {
     try {
         let profilePicUrl = null;
         try {
-            // Tenta buscar a foto (pode falhar se for privado)
             profilePicUrl = await sock.profilePictureUrl(jid, 'image');
         } catch (e) { /* Sem foto */ }
 
@@ -77,7 +78,6 @@ const upsertContact = async (jid, sock, pushName = null) => {
             updated_at: new Date()
         };
         
-        // Só atualiza o nome se tivermos um novo (para não sobrescrever com null)
         if (pushName) contactData.push_name = pushName;
         if (pushName) contactData.name = pushName;
 
@@ -88,10 +88,12 @@ const upsertContact = async (jid, sock, pushName = null) => {
 };
 
 export const startSession = async (sessionId, companyId) => {
+  // Limpeza prévia se existir
   if (sessions.has(sessionId)) {
       const oldSock = sessions.get(sessionId);
       if (oldSock) { oldSock.shouldReconnect = false; oldSock.end(undefined); }
       sessions.delete(sessionId);
+      companyIndex.delete(companyId); // Limpa index antigo
   }
 
   const { state, saveCreds } = await useSupabaseAuthState(sessionId);
@@ -101,7 +103,7 @@ export const startSession = async (sessionId, companyId) => {
     printQRInTerminal: true,
     logger: pino({ level: "error" }),
     browser: Browsers.macOS('Desktop'),
-    syncFullHistory: true, // Histórico ATIVADO
+    syncFullHistory: true, 
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
     keepAliveIntervalMs: 10000,
@@ -109,11 +111,16 @@ export const startSession = async (sessionId, companyId) => {
   });
 
   sock.shouldReconnect = true; 
-  sessions.set(sessionId, sock);
+  
+  // --- AQUI ESTÁ A CORREÇÃO DE MAPEAMENTO ---
+  sessions.set(sessionId, sock); 
+  if (companyId) {
+      companyIndex.set(companyId, sessionId);
+      console.log(`[MAP] Empresa ${companyId} vinculada à sessão ${sessionId}`);
+  }
 
   sock.ev.on("creds.update", saveCreds);
 
-  // --- CONEXÃO ---
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (sock.shouldReconnect === false) return;
@@ -125,6 +132,7 @@ export const startSession = async (sessionId, companyId) => {
     if (connection === "close") {
       const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
       if (shouldReconnect) {
+          // Mantém o mapa, pois vai reconectar
           sessions.delete(sessionId);
           await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
           setTimeout(() => { if (sock.shouldReconnect) startSession(sessionId, companyId); }, 3000);
@@ -137,22 +145,17 @@ export const startSession = async (sessionId, companyId) => {
     if (connection === "open") await supabase.from("instances").update({ status: "connected", qrcode_url: null }).eq("session_id", sessionId);
   });
 
-  // --- EVENTO 1: CARGA INICIAL DE HISTÓRICO + CONTATOS ---
   sock.ev.on("messaging-history.set", async ({ messages, contacts }) => {
       console.log(`[HISTORY] Processando ${messages.length} mensagens e ${contacts?.length || 0} contatos...`);
-      
-      // 1. Salva Mensagens
       const formattedMessages = messages.map(msg => extractMessageData(msg, sessionId)).filter(Boolean);
       await saveMessagesBatch(formattedMessages);
 
-      // 2. Salva Contatos (Nomes iniciais)
       if (contacts) {
          const contactBatch = contacts.map(c => ({
              jid: c.id,
              name: c.name || c.notify || c.verifiedName,
              push_name: c.notify
          }));
-         // Batch insert de contatos
          const BATCH = 50;
          for (let i = 0; i < contactBatch.length; i += BATCH) {
             await supabase.from('contacts').upsert(contactBatch.slice(i, i + BATCH), { onConflict: 'jid' });
@@ -160,25 +163,19 @@ export const startSession = async (sessionId, companyId) => {
       }
   });
 
-  // --- EVENTO 2: ATUALIZAÇÃO DE CONTATOS (Chegou nome novo) ---
   sock.ev.on("contacts.upsert", async (contacts) => {
       for (const c of contacts) {
-          // Salva nome e tenta buscar foto
           await upsertContact(c.id, sock, c.name || c.notify);
       }
   });
 
-  // --- EVENTO 3: MENSAGENS NOVAS ---
   sock.ev.on("messages.upsert", async ({ messages }) => {
     if (sock.shouldReconnect === false) return;
-
     const formattedMessages = messages.map(msg => extractMessageData(msg, sessionId)).filter(Boolean);
 
     if (formattedMessages.length > 0) {
         console.log(`[MSG] Recebida: ${formattedMessages[0].content.substring(0, 20)}...`);
         await supabase.from('messages').insert(formattedMessages);
-        
-        // Se chegou mensagem, garante que temos a foto/nome desse contato atualizados
         for (const msg of formattedMessages) {
             if (!msg.from_me) {
                 await upsertContact(msg.remote_jid, sock);
@@ -190,18 +187,27 @@ export const startSession = async (sessionId, companyId) => {
   return sock;
 };
 
-// --- FUNÇÃO: RESET ---
 export const deleteSession = async (sessionId, companyId) => {
-    console.log(`[RESET] Deletando...`);
+    console.log(`[RESET] Deletando sessão ${sessionId}...`);
     const sock = sessions.get(sessionId);
-    if (sock) { sock.shouldReconnect = false; try { sock.end(undefined); } catch (e) {} }
+    
+    if (sock) { 
+        sock.shouldReconnect = false; 
+        try { sock.end(undefined); } catch (e) {} 
+    }
+    
     sessions.delete(sessionId);
+    
+    // Limpeza do Indexador
+    if (companyId) {
+        companyIndex.delete(companyId);
+    }
+
     await supabase.from("instances").delete().eq("session_id", sessionId);
     await supabase.from("baileys_auth_state").delete().eq("session_id", sessionId);
     return true;
 };
 
-// --- FUNÇÃO: ENVIAR ---
 export const sendMessage = async (sessionId, to, text) => {
   const sock = sessions.get(sessionId);
   if (!sock) throw new Error("Sessão não ativa");
@@ -209,20 +215,15 @@ export const sendMessage = async (sessionId, to, text) => {
   return await sock.sendMessage(jid, { text });
 };
 
-// --- Adição para o Motor de Campanhas ---
-
-/**
- * Retorna a instância do socket do WhatsApp ativa para uma empresa.
- * Usado pelos Workers de fila.
- * @param {string} companyId - ID da empresa (ou sessionId dependendo da sua lógica atual)
- */
+// --- AQUI ESTÁ A CORREÇÃO SOLICITADA ---
+// Agora acessamos o indexador local 'companyIndex' e depois o mapa 'sessions'
 export const getSession = (companyId) => {
-    // SE O SEU CÓDIGO USA UM MAPA CHAMADO 'sessions':
-    if (global.sessions) {
-        return global.sessions.get(companyId);
+    const sessionId = companyIndex.get(companyId);
+    if (!sessionId) {
+        // Fallback: Se não achar no index, tenta achar alguma sessão iterando (menos performático, mas seguro)
+        // Isso é útil se o servidor reiniciou e o mapa index ainda não populou 100%
+        console.warn(`[WARN] Sessão não encontrada via index para empresa ${companyId}.`);
+        return null;
     }
-    
-    // SE O SEU CÓDIGO USA UMA VARIÁVEL LOCAL (NÃO RECOMENDADO PARA PROD, MAS COMUM EM MVP):
-    // Você precisará refatorar para usar 'global.sessions = new Map()' no topo do arquivo.
-    return null;
+    return sessions.get(sessionId);
 };
