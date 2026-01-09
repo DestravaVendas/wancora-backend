@@ -27,6 +27,17 @@ router.post("/session/start", async (req, res) => {
   }
 });
 
+router.post("/session/logout", async (req, res) => {
+  const { sessionId, companyId } = req.body;
+  try {
+    await whatsappController.deleteSession(sessionId, companyId);
+    res.json({ message: "Sessão desconectada e limpa com sucesso." });
+  } catch (error) {
+    console.error("Erro ao desconectar:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.get("/session/status/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const { data, error } = await supabase
