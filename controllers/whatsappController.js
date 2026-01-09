@@ -43,8 +43,9 @@ export const startSession = async (sessionId, companyId) => {
         qrcode_url: qr, 
         status: "qrcode",
         company_id: companyId,
-        name: "WhatsApp Principal" // 🔥 CORREÇÃO: Dando um nome para satisfazer o banco
-      });
+        name: "WhatsApp Principal"
+      }, { onConflict: 'session_id' }); // 🔥 AQUI ESTÁ A CORREÇÃO MÁGICA
+
       if (error) console.error("[DB ERROR] Erro ao salvar QR:", error.message);
     }
 
