@@ -17,12 +17,17 @@ export const startSession = async (sessionId, companyId) => {
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: true,
-    logger: pino({ level: "error" }), // Menos poluição, só erros graves
-    browser: Browsers.macOS('Desktop'), // Navegador mais estável que o Chrome genérico
-    syncFullHistory: false, // 🔥 IMPORTANTE: Não tenta baixar todo o histórico de uma vez (evita timeout)
-    connectTimeoutMs: 60000,
+    logger: pino({ level: "error" }),
+    browser: Browsers.macOS('Desktop'),
+    syncFullHistory: false, // Já estava, mantém.
+    // Aumenta tolerância para internet lenta do Render
+    connectTimeoutMs: 60000, 
+    defaultQueryTimeoutMs: 60000,
     keepAliveIntervalMs: 10000,
-    emitOwnEvents: false,
+    // Evita tentar re-enviar mensagens antigas que travam o boot
+    retryRequestDelayMs: 2000, 
+    // Configurações de Cache para agilizar
+    generateHighQualityLinkPreview: true,
   });
 
   sessions.set(sessionId, sock);
