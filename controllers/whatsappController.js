@@ -101,7 +101,7 @@ export const startSession = async (sessionId, companyId) => {
     }
   });
 
-// Listener de mensagens
+  // Listener de mensagens
   sock.ev.on("messages.upsert", async ({ messages }) => {
     if (sock.shouldReconnect === false) return;
 
@@ -128,6 +128,9 @@ export const startSession = async (sessionId, companyId) => {
         }
     }
   });
+
+  return sock;
+}; // <--- ESSA FOI A CHAVE QUE FALTOU NO SEU CÓDIGO ANTERIOR!
 
 // 🔥 FUNÇÃO DE RESET (KILL SWITCH)
 export const deleteSession = async (sessionId, companyId) => {
