@@ -101,14 +101,33 @@ export const startSession = async (sessionId, companyId) => {
     }
   });
 
-  // Listener de mensagens
+// Listener de mensagens
   sock.ev.on("messages.upsert", async ({ messages }) => {
-    if (sock.shouldReconnect === false) return; // Não processa msg se estiver morrendo
-    // ... (sua lógica de mensagens aqui) ...
-  });
+    if (sock.shouldReconnect === false) return;
 
-  return sock;
-};
+    for (const msg of messages) {
+        if (!msg.message) continue;
+
+        const remoteJid = msg.key.remoteJid;
+        const fromMe = msg.key.fromMe;
+        // Pega texto de diferentes tipos de msg (texto simples ou extended)
+        const content = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || "";
+
+        if (content) {
+            console.log(`[MSG] ${fromMe ? 'Eu' : 'Cliente'}: ${content}`);
+            
+            // 🔥 SALVA NO SUPABASE
+            await supabase.from('messages').insert({
+                session_id: sessionId,
+                remote_jid: remoteJid,
+                from_me: fromMe,
+                content: content,
+                message_type: 'text',
+                status: 'received'
+            });
+        }
+    }
+  });
 
 // 🔥 FUNÇÃO DE RESET (KILL SWITCH)
 export const deleteSession = async (sessionId, companyId) => {
