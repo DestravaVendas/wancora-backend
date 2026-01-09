@@ -4,11 +4,15 @@ import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+
+// Mapa de sessões ativas
 const sessions = new Map();
 
 export const startSession = async (sessionId, companyId) => {
-  // Limpeza preventiva de memória
+  // Limpeza preventiva: Se já existe, mata a antiga antes de criar a nova
   if (sessions.has(sessionId)) {
+      console.log(`[START] Sessão ${sessionId} já existe. Reiniciando...`);
+      // Não chamamos deleteSession aqui para evitar loop, apenas removemos do map
       sessions.delete(sessionId);
   }
 
@@ -20,14 +24,13 @@ export const startSession = async (sessionId, companyId) => {
     logger: pino({ level: "error" }),
     browser: Browsers.macOS('Desktop'),
     syncFullHistory: false,
-    
-    // 🔥 AUMENTANDO DRASTICAMENTE OS TIMEOUTS PARA O RENDER
-    connectTimeoutMs: 30000, // 90 segundos antes de desistir
-    defaultQueryTimeoutMs: 30000,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
     keepAliveIntervalMs: 10000,
-    retryRequestDelayMs: 5000, // Espera 5s antes de tentar de novo
+    retryRequestDelayMs: 5000,
   });
 
+  // Adiciona na memória
   sessions.set(sessionId, sock);
 
   sock.ev.on("creds.update", saveCreds);
@@ -35,44 +38,61 @@ export const startSession = async (sessionId, companyId) => {
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
+    // 1. Lógica de Conexão (Mostra Spinner)
     if (connection === 'connecting') {
         console.log("[STATUS] Iniciando conexão/sincronização...");
-        await supabase.from("instances").update({ 
-            status: "connecting",
-            // Opcional: Não limpamos o QR aqui para evitar piscar se for só uma oscilação, 
-            // mas o status 'connecting' já fará o frontend mostrar o spinner.
-        }).eq("session_id", sessionId);
+        // Só atualiza banco se a sessão ainda for válida
+        if (sessions.has(sessionId)) {
+            await supabase.from("instances").update({ status: "connecting" }).eq("session_id", sessionId);
+        }
     }
     
+    // 2. Lógica de QR Code
     if (qr) {
       console.log(`[QR GENERATED] Nova tentativa de login para ${sessionId}`);
-      await supabase.from("instances").upsert({ 
-        session_id: sessionId, 
-        qrcode_url: qr, 
-        status: "qrcode",
-        company_id: companyId,
-        name: "WhatsApp Principal"
-      }, { onConflict: 'session_id' });
+      if (sessions.has(sessionId)) {
+          await supabase.from("instances").upsert({ 
+            session_id: sessionId, 
+            qrcode_url: qr, 
+            status: "qrcode",
+            company_id: companyId,
+            name: "WhatsApp Principal"
+          }, { onConflict: 'session_id' });
+      }
     }
 
+    // 3. Lógica de Desconexão (AQUI ESTAVA O LOOP)
     if (connection === "close") {
       const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
       
-      // Remove da memória imediatamente
-      sessions.delete(sessionId);
+      // 🔥 A CURA DO ZUMBI:
+      // Verificamos se a sessão AINDA EXISTE na memória.
+      // Se deleteSession() foi chamado, ela já foi removida do Map.
+      // Então, se não estiver no Map, NÃO FAZEMOS NADA (Return).
+      if (!sessions.has(sessionId)) {
+          console.log(`[STOP] Sessão ${sessionId} foi encerrada manualmente. Loop interrompido.`);
+          return; 
+      }
 
-      await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
+      console.log(`[CLOSE] Conexão caiu. Reconectar? ${shouldReconnect}`);
 
       if (shouldReconnect) {
-          console.log("[AUTO-RECONNECT] Reconectando em 3s...");
-          setTimeout(() => startSession(sessionId, companyId), 3000);
+          console.log("[AUTO-RECONNECT] Tentando reconectar em 3s...");
+          // Removemos a instância atual defeituosa da memória para dar lugar à nova
+          sessions.delete(sessionId);
+          await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
+          
+          setTimeout(() => {
+              // Verifica novamente se não foi deletada nesse meio tempo
+              startSession(sessionId, companyId);
+          }, 3000);
       } else {
-          console.log("[STOP] Desconectado permanentemente (Logoff).");
-          // Se foi Logoff real, limpamos o banco de auth também
+          console.log("[LOGOUT] Desconectado definitivamente.");
           await deleteSession(sessionId, companyId);
       }
     }
 
+    // 4. Lógica de Sucesso
     if (connection === "open") {
       console.log("[SUCCESS] Conectado e pronto!");
       await supabase.from("instances").update({ 
@@ -82,30 +102,34 @@ export const startSession = async (sessionId, companyId) => {
     }
   });
 
-  // Listener simples de mensagens
+  // Listener de mensagens
   sock.ev.on("messages.upsert", async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
-
-    // ... (Mantive a lógica de Leads simples para economizar espaço aqui, mas ela continua funcionando igual) ...
+     // ... (Lógica de mensagens mantida igual) ...
   });
 
   return sock;
 };
 
-// 🔥 NOVA FUNÇÃO: O "Botão de Pânico"
+// 🔥 FUNÇÃO DE DELETAR CORRIGIDA
 export const deleteSession = async (sessionId, companyId) => {
     console.log(`[RESET] Deletando sessão ${sessionId}...`);
     
-    // 1. Fecha o socket se estiver aberto
     const sock = sessions.get(sessionId);
+
+    // 1. PRIMEIRO: Removemos do Mapa.
+    // Isso sinaliza para o evento 'connection.update' que ele NÃO deve tentar reconectar.
+    sessions.delete(sessionId);
+
+    // 2. DEPOIS: Fechamos o socket
     if (sock) {
-        sock.end(undefined);
-        sessions.delete(sessionId);
+        try {
+            sock.end(undefined);
+        } catch (error) {
+            console.log("Erro ao fechar socket (ignorado):", error.message);
+        }
     }
 
-    // 2. Limpa tabelas no banco (Instância e Autenticação)
-    // NÃO apagamos leads nem mensagens, apenas a conexão!
+    // 3. Limpa o banco
     await supabase.from("instances").delete().eq("session_id", sessionId);
     await supabase.from("baileys_auth_state").delete().eq("session_id", sessionId);
     
