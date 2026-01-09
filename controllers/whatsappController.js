@@ -36,7 +36,7 @@ export const startSession = async (sessionId, companyId) => {
     
     console.log(`[CONNECTION UPDATE] Status: ${connection || 'mudando'} | QR: ${!!qr}`);
 
-   if (qr) {
+    if (qr) {
       console.log("[DB] Salvando QR Code no Supabase...");
       const { error } = await supabase.from("instances").upsert({ 
         session_id: sessionId, 
@@ -44,8 +44,8 @@ export const startSession = async (sessionId, companyId) => {
         status: "qrcode",
         company_id: companyId,
         name: "WhatsApp Principal"
-      }, { onConflict: 'session_id' }); // 🔥 AQUI ESTÁ A CORREÇÃO MÁGICA
-
+      }, { onConflict: 'session_id' }); // 🔥 Correção de duplicidade mantida
+      
       if (error) console.error("[DB ERROR] Erro ao salvar QR:", error.message);
     }
 
@@ -55,10 +55,16 @@ export const startSession = async (sessionId, companyId) => {
       
       await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
       
+      // 🔥 A CORREÇÃO DO LOOP ESTÁ AQUI:
+      // Removemos a sessão "morta" da memória ANTES de tentar reconectar
+      sessions.delete(sessionId); 
+
       if (shouldReconnect) {
-          startSession(sessionId, companyId);
-      } else {
-          sessions.delete(sessionId);
+          console.log("[AUTO-RECONNECT] Tentando reconectar automaticamente...");
+          // Pequeno delay para evitar spam
+          setTimeout(() => {
+              startSession(sessionId, companyId);
+          }, 2000);
       }
     }
 
@@ -70,7 +76,7 @@ export const startSession = async (sessionId, companyId) => {
       }).eq("session_id", sessionId);
     }
   });
-
+  
   sock.ev.on("messages.upsert", async ({ messages }) => {
     // Mantive a lógica de mensagens igual, pois ela não impede a conexão
     const msg = messages[0];
