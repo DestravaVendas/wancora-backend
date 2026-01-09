@@ -4,15 +4,19 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+  auth: {
+    persistSession: false // Otimização para backend
+  }
+});
 
 export const useSupabaseAuthState = async (sessionId) => {
-  // Função auxiliar para escrever dados no banco
+  // Função auxiliar para escrever dados no banco (com retry simples)
   const writeData = async (data, type, id) => {
     try {
-        // Serializa o buffer para JSON antes de salvar
         const payload = JSON.parse(JSON.stringify(data, BufferJSON.replacer));
         
+        // Tentativa de salvar
         const { error } = await supabase.from("baileys_auth_state").upsert({
           session_id: sessionId,
           data_type: type,
@@ -22,14 +26,23 @@ export const useSupabaseAuthState = async (sessionId) => {
         }, { onConflict: 'session_id, data_type, key_id' });
 
         if (error) {
-            console.error(`[AUTH ERROR] Falha ao salvar ${type}:`, error.message);
+            // Se falhar, tentamos uma segunda vez após 500ms (ajuda em oscilações)
+            await new Promise(r => setTimeout(r, 500));
+            const { error: retryError } = await supabase.from("baileys_auth_state").upsert({
+                session_id: sessionId,
+                data_type: type,
+                key_id: id,
+                payload: payload,
+                updated_at: new Date()
+            }, { onConflict: 'session_id, data_type, key_id' });
+            
+            if (retryError) console.error(`[AUTH ERROR] Falha final ao salvar ${type}/${id}:`, retryError.message);
         }
     } catch (e) {
-        console.error("[AUTH CRITICAL] Erro no writeData:", e);
+        console.error(`[AUTH CRITICAL] Erro de rede ao salvar ${type}:`, e.message);
     }
   };
 
-  // Função auxiliar para ler dados do banco
   const readData = async (type, id) => {
     try {
         const { data, error } = await supabase
@@ -41,10 +54,8 @@ export const useSupabaseAuthState = async (sessionId) => {
           .single();
 
         if (error || !data) return null;
-        // Reconverte o JSON para Buffer
         return JSON.parse(JSON.stringify(data.payload), BufferJSON.reviver);
     } catch (e) {
-        console.error("[AUTH READ ERROR]", e);
         return null;
     }
   };
@@ -62,8 +73,6 @@ export const useSupabaseAuthState = async (sessionId) => {
     }
   };
 
-  // Inicializa as credenciais (Se não existir no banco, cria novas)
-  console.log(`[AUTH] Carregando credenciais para sessão: ${sessionId}`);
   const creds = await readData("creds", "main") || initAuthCreds();
 
   return {
@@ -72,6 +81,7 @@ export const useSupabaseAuthState = async (sessionId) => {
       keys: {
         get: async (type, ids) => {
           const res = {};
+          // Otimização de leitura: Fazemos Promise.all para ser rápido na leitura
           await Promise.all(ids.map(async (id) => {
             let value = await readData(type, id);
             if (type === "app-state-sync-key" && value) {
@@ -83,13 +93,24 @@ export const useSupabaseAuthState = async (sessionId) => {
         },
         set: async (data) => {
           const tasks = [];
+          
+          // 1. Prepara todas as tarefas
           for (const type in data) {
             for (const id in data[type]) {
               const value = data[type][id];
-              tasks.push(value ? writeData(value, type, id) : removeData(type, id));
+              // Adicionamos a tarefa na lista
+              tasks.push(() => value ? writeData(value, type, id) : removeData(type, id));
             }
           }
-          await Promise.all(tasks);
+
+          // 2. 🔥 EXECUÇÃO EM LOTES (BATCHING) 🔥
+          // Isso resolve o erro "fetch failed". Enviamos 50 de cada vez.
+          const BATCH_SIZE = 50; 
+          for (let i = 0; i < tasks.length; i += BATCH_SIZE) {
+            const chunk = tasks.slice(i, i + BATCH_SIZE);
+            // Executa 50 tarefas simultâneas e espera elas terminarem antes de mandar as próximas
+            await Promise.all(chunk.map(task => task()));
+          }
         },
       },
     },
