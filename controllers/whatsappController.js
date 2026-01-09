@@ -34,6 +34,15 @@ export const startSession = async (sessionId, companyId) => {
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
+
+    if (connection === 'connecting') {
+        console.log("[STATUS] Iniciando conexão/sincronização...");
+        await supabase.from("instances").update({ 
+            status: "connecting",
+            // Opcional: Não limpamos o QR aqui para evitar piscar se for só uma oscilação, 
+            // mas o status 'connecting' já fará o frontend mostrar o spinner.
+        }).eq("session_id", sessionId);
+    }
     
     if (qr) {
       console.log(`[QR GENERATED] Nova tentativa de login para ${sessionId}`);
