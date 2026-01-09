@@ -9,10 +9,14 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const sessions = new Map();
 
 export const startSession = async (sessionId, companyId) => {
-  // Limpeza preventiva: Se já existe, mata a antiga antes de criar a nova
+  // 1. Limpeza Prévia: Se já existe sessão, marca para não reconectar e mata
   if (sessions.has(sessionId)) {
-      console.log(`[START] Sessão ${sessionId} já existe. Reiniciando...`);
-      // Não chamamos deleteSession aqui para evitar loop, apenas removemos do map
+      console.log(`[START] Sessão ${sessionId} já existe. Substituindo...`);
+      const oldSock = sessions.get(sessionId);
+      if (oldSock) {
+          oldSock.shouldReconnect = false; // 🔥 PROIBIDO RECONECTAR
+          oldSock.end(undefined);
+      }
       sessions.delete(sessionId);
   }
 
@@ -30,6 +34,9 @@ export const startSession = async (sessionId, companyId) => {
     retryRequestDelayMs: 5000,
   });
 
+  // 🔥 A BANDEIRA DE VIDA: Por padrão, permitimos reconectar
+  sock.shouldReconnect = true; 
+
   // Adiciona na memória
   sessions.set(sessionId, sock);
 
@@ -38,61 +45,53 @@ export const startSession = async (sessionId, companyId) => {
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // 1. Lógica de Conexão (Mostra Spinner)
-    if (connection === 'connecting') {
-        console.log("[STATUS] Iniciando conexão/sincronização...");
-        // Só atualiza banco se a sessão ainda for válida
-        if (sessions.has(sessionId)) {
-            await supabase.from("instances").update({ status: "connecting" }).eq("session_id", sessionId);
-        }
-    }
-    
-    // 2. Lógica de QR Code
-    if (qr) {
-      console.log(`[QR GENERATED] Nova tentativa de login para ${sessionId}`);
-      if (sessions.has(sessionId)) {
-          await supabase.from("instances").upsert({ 
-            session_id: sessionId, 
-            qrcode_url: qr, 
-            status: "qrcode",
-            company_id: companyId,
-            name: "WhatsApp Principal"
-          }, { onConflict: 'session_id' });
-      }
+    // Se essa sessão foi marcada para morrer, IGNORA tudo e retorna.
+    if (sock.shouldReconnect === false) {
+        console.log(`[ZOMBIE KILLER] Sessão ${sessionId} tentou reviver mas foi bloqueada.`);
+        return;
     }
 
-    // 3. Lógica de Desconexão (AQUI ESTAVA O LOOP)
+    if (connection === 'connecting') {
+        console.log("[STATUS] Iniciando conexão/sincronização...");
+        await supabase.from("instances").update({ status: "connecting" }).eq("session_id", sessionId);
+    }
+    
+    if (qr) {
+      console.log(`[QR GENERATED] Nova tentativa de login para ${sessionId}`);
+      await supabase.from("instances").upsert({ 
+        session_id: sessionId, 
+        qrcode_url: qr, 
+        status: "qrcode",
+        company_id: companyId,
+        name: "WhatsApp Principal"
+      }, { onConflict: 'session_id' });
+    }
+
     if (connection === "close") {
       const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
       
-      // 🔥 A CURA DO ZUMBI:
-      // Verificamos se a sessão AINDA EXISTE na memória.
-      // Se deleteSession() foi chamado, ela já foi removida do Map.
-      // Então, se não estiver no Map, NÃO FAZEMOS NADA (Return).
-      if (!sessions.has(sessionId)) {
-          console.log(`[STOP] Sessão ${sessionId} foi encerrada manualmente. Loop interrompido.`);
-          return; 
-      }
-
       console.log(`[CLOSE] Conexão caiu. Reconectar? ${shouldReconnect}`);
 
       if (shouldReconnect) {
-          console.log("[AUTO-RECONNECT] Tentando reconectar em 3s...");
-          // Removemos a instância atual defeituosa da memória para dar lugar à nova
+          // Remove da memória para garantir limpeza
           sessions.delete(sessionId);
           await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
           
+          console.log("[AUTO-RECONNECT] Tentando reconectar em 3s...");
           setTimeout(() => {
-              // Verifica novamente se não foi deletada nesse meio tempo
-              startSession(sessionId, companyId);
+              // Verifica se não foi cancelado nesse meio tempo
+              if (sock.shouldReconnect) {
+                startSession(sessionId, companyId);
+              }
           }, 3000);
       } else {
           console.log("[LOGOUT] Desconectado definitivamente.");
+          // Se foi logout real pelo celular, marcamos para não voltar
+          sock.shouldReconnect = false; 
           await deleteSession(sessionId, companyId);
       }
     }
 
-    // 4. Lógica de Sucesso
     if (connection === "open") {
       console.log("[SUCCESS] Conectado e pronto!");
       await supabase.from("instances").update({ 
@@ -104,30 +103,31 @@ export const startSession = async (sessionId, companyId) => {
 
   // Listener de mensagens
   sock.ev.on("messages.upsert", async ({ messages }) => {
-     // ... (Lógica de mensagens mantida igual) ...
+    if (sock.shouldReconnect === false) return; // Não processa msg se estiver morrendo
+    // ... (sua lógica de mensagens aqui) ...
   });
 
   return sock;
 };
 
-// 🔥 FUNÇÃO DE DELETAR CORRIGIDA
+// 🔥 FUNÇÃO DE RESET (KILL SWITCH)
 export const deleteSession = async (sessionId, companyId) => {
     console.log(`[RESET] Deletando sessão ${sessionId}...`);
     
     const sock = sessions.get(sessionId);
 
-    // 1. PRIMEIRO: Removemos do Mapa.
-    // Isso sinaliza para o evento 'connection.update' que ele NÃO deve tentar reconectar.
-    sessions.delete(sessionId);
-
-    // 2. DEPOIS: Fechamos o socket
+    // 1. MARCA A BANDEIRA: "VOCÊ VAI MORRER E NÃO VAI VOLTAR"
     if (sock) {
+        sock.shouldReconnect = false; 
         try {
-            sock.end(undefined);
-        } catch (error) {
-            console.log("Erro ao fechar socket (ignorado):", error.message);
+            sock.end(undefined); // Isso vai disparar 'close', mas o IF lá em cima vai bloquear o reconnect
+        } catch (e) {
+            console.log("Erro ao fechar socket:", e.message);
         }
     }
+
+    // 2. Remove do mapa
+    sessions.delete(sessionId);
 
     // 3. Limpa o banco
     await supabase.from("instances").delete().eq("session_id", sessionId);
