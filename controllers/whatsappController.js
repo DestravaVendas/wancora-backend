@@ -19,15 +19,13 @@ export const startSession = async (sessionId, companyId) => {
     printQRInTerminal: true,
     logger: pino({ level: "error" }),
     browser: Browsers.macOS('Desktop'),
-    syncFullHistory: false, // Já estava, mantém.
-    // Aumenta tolerância para internet lenta do Render
-    connectTimeoutMs: 60000, 
-    defaultQueryTimeoutMs: 60000,
+    syncFullHistory: false,
+    
+    // 🔥 AUMENTANDO DRASTICAMENTE OS TIMEOUTS PARA O RENDER
+    connectTimeoutMs: 90000, // 90 segundos antes de desistir
+    defaultQueryTimeoutMs: 90000,
     keepAliveIntervalMs: 10000,
-    // Evita tentar re-enviar mensagens antigas que travam o boot
-    retryRequestDelayMs: 2000, 
-    // Configurações de Cache para agilizar
-    generateHighQualityLinkPreview: true,
+    retryRequestDelayMs: 5000, // Espera 5s antes de tentar de novo
   });
 
   sessions.set(sessionId, sock);
