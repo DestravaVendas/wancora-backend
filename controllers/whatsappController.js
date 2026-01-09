@@ -22,8 +22,8 @@ export const startSession = async (sessionId, companyId) => {
     syncFullHistory: false,
     
     // 🔥 AUMENTANDO DRASTICAMENTE OS TIMEOUTS PARA O RENDER
-    connectTimeoutMs: 90000, // 90 segundos antes de desistir
-    defaultQueryTimeoutMs: 90000,
+    connectTimeoutMs: 30000, // 90 segundos antes de desistir
+    defaultQueryTimeoutMs: 30000,
     keepAliveIntervalMs: 10000,
     retryRequestDelayMs: 5000, // Espera 5s antes de tentar de novo
   });
