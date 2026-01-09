@@ -8,17 +8,17 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 // Mapa de sessões ativas
 const sessions = new Map();
 
-// --- FUNÇÃO AUXILIAR: Extrai dados úteis da mensagem ---
+// --- FUNÇÃO AUXILIAR 1: Extrai dados úteis da mensagem ---
 const extractMessageData = (msg, sessionId) => {
     if (!msg.message) return null;
-
-    // Ignora mensagens de protocolo/status (aquelas "azulzinhas" de segurança)
     if (msg.message.protocolMessage || msg.message.senderKeyDistributionMessage) return null;
 
     const remoteJid = msg.key.remoteJid;
+    // Filtro de segurança: Ignora grupos e broadcast para focar no atendimento
+    if (remoteJid.includes('@broadcast') || remoteJid.includes('@g.us')) return null;
+
     const fromMe = msg.key.fromMe;
     
-    // Tenta pegar o texto de várias formas (simples, estendido, legenda de imagem, etc)
     const content = 
         msg.message.conversation || 
         msg.message.extendedTextMessage?.text || 
@@ -31,8 +31,6 @@ const extractMessageData = (msg, sessionId) => {
 
     if (!content) return null;
 
-    // Converte timestamp do WhatsApp (segundos) para ISO String (Date)
-    // Se não tiver timestamp (msg antiga), usa o momento atual
     const messageTimestamp = msg.messageTimestamp 
         ? new Date(msg.messageTimestamp * 1000).toISOString() 
         : new Date().toISOString();
@@ -42,44 +40,57 @@ const extractMessageData = (msg, sessionId) => {
         remote_jid: remoteJid,
         from_me: fromMe,
         content: content,
-        message_type: 'text', // Simplificado para MVP
+        message_type: 'text',
         status: 'received',
         created_at: messageTimestamp
     };
 };
 
-// --- FUNÇÃO AUXILIAR: Salva mensagens em lote no Supabase ---
+// --- FUNÇÃO AUXILIAR 2: Salva mensagens em lote (Batch) ---
 const saveMessagesBatch = async (messages) => {
     if (!messages || messages.length === 0) return;
-    
-    // Salva em lotes de 50 para não estourar o limite do Supabase
     const BATCH_SIZE = 50;
-    
     for (let i = 0; i < messages.length; i += BATCH_SIZE) {
         const batch = messages.slice(i, i + BATCH_SIZE);
         try {
-            // Usamos upsert para evitar erros se duplicar, mas idealmente precisariamos de um ID único do whats
-            // Como nosso banco gera ID UUID automático, cuidado com duplicações se escanear muitas vezes.
-            // Para MVP, insert simples funciona bem.
             const { error } = await supabase.from('messages').insert(batch);
             if (error) console.error("Erro ao salvar lote:", error.message);
         } catch (err) {
             console.error("Erro crítico no batch:", err.message);
         }
     }
-    console.log(`[DB] ${messages.length} mensagens salvas no histórico.`);
+    console.log(`[DB] ${messages.length} mensagens salvas.`);
 };
 
+// --- FUNÇÃO AUXILIAR 3: Salva Contato e Foto (Upsert) ---
+const upsertContact = async (jid, sock, pushName = null) => {
+    try {
+        let profilePicUrl = null;
+        try {
+            // Tenta buscar a foto (pode falhar se for privado)
+            profilePicUrl = await sock.profilePictureUrl(jid, 'image');
+        } catch (e) { /* Sem foto */ }
+
+        const contactData = {
+            jid: jid,
+            profile_pic_url: profilePicUrl,
+            updated_at: new Date()
+        };
+        
+        // Só atualiza o nome se tivermos um novo (para não sobrescrever com null)
+        if (pushName) contactData.push_name = pushName;
+        if (pushName) contactData.name = pushName;
+
+        await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
+    } catch (err) {
+        console.error("Erro ao salvar contato:", jid);
+    }
+};
 
 export const startSession = async (sessionId, companyId) => {
-  // 1. Limpeza Prévia
   if (sessions.has(sessionId)) {
-      console.log(`[START] Sessão ${sessionId} já existe. Substituindo...`);
       const oldSock = sessions.get(sessionId);
-      if (oldSock) {
-          oldSock.shouldReconnect = false;
-          oldSock.end(undefined);
-      }
+      if (oldSock) { oldSock.shouldReconnect = false; oldSock.end(undefined); }
       sessions.delete(sessionId);
   }
 
@@ -90,10 +101,7 @@ export const startSession = async (sessionId, companyId) => {
     printQRInTerminal: true,
     logger: pino({ level: "error" }),
     browser: Browsers.macOS('Desktop'),
-    
-    // 🔥 AQUI ESTÁ A MÁGICA: Ativamos o histórico completo
-    syncFullHistory: true, 
-    
+    syncFullHistory: true, // Histórico ATIVADO
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
     keepAliveIntervalMs: 10000,
@@ -105,78 +113,77 @@ export const startSession = async (sessionId, companyId) => {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // --- EVENTO: CONEXÃO ---
+  // --- CONEXÃO ---
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
-
     if (sock.shouldReconnect === false) return;
 
-    if (connection === 'connecting') {
-        console.log("[STATUS] Iniciando conexão...");
-        await supabase.from("instances").update({ status: "connecting" }).eq("session_id", sessionId);
-    }
+    if (connection === 'connecting') await supabase.from("instances").update({ status: "connecting" }).eq("session_id", sessionId);
     
-    if (qr) {
-      console.log(`[QR] Novo QR Code gerado.`);
-      await supabase.from("instances").upsert({ 
-        session_id: sessionId, 
-        qrcode_url: qr, 
-        status: "qrcode",
-        company_id: companyId,
-        name: "WhatsApp Principal"
-      }, { onConflict: 'session_id' });
-    }
+    if (qr) await supabase.from("instances").upsert({ session_id: sessionId, qrcode_url: qr, status: "qrcode", company_id: companyId, name: "WhatsApp Principal" }, { onConflict: 'session_id' });
 
     if (connection === "close") {
       const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log(`[CLOSE] Desconectado. Reconectar? ${shouldReconnect}`);
-
       if (shouldReconnect) {
           sessions.delete(sessionId);
           await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
-          setTimeout(() => {
-              if (sock.shouldReconnect) startSession(sessionId, companyId);
-          }, 3000);
+          setTimeout(() => { if (sock.shouldReconnect) startSession(sessionId, companyId); }, 3000);
       } else {
-          console.log("[LOGOUT] Logout definitivo.");
           sock.shouldReconnect = false; 
           await deleteSession(sessionId, companyId);
       }
     }
 
-    if (connection === "open") {
-      console.log("[SUCCESS] Conectado! Aguardando mensagens...");
-      await supabase.from("instances").update({ status: "connected", qrcode_url: null }).eq("session_id", sessionId);
-    }
+    if (connection === "open") await supabase.from("instances").update({ status: "connected", qrcode_url: null }).eq("session_id", sessionId);
   });
 
-  // --- EVENTO: HISTÓRICO ANTIGO (Carrega ao conectar) ---
-  sock.ev.on("messaging-history.set", async ({ messages }) => {
-      console.log(`[HISTORY] Recebendo histórico com ${messages.length} mensagens...`);
+  // --- EVENTO 1: CARGA INICIAL DE HISTÓRICO + CONTATOS ---
+  sock.ev.on("messaging-history.set", async ({ messages, contacts }) => {
+      console.log(`[HISTORY] Processando ${messages.length} mensagens e ${contacts?.length || 0} contatos...`);
       
-      // Filtra e formata
-      const formattedMessages = messages
-          .map(msg => extractMessageData(msg, sessionId))
-          .filter(Boolean); // Remove nulos
-      
-      if (formattedMessages.length > 0) {
-          console.log(`[HISTORY] Salvando ${formattedMessages.length} mensagens válidas no banco...`);
-          await saveMessagesBatch(formattedMessages);
+      // 1. Salva Mensagens
+      const formattedMessages = messages.map(msg => extractMessageData(msg, sessionId)).filter(Boolean);
+      await saveMessagesBatch(formattedMessages);
+
+      // 2. Salva Contatos (Nomes iniciais)
+      if (contacts) {
+         const contactBatch = contacts.map(c => ({
+             jid: c.id,
+             name: c.name || c.notify || c.verifiedName,
+             push_name: c.notify
+         }));
+         // Batch insert de contatos
+         const BATCH = 50;
+         for (let i = 0; i < contactBatch.length; i += BATCH) {
+            await supabase.from('contacts').upsert(contactBatch.slice(i, i + BATCH), { onConflict: 'jid' });
+         }
       }
   });
 
-  // --- EVENTO: MENSAGENS NOVAS (Tempo real) ---
+  // --- EVENTO 2: ATUALIZAÇÃO DE CONTATOS (Chegou nome novo) ---
+  sock.ev.on("contacts.upsert", async (contacts) => {
+      for (const c of contacts) {
+          // Salva nome e tenta buscar foto
+          await upsertContact(c.id, sock, c.name || c.notify);
+      }
+  });
+
+  // --- EVENTO 3: MENSAGENS NOVAS ---
   sock.ev.on("messages.upsert", async ({ messages }) => {
     if (sock.shouldReconnect === false) return;
 
-    const formattedMessages = messages
-        .map(msg => extractMessageData(msg, sessionId))
-        .filter(Boolean);
+    const formattedMessages = messages.map(msg => extractMessageData(msg, sessionId)).filter(Boolean);
 
     if (formattedMessages.length > 0) {
-        console.log(`[NEW MSG] ${formattedMessages.length} novas mensagens recebidas.`);
-        // Para mensagens novas (poucas), insert direto é tranquilo
+        console.log(`[MSG] Recebida: ${formattedMessages[0].content.substring(0, 20)}...`);
         await supabase.from('messages').insert(formattedMessages);
+        
+        // Se chegou mensagem, garante que temos a foto/nome desse contato atualizados
+        for (const msg of formattedMessages) {
+            if (!msg.from_me) {
+                await upsertContact(msg.remote_jid, sock);
+            }
+        }
     }
   });
 
@@ -185,23 +192,12 @@ export const startSession = async (sessionId, companyId) => {
 
 // --- FUNÇÃO: RESET ---
 export const deleteSession = async (sessionId, companyId) => {
-    console.log(`[RESET] Deletando sessão ${sessionId}...`);
+    console.log(`[RESET] Deletando...`);
     const sock = sessions.get(sessionId);
-
-    if (sock) {
-        sock.shouldReconnect = false; 
-        try { sock.end(undefined); } catch (e) {}
-    }
-
+    if (sock) { sock.shouldReconnect = false; try { sock.end(undefined); } catch (e) {} }
     sessions.delete(sessionId);
     await supabase.from("instances").delete().eq("session_id", sessionId);
     await supabase.from("baileys_auth_state").delete().eq("session_id", sessionId);
-    
-    // Opcional: Se quiser limpar o histórico de mensagens ao desconectar, descomente abaixo.
-    // Mas geralmente num CRM queremos manter o histórico.
-    // await supabase.from("messages").delete().eq("session_id", sessionId);
-
-    console.log(`[RESET] Sessão limpa.`);
     return true;
 };
 
@@ -209,6 +205,6 @@ export const deleteSession = async (sessionId, companyId) => {
 export const sendMessage = async (sessionId, to, text) => {
   const sock = sessions.get(sessionId);
   if (!sock) throw new Error("Sessão não ativa");
-  const jid = `${to}@s.whatsapp.net`;
+  const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
   return await sock.sendMessage(jid, { text });
 };
