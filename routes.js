@@ -1,6 +1,7 @@
 import express from "express";
 import * as whatsappController from "./controllers/whatsappController.js";
 import { createClient } from "@supabase/supabase-js";
+import { createCampaign } from "./controllers/campaignController.js"; 
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -80,5 +81,7 @@ router.post("/message/send", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+router.post("/campaigns/send", createCampaign);
 
 export default router;

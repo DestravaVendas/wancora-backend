@@ -215,15 +215,20 @@ export const sendMessage = async (sessionId, to, text) => {
   return await sock.sendMessage(jid, { text });
 };
 
-// --- AQUI ESTÁ A CORREÇÃO SOLICITADA ---
+export const getSessionId = (companyId) => {
+    return companyIndex.get(companyId);
+};
+
+// 2. Função para o CONTROLLER/INTERNO (Retorna o Socket/Conexão Real)
 // Agora acessamos o indexador local 'companyIndex' e depois o mapa 'sessions'
 export const getSession = (companyId) => {
     const sessionId = companyIndex.get(companyId);
+    
     if (!sessionId) {
-        // Fallback: Se não achar no index, tenta achar alguma sessão iterando (menos performático, mas seguro)
-        // Isso é útil se o servidor reiniciou e o mapa index ainda não populou 100%
+        // Fallback: Se não achar no index
         console.warn(`[WARN] Sessão não encontrada via index para empresa ${companyId}.`);
         return null;
     }
+    
     return sessions.get(sessionId);
 };
