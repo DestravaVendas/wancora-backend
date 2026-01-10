@@ -1,4 +1,4 @@
-import makeWASocket, { DisconnectReason, Browsers } from "@whiskeysockets/baileys";
+import makeWASocket, { DisconnectReason, Browsers, fetchLatestBaileysVersion } from "@whiskeysockets/baileys";
 import { useSupabaseAuthState } from "../auth/supabaseAuth.js";
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
@@ -6,28 +6,43 @@ import pino from "pino";
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // --- ARQUITETURA DE MEMÓRIA ---
-const sessions = new Map();
-const companyIndex = new Map(); 
+const sessions = new Map(); // sessionId -> Socket
+const companyIndex = new Map(); // companyId -> sessionId
+const retries = new Map();
 
-// --- FUNÇÃO AUXILIAR 1: Extração de Dados ---
+// --- FUNÇÃO AUXILIAR 1: Extrai dados úteis da mensagem ---
 const extractMessageData = (msg, sessionId, companyId) => {
     if (!msg.message) return null;
     if (msg.message.protocolMessage || msg.message.senderKeyDistributionMessage) return null;
 
-    const remoteJid = msg.key.remoteJid;
-    if (remoteJid.includes('@broadcast') || remoteJid.includes('@g.us')) return null;
+    let remoteJid = msg.key.remoteJid;
+    
+    // Normalização de JID
+    if (remoteJid.includes(':')) {
+        remoteJid = remoteJid.split(':')[0] + '@s.whatsapp.net';
+    }
+    
+    if (remoteJid === 'status@broadcast' || remoteJid.includes('@broadcast')) return null;
 
     const fromMe = msg.key.fromMe;
     
-    const content = 
-        msg.message.conversation || 
-        msg.message.extendedTextMessage?.text || 
-        msg.message.imageMessage?.caption || 
-        msg.message.videoMessage?.caption ||
-        (msg.message.imageMessage ? "[Imagem]" : null) ||
-        (msg.message.audioMessage ? "[Áudio]" : null) ||
-        (msg.message.stickerMessage ? "[Figurinha]" : null) ||
-        "";
+    let content = "";
+    let messageType = "text";
+
+    const m = msg.message;
+
+    // Prioridade de extração
+    if (m.conversation) content = m.conversation;
+    else if (m.extendedTextMessage?.text) content = m.extendedTextMessage.text;
+    else if (m.imageMessage) { content = m.imageMessage.caption || "[Imagem]"; messageType = "image"; }
+    else if (m.videoMessage) { content = m.videoMessage.caption || "[Vídeo]"; messageType = "video"; }
+    else if (m.audioMessage) { content = "[Áudio]"; messageType = "audio"; }
+    else if (m.documentMessage) { content = m.documentMessage.fileName || "[Documento]"; messageType = "document"; }
+    else if (m.stickerMessage) { content = "[Figurinha]"; messageType = "sticker"; }
+    else if (m.locationMessage) { 
+        content = `Loc: ${m.locationMessage.degreesLatitude}, ${m.locationMessage.degreesLongitude}`; 
+        messageType = "location"; 
+    }
 
     if (!content) return null;
 
@@ -41,13 +56,51 @@ const extractMessageData = (msg, sessionId, companyId) => {
         remote_jid: remoteJid,
         from_me: fromMe,
         content: content,
-        message_type: 'text',
+        message_type: messageType,
         status: 'received',
         created_at: messageTimestamp
     };
 };
 
-// --- FUNÇÃO AUXILIAR 2: Batch Insert ---
+// --- FUNÇÃO AUXILIAR 2: Salva Contato ---
+const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
+    try {
+        const isGroup = jid.endsWith('@g.us');
+        let name = pushName;
+        let profilePicUrl = null;
+
+        try {
+            profilePicUrl = await sock.profilePictureUrl(jid, 'image');
+        } catch (e) { /* Silencioso */ }
+
+        if (isGroup && !name) {
+            try {
+                const groupMetadata = await sock.groupMetadata(jid);
+                name = groupMetadata.subject;
+            } catch (e) { /* Silencioso */ }
+        }
+
+        const contactData = {
+            jid: jid,
+            profile_pic_url: profilePicUrl,
+            updated_at: new Date()
+        };
+        
+        if (name) {
+            contactData.name = name;
+            contactData.push_name = name;
+        }
+        
+        if (companyId) contactData.company_id = companyId;
+
+        await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
+
+    } catch (err) {
+        // console.error(`Erro ao salvar contato ${jid}:`, err.message);
+    }
+};
+
+// --- FUNÇÃO AUXILIAR 3: Batch Save ---
 const saveMessagesBatch = async (messages) => {
     if (!messages || messages.length === 0) return;
     const BATCH_SIZE = 50;
@@ -63,181 +116,193 @@ const saveMessagesBatch = async (messages) => {
     console.log(`[DB] ${messages.length} mensagens salvas.`);
 };
 
-// --- FUNÇÃO AUXILIAR 3: Upsert Contato ---
-const upsertContact = async (jid, sock, pushName = null, companyId) => {
-    try {
-        let profilePicUrl = null;
-        try {
-            profilePicUrl = await sock.profilePictureUrl(jid, 'image');
-        } catch (e) { /* Sem foto */ }
-
-        const contactData = {
-            jid: jid,
-            company_id: companyId,
-            profile_pic_url: profilePicUrl,
-            updated_at: new Date()
-        };
-        
-        if (pushName) contactData.push_name = pushName;
-        if (pushName) contactData.name = pushName;
-
-        await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
-    } catch (err) {
-        // console.error("Erro ao salvar contato:", jid); // Silenciado para limpar logs
-    }
-};
-
+// --- CORE: Iniciar Sessão ---
 export const startSession = async (sessionId, companyId) => {
-  // Limpeza prévia (Garante que não existem sobras)
-  if (sessions.has(sessionId)) {
-      const oldSock = sessions.get(sessionId);
-      if (oldSock) { 
-          oldSock.shouldReconnect = false; 
-          oldSock.end(undefined); 
-      }
-      sessions.delete(sessionId);
-      companyIndex.delete(companyId); 
-  }
-
-  const { state, saveCreds } = await useSupabaseAuthState(sessionId);
-  
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true,
-    logger: pino({ level: "error" }),
-    browser: Browsers.macOS('Desktop'),
-    syncFullHistory: true, 
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 10000,
-    retryRequestDelayMs: 5000,
-  });
-
-  sock.shouldReconnect = true; 
-  
-  sessions.set(sessionId, sock); 
-  if (companyId) {
-      companyIndex.set(companyId, sessionId);
-      console.log(`[MAP] Empresa ${companyId} vinculada à sessão ${sessionId}`);
-  }
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    // 🛡️ TRAVA ANTI-ZUMBI 1: Se a sessão foi removida do mapa, PARE TUDO.
-    if (!sessions.has(sessionId)) return;
-
-    // 🛡️ TRAVA ANTI-ZUMBI 2: Flag manual
-    if (sock.shouldReconnect === false) return;
-
-    if (connection === 'connecting') await supabase.from("instances").update({ status: "connecting" }).eq("session_id", sessionId);
-    
-    if (qr) await supabase.from("instances").upsert({ session_id: sessionId, qrcode_url: qr, status: "qrcode", company_id: companyId, name: "WhatsApp Principal" }, { onConflict: 'session_id' });
-
-    if (connection === "close") {
-      const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-      
-      // 🛡️ TRAVA ANTI-ZUMBI 3: Verificação Dupla antes de reconectar
-      if (shouldReconnect && sock.shouldReconnect && sessions.has(sessionId)) {
-          // Lógica de Reconexão Segura
-          await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
-          // Remove a sessão antiga do mapa para evitar duplicidade durante o reboot
-          sessions.delete(sessionId); 
-          
-          setTimeout(() => { 
-              // Verifica uma última vez se o usuário não deletou enquanto esperava
-              startSession(sessionId, companyId); 
-          }, 3000);
-      } else {
-          // Logout Definitivo
-          sock.shouldReconnect = false; 
-          await deleteSession(sessionId, companyId);
-      }
+    // Limpeza prévia (Garbage Collection)
+    if (sessions.has(sessionId)) {
+        // Chamamos deleteSession mas sem limpar o banco, apenas para matar o processo anterior
+        await deleteSession(sessionId, companyId, false);
     }
 
-    if (connection === "open") await supabase.from("instances").update({ status: "connected", qrcode_url: null }).eq("session_id", sessionId);
-  });
+    const { state, saveCreds } = await useSupabaseAuthState(sessionId);
+    const { version } = await fetchLatestBaileysVersion();
 
-  sock.ev.on("messaging-history.set", async ({ messages, contacts }) => {
-      console.log(`[HISTORY] Processando ${messages.length} mensagens...`);
-      const formattedMessages = messages.map(msg => extractMessageData(msg, sessionId, companyId)).filter(Boolean);
-      await saveMessagesBatch(formattedMessages);
+    const sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: true,
+        logger: pino({ level: "silent" }),
+        browser: Browsers.macOS('Desktop'),
+        syncFullHistory: true, 
+        markOnlineOnConnect: true,
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 30000,
+        retryRequestDelayMs: 2000,
+    });
 
-      if (contacts) {
-         const contactBatch = contacts.map(c => ({
-             jid: c.id,
-             company_id: companyId,
-             name: c.name || c.notify || c.verifiedName,
-             push_name: c.notify
-         }));
-         const BATCH = 50;
-         for (let i = 0; i < contactBatch.length; i += BATCH) {
-            await supabase.from('contacts').upsert(contactBatch.slice(i, i + BATCH), { onConflict: 'jid' });
-         }
-      }
-  });
+    sock.companyId = companyId;
+    sessions.set(sessionId, sock); 
+    
+    if (companyId) {
+        companyIndex.set(companyId, sessionId);
+        console.log(`[INIT] Empresa ${companyId} :: Sessão ${sessionId}`);
+    }
 
-  sock.ev.on("contacts.upsert", async (contacts) => {
-      for (const c of contacts) {
-          await upsertContact(c.id, sock, c.name || c.notify, companyId);
-      }
-  });
+    sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    // 🛡️ TRAVA: Não processa mensagens de sessões mortas
-    if (!sessions.has(sessionId) || sock.shouldReconnect === false) return;
+    sock.ev.on("connection.update", async (update) => {
+        const { connection, lastDisconnect, qr } = update;
 
-    const formattedMessages = messages.map(msg => extractMessageData(msg, sessionId, companyId)).filter(Boolean);
+        // 🛡️ TRAVA ANTI-ZUMBI 1: Se não está no mapa, pare imediatamente.
+        if (!sessions.has(sessionId)) return;
 
-    if (formattedMessages.length > 0) {
-        // console.log(`[MSG] Recebida: ${formattedMessages[0].content.substring(0, 15)}...`);
-        await supabase.from('messages').insert(formattedMessages);
-        for (const msg of formattedMessages) {
-            if (!msg.from_me) {
-                await upsertContact(msg.remote_jid, sock, null, companyId);
+        if (connection === 'connecting') {
+            await supabase.from("instances").update({ status: "connecting" }).eq("session_id", sessionId);
+        }
+        
+        if (qr) {
+            await supabase.from("instances").upsert({ 
+                session_id: sessionId, 
+                qrcode_url: qr, 
+                status: "qrcode", 
+                company_id: companyId, 
+                name: "WhatsApp Principal" 
+            }, { onConflict: 'session_id' });
+        }
+
+        if (connection === "close") {
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            
+            // 🛡️ TRAVA ANTI-ZUMBI 2: Verificação dupla
+            if (shouldReconnect && sessions.has(sessionId)) {
+                await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
+                
+                // Remove do mapa temporariamente para evitar loopings rápidos, mas mantém retries
+                sessions.delete(sessionId);
+                
+                const attempt = (retries.get(sessionId) || 0) + 1;
+                retries.set(sessionId, attempt);
+                // Delay progressivo (Backoff)
+                const delay = Math.min(attempt * 2000, 10000);
+                
+                console.log(`[RECONNECT] Tentativa ${attempt} em ${delay}ms...`);
+                setTimeout(() => startSession(sessionId, companyId), delay);
+            } else {
+                // Logout intencional ou erro fatal
+                await deleteSession(sessionId, companyId, false); // False = não limpa msg, só desconecta
             }
         }
-    }
-  });
 
-  return sock;
+        if (connection === "open") {
+            console.log(`[OPEN] Conexão estabelecida para ${companyId}!`);
+            retries.set(sessionId, 0);
+            
+            await supabase.from("instances").update({ 
+                status: "connected", 
+                qrcode_url: null 
+            }).eq("session_id", sessionId);
+
+            // Sync Inicial de Grupos
+            try {
+                const groups = await sock.groupFetchAllParticipating();
+                for (const g of Object.values(groups)) {
+                    await upsertContact(g.id, sock, g.subject, companyId);
+                }
+            } catch (e) {}
+        }
+    });
+
+    // --- EVENTOS DE HISTÓRICO E MENSAGENS ---
+    sock.ev.on("messaging-history.set", async ({ messages, contacts }) => {
+        console.log(`[HISTORY] Processando ${messages.length} mensagens...`);
+        
+        const formattedMessages = messages.map(msg => extractMessageData(msg, sessionId, companyId)).filter(Boolean);
+        await saveMessagesBatch(formattedMessages);
+
+        if (contacts) {
+            const contactBatch = contacts.map(c => ({
+                jid: c.id,
+                name: c.name || c.notify || c.verifiedName,
+                push_name: c.notify,
+                company_id: companyId,
+                updated_at: new Date()
+            }));
+            
+            const BATCH = 50;
+            for (let i = 0; i < contactBatch.length; i += BATCH) {
+                await supabase.from('contacts').upsert(contactBatch.slice(i, i + BATCH), { onConflict: 'jid' });
+            }
+        }
+    });
+
+    sock.ev.on("contacts.upsert", async (contacts) => {
+        for (const c of contacts) {
+            await upsertContact(c.id, sock, c.name || c.notify, companyId);
+        }
+    });
+
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+        // 🛡️ TRAVA ANTI-ZUMBI 3: Se a sessão morreu, ignora eventos
+        if (!sessions.has(sessionId)) return;
+        if (type !== 'notify') return;
+
+        const formattedMessages = messages.map(msg => extractMessageData(msg, sessionId, companyId)).filter(Boolean);
+
+        if (formattedMessages.length > 0) {
+            console.log(`[MSG] Nova mensagem para ${companyId}`);
+            await supabase.from('messages').insert(formattedMessages);
+            
+            for (const msg of messages) {
+                if (!msg.key.fromMe && msg.key.remoteJid) {
+                    await upsertContact(msg.key.remoteJid, sock, msg.pushName, companyId);
+                }
+            }
+        }
+    });
+
+    return sock;
 };
 
-export const deleteSession = async (sessionId, companyId) => {
-    console.log(`[RESET] MATANDO SESSÃO ${sessionId} (Comando do Usuário)...`);
+// --- AQUI ESTÁ A LÓGICA DE LIMPEZA BLINDADA ---
+export const deleteSession = async (sessionId, companyId, clearDb = true) => {
+    console.log(`[DELETE] Expurgo da sessão ${sessionId}...`);
     
-    // 1. Remove do Indexador IMEDIATAMENTE para impedir lookups
+    // 1. PRIMEIRO: Remove do Indexador (Impede novos acessos)
     if (companyId) companyIndex.delete(companyId);
     
-    // 2. Pega o socket
+    // 2. SEGUNDO: Pega o socket
     const sock = sessions.get(sessionId);
     
-    // 3. Remove do Mapa Principal IMEDIATAMENTE (Isso ativa a Trava 1)
+    // 3. TERCEIRO: Remove do Mapa Principal (ATIVANDO A TRAVA NO connection.update)
     sessions.delete(sessionId);
+    retries.delete(sessionId);
     
-    // 4. Encerra o Socket
+    // 4. QUARTO: Só agora encerra a conexão
     if (sock) { 
-        sock.shouldReconnect = false; // Ativa a Trava 2
-        try { 
-            sock.end(undefined); 
-        } catch (e) {
-            console.log("Erro ao fechar socket (provavelmente já fechado)");
-        } 
+        try { sock.end(undefined); } catch (e) {} 
     }
-    
-    // 5. Limpa o Banco
-    await supabase.from("instances").delete().eq("session_id", sessionId);
-    await supabase.from("baileys_auth_state").delete().eq("session_id", sessionId);
+
+    if (clearDb) {
+        // Limpa auth e instâncias
+        await supabase.from("instances").delete().eq("session_id", sessionId);
+        await supabase.from("baileys_auth_state").delete().eq("session_id", sessionId);
+
+        // 🔥 LIMPEZA TOTAL (Factory Reset) - Conforme solicitado no código Thanos
+        if (companyId) {
+            console.log(`[WIPE] Factory Reset na empresa ${companyId}...`);
+            await supabase.from("messages").delete().eq("company_id", companyId);
+            await supabase.from("contacts").delete().eq("company_id", companyId);
+        }
+    }
     return true;
 };
 
 export const sendMessage = async (sessionId, to, text) => {
-  const sock = sessions.get(sessionId);
-  if (!sock) throw new Error("Sessão não ativa");
-  const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-  return await sock.sendMessage(jid, { text });
+    const sock = sessions.get(sessionId);
+    if (!sock) throw new Error("Sessão não ativa");
+    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+    return await sock.sendMessage(jid, { text });
 };
 
 export const getSessionId = (companyId) => {
@@ -246,6 +311,9 @@ export const getSessionId = (companyId) => {
 
 export const getSession = (companyId) => {
     const sessionId = companyIndex.get(companyId);
-    if (!sessionId) return null;
+    if (!sessionId) {
+        // console.warn(`[WARN] Sessão não encontrada via index para empresa ${companyId}.`);
+        return null;
+    }
     return sessions.get(sessionId);
 };
