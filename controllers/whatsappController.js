@@ -3,35 +3,40 @@ import { useSupabaseAuthState } from "../auth/supabaseAuth.js";
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
+// 1. CHECAGEM DE SEGURANÇA (INFRAESTRUTURA)
+if (!process.env.SUPABASE_KEY || !process.env.SUPABASE_URL) {
+    console.error("❌ ERRO FATAL: Chaves do Supabase não encontradas no .env");
+}
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // --- ARQUITETURA DE MEMÓRIA ---
-const sessions = new Map(); // sessionId -> Socket
-const companyIndex = new Map(); // companyId -> sessionId
-const retries = new Map();
+const sessions = new Map();      // Mapa: sessionId -> Socket
+const companyIndex = new Map();  // Mapa: companyId -> sessionId
+const retries = new Map();       // Mapa: sessionId -> Tentativas de reconexão
 
-// --- FUNÇÃO AUXILIAR 1: Extrai dados úteis da mensagem ---
+// --- FUNÇÃO AUXILIAR 1: Extrai dados da mensagem (COM LOGICA COMPLETA) ---
 const extractMessageData = (msg, sessionId, companyId) => {
     if (!msg.message) return null;
     if (msg.message.protocolMessage || msg.message.senderKeyDistributionMessage) return null;
 
     let remoteJid = msg.key.remoteJid;
     
-    // Normalização de JID
+    // Normalização de JID (Remove sufixos de device :1, :2...)
     if (remoteJid.includes(':')) {
         remoteJid = remoteJid.split(':')[0] + '@s.whatsapp.net';
     }
     
+    // Ignora Status (Stories) e Broadcasts
     if (remoteJid === 'status@broadcast' || remoteJid.includes('@broadcast')) return null;
 
     const fromMe = msg.key.fromMe;
     
     let content = "";
     let messageType = "text";
-
     const m = msg.message;
 
-    // Prioridade de extração
+    // Prioridade de Extração
     if (m.conversation) content = m.conversation;
     else if (m.extendedTextMessage?.text) content = m.extendedTextMessage.text;
     else if (m.imageMessage) { content = m.imageMessage.caption || "[Imagem]"; messageType = "image"; }
@@ -46,33 +51,31 @@ const extractMessageData = (msg, sessionId, companyId) => {
 
     if (!content) return null;
 
-    const messageTimestamp = msg.messageTimestamp 
-        ? new Date(msg.messageTimestamp * 1000).toISOString() 
-        : new Date().toISOString();
-
     return {
         session_id: sessionId,
-        company_id: companyId,
+        company_id: companyId, // VITAL: Sem isso o frontend não acha a mensagem
         remote_jid: remoteJid,
         from_me: fromMe,
         content: content,
         message_type: messageType,
         status: 'received',
-        created_at: messageTimestamp
+        created_at: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toISOString() : new Date().toISOString()
     };
 };
 
-// --- FUNÇÃO AUXILIAR 2: Salva Contato ---
+// --- FUNÇÃO AUXILIAR 2: Salva Contato Unitário (Com Metadata de Grupo) ---
 const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
     try {
         const isGroup = jid.endsWith('@g.us');
         let name = pushName;
         let profilePicUrl = null;
 
+        // 1. Tenta pegar foto (pode falhar por privacidade)
         try {
             profilePicUrl = await sock.profilePictureUrl(jid, 'image');
         } catch (e) { /* Silencioso */ }
 
+        // 2. Se for grupo e não tiver nome, busca metadata
         if (isGroup && !name) {
             try {
                 const groupMetadata = await sock.groupMetadata(jid);
@@ -93,34 +96,45 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
         
         if (companyId) contactData.company_id = companyId;
 
-        await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
+        const { error } = await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
+        
+        if (error) {
+             console.error(`[CONTACT ERROR] Falha ao salvar ${jid}:`, error.message);
+        }
 
     } catch (err) {
-        // console.error(`Erro ao salvar contato ${jid}:`, err.message);
+        console.error(`[CONTACT FATAL] ${err.message}`);
     }
 };
 
-// --- FUNÇÃO AUXILIAR 3: Batch Save ---
+// --- FUNÇÃO AUXILIAR 3: Salva Mensagens em Lote (Batch) ---
 const saveMessagesBatch = async (messages) => {
     if (!messages || messages.length === 0) return;
+    
     const BATCH_SIZE = 50;
     for (let i = 0; i < messages.length; i += BATCH_SIZE) {
         const batch = messages.slice(i, i + BATCH_SIZE);
         try {
-            const { error } = await supabase.from('messages').insert(batch);
-            if (error) console.error("Erro ao salvar lote:", error.message);
+            // Usamos .select() para confirmar se inseriu e ver erros detalhados
+            const { error } = await supabase.from('messages').insert(batch).select();
+            
+            if (error) {
+                console.error("❌ ERRO SUPABASE (BATCH MESSAGES):", JSON.stringify(error, null, 2));
+            } else {
+                console.log(`✅ [DB] ${batch.length} mensagens salvas.`);
+            }
         } catch (err) {
-            console.error("Erro crítico no batch:", err.message);
+            console.error("❌ ERRO CRÍTICO NO BATCH:", err.message);
         }
     }
-    console.log(`[DB] ${messages.length} mensagens salvas.`);
 };
 
 // --- CORE: Iniciar Sessão ---
 export const startSession = async (sessionId, companyId) => {
-    // Limpeza prévia (Garbage Collection)
+    console.log(`[START] Iniciando sessão para empresa: ${companyId}`);
+    
+    // Limpeza de processos anteriores
     if (sessions.has(sessionId)) {
-        // Chamamos deleteSession mas sem limpar o banco, apenas para matar o processo anterior
         await deleteSession(sessionId, companyId, false);
     }
 
@@ -142,18 +156,14 @@ export const startSession = async (sessionId, companyId) => {
 
     sock.companyId = companyId;
     sessions.set(sessionId, sock); 
-    
-    if (companyId) {
-        companyIndex.set(companyId, sessionId);
-        console.log(`[INIT] Empresa ${companyId} :: Sessão ${sessionId}`);
-    }
+    if (companyId) companyIndex.set(companyId, sessionId);
 
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        // 🛡️ TRAVA ANTI-ZUMBI 1: Se não está no mapa, pare imediatamente.
+        // 🛡️ TRAVA ANTI-ZUMBI 1: Se a sessão foi deletada do mapa, ignora tudo.
         if (!sessions.has(sessionId)) return;
 
         if (connection === 'connecting') {
@@ -174,36 +184,32 @@ export const startSession = async (sessionId, companyId) => {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
-            // 🛡️ TRAVA ANTI-ZUMBI 2: Verificação dupla
+            // 🛡️ TRAVA ANTI-ZUMBI 2: Só reconecta se a sessão AINDA existir no mapa
             if (shouldReconnect && sessions.has(sessionId)) {
                 await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
                 
-                // Remove do mapa temporariamente para evitar loopings rápidos, mas mantém retries
+                // Remove do mapa temporariamente para evitar loops rápidos (Debounce)
                 sessions.delete(sessionId);
                 
                 const attempt = (retries.get(sessionId) || 0) + 1;
                 retries.set(sessionId, attempt);
-                // Delay progressivo (Backoff)
-                const delay = Math.min(attempt * 2000, 10000);
                 
+                const delay = Math.min(attempt * 2000, 10000);
                 console.log(`[RECONNECT] Tentativa ${attempt} em ${delay}ms...`);
+                
                 setTimeout(() => startSession(sessionId, companyId), delay);
             } else {
-                // Logout intencional ou erro fatal
-                await deleteSession(sessionId, companyId, false); // False = não limpa msg, só desconecta
+                // Logout intencional ou erro fatal -> Limpeza completa
+                await deleteSession(sessionId, companyId, false);
             }
         }
 
         if (connection === "open") {
-            console.log(`[OPEN] Conexão estabelecida para ${companyId}!`);
+            console.log(`[OPEN] Conectado! Baixando histórico...`);
             retries.set(sessionId, 0);
-            
-            await supabase.from("instances").update({ 
-                status: "connected", 
-                qrcode_url: null 
-            }).eq("session_id", sessionId);
+            await supabase.from("instances").update({ status: "connected", qrcode_url: null }).eq("session_id", sessionId);
 
-            // Sync Inicial de Grupos
+            // Sync Inicial de Grupos (Garante que nomes de grupos apareçam)
             try {
                 const groups = await sock.groupFetchAllParticipating();
                 for (const g of Object.values(groups)) {
@@ -213,13 +219,15 @@ export const startSession = async (sessionId, companyId) => {
         }
     });
 
-    // --- EVENTOS DE HISTÓRICO E MENSAGENS ---
+    // --- EVENTOS DE HISTÓRICO (SYNC INICIAL) ---
     sock.ev.on("messaging-history.set", async ({ messages, contacts }) => {
-        console.log(`[HISTORY] Processando ${messages.length} mensagens...`);
+        console.log(`[HISTORY] Recebido: ${messages.length} msgs, ${contacts?.length || 0} contatos.`);
         
+        // 1. Salva Mensagens
         const formattedMessages = messages.map(msg => extractMessageData(msg, sessionId, companyId)).filter(Boolean);
         await saveMessagesBatch(formattedMessages);
 
+        // 2. Salva Contatos em LOTE (Melhor performance que um por um)
         if (contacts) {
             const contactBatch = contacts.map(c => ({
                 jid: c.id,
@@ -231,28 +239,33 @@ export const startSession = async (sessionId, companyId) => {
             
             const BATCH = 50;
             for (let i = 0; i < contactBatch.length; i += BATCH) {
-                await supabase.from('contacts').upsert(contactBatch.slice(i, i + BATCH), { onConflict: 'jid' });
+                const chunk = contactBatch.slice(i, i + BATCH);
+                const { error } = await supabase.from('contacts').upsert(chunk, { onConflict: 'jid' });
+                if (error) console.error("Erro no batch de contatos:", error.message);
             }
         }
     });
 
+    // --- EVENTOS DE ATUALIZAÇÃO DE CONTATOS ---
     sock.ev.on("contacts.upsert", async (contacts) => {
         for (const c of contacts) {
             await upsertContact(c.id, sock, c.name || c.notify, companyId);
         }
     });
 
+    // --- EVENTOS DE MENSAGENS EM TEMPO REAL ---
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
-        // 🛡️ TRAVA ANTI-ZUMBI 3: Se a sessão morreu, ignora eventos
+        // 🛡️ TRAVA ANTI-ZUMBI 3
         if (!sessions.has(sessionId)) return;
         if (type !== 'notify') return;
 
         const formattedMessages = messages.map(msg => extractMessageData(msg, sessionId, companyId)).filter(Boolean);
 
         if (formattedMessages.length > 0) {
-            console.log(`[MSG] Nova mensagem para ${companyId}`);
-            await supabase.from('messages').insert(formattedMessages);
+            console.log(`[MSG] Nova mensagem recebida. Salvando...`);
+            await saveMessagesBatch(formattedMessages);
             
+            // Atualiza o contato do remetente na hora
             for (const msg of messages) {
                 if (!msg.key.fromMe && msg.key.remoteJid) {
                     await upsertContact(msg.key.remoteJid, sock, msg.pushName, companyId);
@@ -264,21 +277,21 @@ export const startSession = async (sessionId, companyId) => {
     return sock;
 };
 
-// --- AQUI ESTÁ A LÓGICA DE LIMPEZA BLINDADA ---
+// --- FUNÇÃO DE DELETAR (ANTI-ZUMBI) ---
 export const deleteSession = async (sessionId, companyId, clearDb = true) => {
-    console.log(`[DELETE] Expurgo da sessão ${sessionId}...`);
+    console.log(`[DELETE] Matando sessão ${sessionId}`);
     
-    // 1. PRIMEIRO: Remove do Indexador (Impede novos acessos)
+    // 1. Remove do Indexador
     if (companyId) companyIndex.delete(companyId);
     
-    // 2. SEGUNDO: Pega o socket
+    // 2. Pega o socket ANTES de deletar
     const sock = sessions.get(sessionId);
     
-    // 3. TERCEIRO: Remove do Mapa Principal (ATIVANDO A TRAVA NO connection.update)
+    // 3. Deleta do Mapa (Isso ativa as travas nos eventos)
     sessions.delete(sessionId);
     retries.delete(sessionId);
     
-    // 4. QUARTO: Só agora encerra a conexão
+    // 4. Encerra o Socket
     if (sock) { 
         try { sock.end(undefined); } catch (e) {} 
     }
@@ -287,12 +300,12 @@ export const deleteSession = async (sessionId, companyId, clearDb = true) => {
         // Limpa auth e instâncias
         await supabase.from("instances").delete().eq("session_id", sessionId);
         await supabase.from("baileys_auth_state").delete().eq("session_id", sessionId);
-
-        // 🔥 LIMPEZA TOTAL (Factory Reset) - Conforme solicitado no código Thanos
+        
+        // Limpeza Total (Factory Reset)
         if (companyId) {
-            console.log(`[WIPE] Factory Reset na empresa ${companyId}...`);
-            await supabase.from("messages").delete().eq("company_id", companyId);
-            await supabase.from("contacts").delete().eq("company_id", companyId);
+             console.log(`[WIPE] Limpando dados da empresa ${companyId}...`);
+             await supabase.from("messages").delete().eq("company_id", companyId);
+             await supabase.from("contacts").delete().eq("company_id", companyId);
         }
     }
     return true;
@@ -305,15 +318,9 @@ export const sendMessage = async (sessionId, to, text) => {
     return await sock.sendMessage(jid, { text });
 };
 
-export const getSessionId = (companyId) => {
-    return companyIndex.get(companyId);
-};
+export const getSessionId = (companyId) => companyIndex.get(companyId);
 
 export const getSession = (companyId) => {
     const sessionId = companyIndex.get(companyId);
-    if (!sessionId) {
-        // console.warn(`[WARN] Sessão não encontrada via index para empresa ${companyId}.`);
-        return null;
-    }
-    return sessions.get(sessionId);
+    return sessionId ? sessions.get(sessionId) : null;
 };
