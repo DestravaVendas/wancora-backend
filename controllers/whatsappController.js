@@ -1,37 +1,21 @@
-import { makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, delay } from "@whiskeysockets/baileys";
-import { createClient } from "@supabase/supabase-js";
+import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, delay } from "@whiskeysockets/baileys";
 import { useSupabaseAuthState } from "../auth/supabaseAuth.js";
-import dotenv from "dotenv";
+import { createClient } from "@supabase/supabase-js";
+import pino from "pino";
 
-dotenv.config();
+// CHECAGEM DE SEGURANÇA
+if (!process.env.SUPABASE_KEY || !process.env.SUPABASE_URL) {
+    console.error("❌ ERRO FATAL: Chaves do Supabase não encontradas no .env");
+}
 
-// Admin Client para escrever no banco ignorando RLS (o backend é o sistema)
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
-  auth: {
-    persistSession: false
-  }
-});
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// Armazena as sessões ativas em memória: { sessionId: { socket, companyId } }
-const sessions = new Map();
+// --- ARQUITETURA DE MEMÓRIA ---
+const sessions = new Map();      
+const companyIndex = new Map();  
+const retries = new Map();       
 
-// Helper para extrair conteúdo de texto de mensagens variadas
-const getMessageContent = (msg) => {
-    if (!msg) return "";
-    return (
-        msg.conversation ||
-        msg.extendedTextMessage?.text ||
-        msg.imageMessage?.caption ||
-        msg.videoMessage?.caption ||
-        msg.documentMessage?.caption ||
-        (msg.listResponseMessage?.singleSelectReply?.selectedRowId) ||
-        (msg.buttonsResponseMessage?.selectedButtonId) ||
-        (msg.templateButtonReplyMessage?.selectedId) ||
-        ""
-    );
-};
-
-// Helper para determinar o tipo da mensagem
+// --- HELPER 1: Determinar Tipo da Mensagem ---
 const getMessageType = (msg) => {
     if (msg.imageMessage) return 'image';
     if (msg.videoMessage) return 'video';
@@ -39,241 +23,302 @@ const getMessageType = (msg) => {
     if (msg.documentMessage) return 'document';
     if (msg.stickerMessage) return 'sticker';
     if (msg.locationMessage) return 'location';
+    if (msg.pollCreationMessage || msg.pollCreationMessageV3) return 'poll';
     return 'text';
 };
 
-export const startSession = async (req, res) => {
-  const { sessionId, companyId } = req.body;
+// --- HELPER 2: Extrair Conteúdo (Texto, Caption ou JSON de Enquete) ---
+const getMessageContent = (msg) => {
+    if (!msg) return "";
+    
+    // Texto Simples
+    if (msg.conversation) return msg.conversation;
+    if (msg.extendedTextMessage?.text) return msg.extendedTextMessage.text;
+    
+    // Mídias com Legenda
+    if (msg.imageMessage?.caption) return msg.imageMessage.caption;
+    if (msg.videoMessage?.caption) return msg.videoMessage.caption;
+    if (msg.documentMessage?.caption) return msg.documentMessage.caption;
+    
+    // Se for mídia sem legenda, retorna identificador
+    if (msg.imageMessage) return "[Imagem]";
+    if (msg.videoMessage) return "[Vídeo]";
+    if (msg.audioMessage) return "[Áudio]";
+    if (msg.documentMessage) return msg.documentMessage.fileName || "[Documento]";
+    if (msg.stickerMessage) return "[Figurinha]";
 
-  if (!sessionId || !companyId) {
-    return res.status(400).json({ error: "SessionID e CompanyID são obrigatórios." });
-  }
+    // Enquete (Salva as opções como texto JSON para o frontend ler depois)
+    if (msg.pollCreationMessage || msg.pollCreationMessageV3) {
+        const pollData = (msg.pollCreationMessage || msg.pollCreationMessageV3);
+        return JSON.stringify({
+            name: pollData.name,
+            options: pollData.options.map(o => o.optionName)
+        });
+    }
 
-  // Se já existe, retorna ok (mas monitora status)
-  if (sessions.has(sessionId)) {
-      return res.status(200).json({ message: "Sessão já inicializada." });
-  }
+    return "";
+};
 
-  try {
-    // Usa o adaptador de Auth do Supabase que você já configurou
+// --- HELPER 3: Upsert Contato Inteligente ---
+const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
+    try {
+        if (!jid || jid.includes('status@broadcast')) return;
+        
+        // Remove sufixos de dispositivo para garantir ID limpo
+        const cleanJid = jid.split(':')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
+
+        const isGroup = cleanJid.endsWith('@g.us');
+        let name = pushName;
+        let profilePicUrl = null;
+
+        // Tenta pegar foto (pode falhar por privacidade)
+        try {
+            // profilePicUrl = await sock.profilePictureUrl(cleanJid, 'image'); // Opcional: Descomente se quiser fotos (consome banda)
+        } catch (e) {}
+
+        // Se for grupo, força pegar o nome atualizado
+        if (isGroup) {
+            try {
+                const groupMetadata = await sock.groupMetadata(cleanJid);
+                name = groupMetadata.subject;
+            } catch (e) {}
+        }
+
+        const contactData = {
+            jid: cleanJid,
+            profile_pic_url: profilePicUrl,
+            updated_at: new Date()
+        };
+        
+        // Só atualiza nome se tiver um novo (não sobrescreve com null)
+        if (name) {
+            contactData.name = name;
+            contactData.push_name = name;
+        }
+        if (companyId) contactData.company_id = companyId;
+
+        await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
+    } catch (err) {
+        // Silencioso
+    }
+};
+
+// --- HELPER 4: Salvar Mensagem no Banco ---
+const saveMessageToDb = async (msgInfo) => {
+    const { error } = await supabase.from('messages').insert(msgInfo);
+    if (error) console.error("❌ Erro DB:", error.message);
+};
+
+// ==============================================================================
+// CORE: START SESSION
+// ==============================================================================
+export const startSession = async (sessionId, companyId) => {
+    console.log(`[START] Sessão ${sessionId} (Empresa: ${companyId})`);
+    
+    if (sessions.has(sessionId)) {
+        await deleteSession(sessionId, companyId, false);
+    }
+
     const { state, saveCreds } = await useSupabaseAuthState(sessionId);
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
-      version,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, console),
-      },
-      printQRInTerminal: false, // Desativado pois salvamos no banco
-      mobile: false,
-      browser: ["Wancora CRM", "Chrome", "10.0"],
-      syncFullHistory: true, // Importante para puxar histórico antigo
-      generateHighQualityLinkPreview: true,
-    });
-
-    // Salva referência em memória
-    sessions.set(sessionId, { socket: sock, companyId });
-
-    // 1. EVENTO: ATUALIZAÇÃO DE CONEXÃO (QR CODE & STATUS)
-    sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, qr } = update;
-
-      // Salva QR Code no Banco para o Frontend exibir
-      if (qr) {
-        console.log(`[QR CODE] Gerado para sessão ${sessionId}`);
-        await supabase
-          .from("instances")
-          .update({ 
-              qrcode_url: qr, // Salva a string bruta do QR
-              status: "qr_ready",
-              updated_at: new Date()
-          })
-          .eq("session_id", sessionId)
-          .eq("company_id", companyId);
-      }
-
-      if (connection === "close") {
-        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-        console.log(`[CONEXÃO] Fechada (${sessionId}). Reconectar: ${shouldReconnect}`);
-
-        await supabase
-            .from("instances")
-            .update({ status: "disconnected" })
-            .eq("session_id", sessionId);
-
-        sessions.delete(sessionId);
-        
-        if (shouldReconnect) {
-            // Pequeno delay e tenta reconectar internamente simulando o request
-            setTimeout(() => {
-                startSession({ body: { sessionId, companyId } }, { status: () => ({ json: () => {} }) });
-            }, 3000);
+        version,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
+        },
+        printQRInTerminal: true,
+        logger: pino({ level: "silent" }),
+        browser: ["Wancora CRM", "Chrome", "10.0"],
+        syncFullHistory: true, 
+        markOnlineOnConnect: true,
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 30000,
+        generateHighQualityLinkPreview: true,
+        getMessage: async (key) => {
+            // Necessário para re-envio em algumas situações
+            return { conversation: "hello" };
         }
-      } 
-      
-      else if (connection === "open") {
-        console.log(`[CONEXÃO] Aberta (${sessionId})`);
-        
-        // Pega info do usuário (foto e nome)
-        const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-        let profilePic = null;
-        try {
-            profilePic = await sock.profilePictureUrl(userJid, 'image').catch(() => null);
-        } catch(e) {}
-
-        await supabase
-          .from("instances")
-          .update({ 
-              status: "connected", 
-              qrcode_url: null, // Limpa QR
-              profile_pic_url: profilePic,
-              name: sock.user.name || sessionId, // Tenta pegar nome do WP ou usa sessão
-              updated_at: new Date()
-          })
-          .eq("session_id", sessionId);
-      }
     });
 
-    // 2. EVENTO: SALVAR CREDENCIAIS
+    sock.companyId = companyId;
+    sessions.set(sessionId, sock); 
+    if (companyId) companyIndex.set(companyId, sessionId);
+
     sock.ev.on("creds.update", saveCreds);
 
-    // 3. EVENTO: RECEBIMENTO DE MENSAGENS (AQUI ESTÁ A MÁGICA QUE FALTAVA)
-    sock.ev.on("messages.upsert", async ({ messages, type }) => {
-        try {
-            if (type === "notify" || type === "append") {
-                for (const msg of messages) {
-                    if (!msg.message) continue;
+    // --- CONEXÃO ---
+    sock.ev.on("connection.update", async (update) => {
+        const { connection, lastDisconnect, qr } = update;
 
-                    // Ignora mensagens de status/protocolo
-                    if (msg.key.remoteJid === "status@broadcast") continue;
+        if (!sessions.has(sessionId)) return; 
 
-                    const body = getMessageContent(msg.message);
-                    const messageType = getMessageType(msg.message);
-                    const remoteJid = msg.key.remoteJid;
-                    const fromMe = msg.key.fromMe;
-                    const pushName = msg.pushName;
+        if (qr) {
+            await supabase.from("instances").upsert({ 
+                session_id: sessionId, qrcode_url: qr, status: "qrcode", company_id: companyId, name: "Conectando...", updated_at: new Date()
+            }, { onConflict: 'session_id' });
+        }
 
-                    // 3.1 Salva/Atualiza Contato (Upsert)
-                    // Só tenta atualizar contatos se não for grupo (termina com g.us) ou se quiser tratar grupos diferente
-                    if(!remoteJid.includes('@g.us')) {
-                        const { error: contactError } = await supabase
-                        .from('contacts')
-                        .upsert({
-                            company_id: companyId,
-                            jid: remoteJid,
-                            name: pushName || null,
-                            push_name: pushName || null,
-                            updated_at: new Date()
-                        }, { onConflict: 'jid' });
-                        
-                        if(contactError) console.error("Erro ao salvar contato:", contactError);
-                    }
-
-                    // 3.2 Salva Mensagem
-                    const { error: msgError } = await supabase.from('messages').insert({
-                        company_id: companyId,
-                        session_id: sessionId,
-                        remote_jid: remoteJid,
-                        from_me: fromMe,
-                        content: body, // Texto
-                        message_type: messageType,
-                        status: 'delivered', // Assumimos entregue ao receber
-                        created_at: new Date(msg.messageTimestamp * 1000)
-                    });
-
-                    if(msgError) console.error("Erro ao salvar mensagem:", msgError);
-
-                    // 3.3 (Opcional) Trigger para Agente IA se não for fromMe
-                    if (!fromMe) {
-                         // Aqui você chamaria o worker/queue para a IA responder
-                         // await campaignQueue.add({ type: 'ai_reply', ... })
-                    }
-                }
+        if (connection === "close") {
+            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect && sessions.has(sessionId)) {
+                await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
+                sessions.delete(sessionId);
+                const attempt = (retries.get(sessionId) || 0) + 1;
+                retries.set(sessionId, attempt);
+                setTimeout(() => startSession(sessionId, companyId), Math.min(attempt * 2000, 10000));
+            } else {
+                await deleteSession(sessionId, companyId, false);
             }
-        } catch (error) {
-            console.error("Erro ao processar mensagens:", error);
+        }
+
+        if (connection === "open") {
+            console.log(`[OPEN] Conectado!`);
+            retries.set(sessionId, 0);
+            
+            const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+            let myPic = null;
+            try { myPic = await sock.profilePictureUrl(userJid, 'image'); } catch(e){}
+
+            await supabase.from("instances").update({ 
+                status: "connected", qrcode_url: null, name: sock.user.name || "WhatsApp Conectado", profile_pic_url: myPic, updated_at: new Date()
+            }).eq("session_id", sessionId);
+
+            // Sync Grupos Inicial
+            try {
+                const groups = await sock.groupFetchAllParticipating();
+                for (const g of Object.values(groups)) {
+                    await upsertContact(g.id, sock, g.subject, companyId);
+                }
+            } catch (e) {}
         }
     });
 
-    // 4. EVENTO: ATUALIZAÇÃO DE CONTATOS (Foto e Nome)
-    sock.ev.on('contacts.upsert', async (contacts) => {
-        for (const contact of contacts) {
-             // Tenta buscar foto
-             let profileUrl = null;
-             /* 
-                Nota: Fetch de foto é pesado e pode dar rate limit. 
-                Idealmente deve ser feito em fila background ou sob demanda.
-                Deixaremos comentado para performance inicial.
-             */
-             // try { profileUrl = await sock.profilePictureUrl(contact.id, 'image'); } catch {}
+    // --- PROCESSAMENTO DE MENSAGENS (TEXTO, MÍDIA, ENQUETES) ---
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+        if (!sessions.has(sessionId)) return;
 
-             await supabase.from('contacts').upsert({
-                 company_id: companyId,
-                 jid: contact.id,
-                 name: contact.name || contact.notify || null,
-                 profile_pic_url: profileUrl
-             }, { onConflict: 'jid' });
+        if (type === "notify" || type === "append") {
+            for (const msg of messages) {
+                if (!msg.message) continue;
+                if (msg.key.remoteJid === 'status@broadcast') continue;
+
+                const remoteJid = msg.key.remoteJid;
+                const fromMe = msg.key.fromMe;
+                const content = getMessageContent(msg.message);
+                const msgType = getMessageType(msg.message);
+
+                if (!content && msgType === 'text') continue;
+
+                // 1. Garante Contato
+                await upsertContact(remoteJid, sock, msg.pushName, companyId);
+
+                // 2. Salva Mensagem
+                await saveMessageToDb({
+                    company_id: companyId,
+                    session_id: sessionId,
+                    remote_jid: remoteJid,
+                    from_me: fromMe,
+                    content: content,
+                    message_type: msgType,
+                    status: fromMe ? 'sent' : 'received',
+                    created_at: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000) : new Date()
+                });
+            }
         }
     });
 
-    res.status(200).json({ message: "Sessão iniciada", status: "connecting" });
-
-  } catch (error) {
-    console.error("Erro fatal ao iniciar sessão:", error);
-    res.status(500).json({ error: "Falha interna ao iniciar Wancora Engine" });
-  }
+    return sock;
 };
 
-export const logoutSession = async (req, res) => {
-    const { sessionId, companyId } = req.body;
-    const session = sessions.get(sessionId);
-
-    if (session) {
-        try {
-            await session.socket.logout();
-            session.socket.end(undefined);
-            sessions.delete(sessionId);
-        } catch (e) {}
-    }
-
-    // Limpa no banco
-    await supabase
-        .from("instances")
-        .update({ status: "disconnected", qrcode_url: null })
-        .eq("session_id", sessionId)
-        .eq("company_id", companyId);
-        
-    // Opcional: Limpar tabela de auth se quiser "Esquecer" totalmente
-    // await supabase.from("baileys_auth_state").delete().eq("session_id", sessionId);
-
-    res.status(200).json({ message: "Sessão desconectada." });
-};
-
-export const sendMessage = async (req, res) => {
-    const { sessionId, to, text, companyId } = req.body;
+// ==============================================================================
+// FUNÇÃO DE ENVIO UNIVERSAL (Texto, Imagem, Áudio, Doc, Enquete)
+// ==============================================================================
+export const sendMessage = async (sessionId, to, payload) => {
+    const sock = sessions.get(sessionId);
+    if (!sock) throw new Error("Sessão não ativa");
     
-    // Recupera sessão da memória
-    const session = sessions.get(sessionId);
+    // Normaliza JID
+    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+    
+    // Payload pode ser string (texto simples) ou objeto (mídia/enquete)
+    // Formatos esperados no payload:
+    // Texto: { type: 'text', content: 'Olá' }
+    // Imagem: { type: 'image', url: 'https://...', caption: 'Olha isso' }
+    // Áudio: { type: 'audio', url: 'https://...', ptt: true }  (ptt=true manda como nota de voz)
+    // Doc: { type: 'document', url: 'https://...', fileName: 'contrato.pdf' }
+    // Enquete: { type: 'poll', name: 'Qual sua cor?', values: ['Azul', 'Vermelho'], selectableCount: 1 }
 
-    if (!session) {
-        return res.status(404).json({ error: "Sessão não encontrada ou desconectada." });
+    const type = payload.type || 'text';
+    let msgContent = {};
+
+    switch (type) {
+        case 'text':
+            msgContent = { text: payload.content };
+            break;
+            
+        case 'image':
+            msgContent = { image: { url: payload.url }, caption: payload.caption || '' };
+            break;
+
+        case 'video':
+            msgContent = { video: { url: payload.url }, caption: payload.caption || '' };
+            break;
+
+        case 'audio':
+            // ptt: true faz aparecer como "nota de voz" (aquele microfone azul)
+            msgContent = { audio: { url: payload.url }, mimetype: 'audio/mp4', ptt: payload.ptt || false };
+            break;
+
+        case 'document':
+            msgContent = { 
+                document: { url: payload.url }, 
+                mimetype: payload.mimetype || 'application/pdf', 
+                fileName: payload.fileName || 'arquivo.pdf' 
+            };
+            break;
+
+        case 'poll':
+            msgContent = {
+                poll: {
+                    name: payload.name,
+                    values: payload.values, // Array de strings ['Opção 1', 'Opção 2']
+                    selectableCount: payload.selectableCount || 1
+                }
+            };
+            break;
+
+        default:
+            throw new Error(`Tipo de mensagem não suportado: ${type}`);
     }
 
-    try {
-        const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-        
-        // Envia via Baileys
-        const sentMsg = await session.socket.sendMessage(jid, { text: text });
+    const sent = await sock.sendMessage(jid, msgContent);
+    return sent;
+};
 
-        // Salva no banco (O listener 'messages.upsert' com fromMe=true TAMBÉM dispara, 
-        // mas para garantir latência zero na UI, podemos salvar aqui ou confiar no listener. 
-        // O listener é mais seguro pois confirma que o WP aceitou).
-        // Vamos confiar no listener acima para evitar duplicidade.
-        
-        res.status(200).json({ message: "Enviado", id: sentMsg.key.id });
-    } catch (error) {
-        console.error("Erro envio:", error);
-        res.status(500).json({ error: "Falha no envio da mensagem." });
+// ==============================================================================
+// DELETE & GETTERS
+// ==============================================================================
+export const deleteSession = async (sessionId, companyId, clearDb = true) => {
+    console.log(`[DELETE] Sessão ${sessionId}`);
+    if (companyId) companyIndex.delete(companyId);
+    
+    const sock = sessions.get(sessionId);
+    sessions.delete(sessionId);
+    retries.delete(sessionId);
+    
+    if (sock) { try { sock.end(undefined); } catch (e) {} }
+
+    if (clearDb) {
+        await supabase.from("instances").delete().eq("session_id", sessionId);
+        await supabase.from("baileys_auth_state").delete().eq("session_id", sessionId);
     }
+    return true;
+};
+
+export const getSessionId = (companyId) => companyIndex.get(companyId);
+export const getSession = (companyId) => {
+    const sessionId = companyIndex.get(companyId);
+    return sessionId ? sessions.get(sessionId) : null;
 };
