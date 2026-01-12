@@ -13,20 +13,20 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 // --- ARQUITETURA DE MEMÓRIA ---
 const sessions = new Map();      
 const companyIndex = new Map();  
-const retries = new Map();       
+const retries = new Map(); 
+// NOVO: Mapa para guardar os timers de reconexão e poder cancelá-los
+const reconnectTimers = new Map();      
 
 // --- HELPER NOVO: Garante que o Lead existe (Anti-Ghost) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
-    // Ignora status e grupos na criação de LEAD (Lead geralmente é pessoa)
     if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) return null;
 
     const phone = remoteJid.split('@')[0];
 
-    // 1. Tenta achar o lead
     const { data: existingLead } = await supabase
         .from('leads')
         .select('id')
-        .eq('phone', phone) // Busca pelo telefone limpo
+        .eq('phone', phone) 
         .eq('company_id', companyId)
         .maybeSingle();
 
@@ -34,15 +34,14 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
 
     console.log(`[AUTO-LEAD] Criando lead para ${phone}...`);
 
-    // 2. Se não existe, cria (Entrada Orgânica)
     const { data: newLead, error } = await supabase
         .from('leads')
         .insert({
             company_id: companyId,
             name: pushName || `Novo Contato (${phone})`,
             phone: phone,
-            status: 'new', // Status inicial no Kanban
-            funnel_stage_id: null // Pode configurar um padrão depois
+            status: 'new', 
+            funnel_stage_id: null 
         })
         .select('id')
         .single();
@@ -132,6 +131,7 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
 export const startSession = async (sessionId, companyId) => {
     console.log(`[START] Sessão ${sessionId} (Empresa: ${companyId})`);
     
+    // Garante limpeza antes de iniciar
     if (sessions.has(sessionId)) {
         await deleteSession(sessionId, companyId, false);
     }
@@ -174,13 +174,34 @@ export const startSession = async (sessionId, companyId) => {
         }
 
         if (connection === "close") {
+            // Limpa timer anterior se existir
+            if (reconnectTimers.has(sessionId)) {
+                clearTimeout(reconnectTimers.get(sessionId));
+                reconnectTimers.delete(sessionId);
+            }
+
             const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            
             if (shouldReconnect && sessions.has(sessionId)) {
                 await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
-                sessions.delete(sessionId);
+                
+                // Limpeza Parcial (mantém sessão no mapa mas prepara reconexão)
                 const attempt = (retries.get(sessionId) || 0) + 1;
                 retries.set(sessionId, attempt);
-                setTimeout(() => startSession(sessionId, companyId), Math.min(attempt * 2000, 10000));
+                
+                const delayMs = Math.min(attempt * 2000, 10000);
+                console.log(`[RECONNECT] Tentativa ${attempt} em ${delayMs}ms...`);
+
+                // FIX: Salva o ID do timeout para poder cancelar no logout
+                const timeoutId = setTimeout(() => {
+                    // Verifica novamente se a sessão ainda deve existir
+                    if (sessions.has(sessionId)) {
+                        startSession(sessionId, companyId);
+                    }
+                }, delayMs);
+                
+                reconnectTimers.set(sessionId, timeoutId);
+
             } else {
                 await deleteSession(sessionId, companyId, false);
             }
@@ -190,6 +211,12 @@ export const startSession = async (sessionId, companyId) => {
             console.log(`[OPEN] Conectado!`);
             retries.set(sessionId, 0);
             
+            // Limpa timers de reconexão pois conectou
+            if (reconnectTimers.has(sessionId)) {
+                clearTimeout(reconnectTimers.get(sessionId));
+                reconnectTimers.delete(sessionId);
+            }
+            
             const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
             let myPic = null;
             try { myPic = await sock.profilePictureUrl(userJid, 'image'); } catch(e){}
@@ -198,7 +225,6 @@ export const startSession = async (sessionId, companyId) => {
                 status: "connected", qrcode_url: null, name: sock.user.name || "WhatsApp Conectado", profile_pic_url: myPic, updated_at: new Date()
             }).eq("session_id", sessionId);
 
-            // Sync Grupos Inicial
             try {
                 const groups = await sock.groupFetchAllParticipating();
                 for (const g of Object.values(groups)) {
@@ -224,19 +250,13 @@ export const startSession = async (sessionId, companyId) => {
 
                 if (!content && msgType === 'text') continue;
 
-                // 1. Garante Contato
                 await upsertContact(remoteJid, sock, msg.pushName, companyId);
 
-                // 2. GARANTE LEAD (A Lógica Nova e Importante)
-                // Se não formos nós mandando, verificamos se o lead existe
                 let leadId = null;
                 if (!fromMe && !remoteJid.includes('@g.us')) {
                     leadId = await ensureLeadExists(remoteJid, msg.pushName, companyId);
-                } else if (!fromMe && remoteJid.includes('@g.us')) {
-                    // Lógica futura para grupos
                 }
 
-                // 3. Salva Mensagem (Agora com lead_id se disponível)
                 const { error } = await supabase.from('messages').insert({
                     company_id: companyId,
                     session_id: sessionId,
@@ -245,7 +265,7 @@ export const startSession = async (sessionId, companyId) => {
                     content: content,
                     message_type: msgType,
                     status: fromMe ? 'sent' : 'received',
-                    lead_id: leadId, // <--- Vincula ao Lead criado/existente
+                    lead_id: leadId, 
                     created_at: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000) : new Date()
                 });
 
@@ -272,6 +292,7 @@ export const sendMessage = async (sessionId, to, payload) => {
         case 'text': msgContent = { text: payload.content }; break;
         case 'image': msgContent = { image: { url: payload.url }, caption: payload.caption || '' }; break;
         case 'video': msgContent = { video: { url: payload.url }, caption: payload.caption || '' }; break;
+        // Ajuste no mimetype do áudio para tentar compatibilidade
         case 'audio': msgContent = { audio: { url: payload.url }, mimetype: 'audio/mp4', ptt: payload.ptt || false }; break;
         case 'document': msgContent = { document: { url: payload.url }, mimetype: payload.mimetype || 'application/pdf', fileName: payload.fileName || 'arquivo.pdf' }; break;
         case 'poll': msgContent = { poll: { name: payload.name, values: payload.values, selectableCount: payload.selectableCount || 1 } }; break;
@@ -289,11 +310,26 @@ export const deleteSession = async (sessionId, companyId, clearDb = true) => {
     console.log(`[DELETE] Sessão ${sessionId}`);
     if (companyId) companyIndex.delete(companyId);
     
+    // FIX: Cancela qualquer reconexão pendente
+    if (reconnectTimers.has(sessionId)) {
+        clearTimeout(reconnectTimers.get(sessionId));
+        reconnectTimers.delete(sessionId);
+    }
+
     const sock = sessions.get(sessionId);
     sessions.delete(sessionId);
     retries.delete(sessionId);
     
-    if (sock) { try { sock.end(undefined); } catch (e) {} }
+    if (sock) { 
+        try { 
+            // FIX: Remove listeners para evitar vazamento de memória
+            sock.ev.removeAllListeners("connection.update");
+            sock.ev.removeAllListeners("creds.update");
+            sock.ev.removeAllListeners("messages.upsert");
+            
+            sock.end(undefined); 
+        } catch (e) {} 
+    }
 
     if (clearDb) {
         await supabase.from("instances").delete().eq("session_id", sessionId);
