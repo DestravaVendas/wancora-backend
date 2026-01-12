@@ -52,42 +52,70 @@ const uploadMediaToSupabase = async (buffer, type) => {
     }
 };
 
-// --- HELPER 1: Anti-Ghost Inteligente (Com verificação de is_ignored) ---
+// --- HELPER 1: Anti-Ghost Inteligente (COM LOGS DE DIAGNÓSTICO) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
-    if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) return null;
-    const phone = remoteJid.split('@')[0];
+    try {
+        if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) return null;
+        const phone = remoteJid.split('@')[0];
 
-    // --- NOVA LÓGICA: Verifica se o usuário pediu para IGNORAR este contato ---
-    const { data: contact } = await supabase
-        .from('contacts')
-        .select('is_ignored')
-        .eq('jid', remoteJid)
-        .maybeSingle();
+        // --- NOVA LÓGICA: Verifica se o usuário pediu para IGNORAR este contato ---
+        const { data: contact } = await supabase
+            .from('contacts')
+            .select('is_ignored')
+            .eq('jid', remoteJid)
+            .maybeSingle();
 
-    if (contact && contact.is_ignored) {
-        console.log(`[Anti-Ghost] Ignorando contato ${phone} (Definido pelo usuário)`);
-        return null; // Retorna null e NÃO cria o lead
+        if (contact && contact.is_ignored) {
+            console.log(`🚫 [Anti-Ghost] Ignorando contato ${phone} (Definido pelo usuário)`);
+            return null; // Retorna null e NÃO cria o lead
+        }
+        // --------------------------------------------------------------------------
+
+        const { data: existingLead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
+        if (existingLead) {
+            // console.log(`ℹ️ Lead já existe para ${phone}`);
+            return existingLead.id;
+        }
+
+        console.log(`🆕 [Anti-Ghost] Tentando criar Lead para ${phone}...`);
+
+        // Pega primeira etapa (COM LOG DE ERRO SE FALHAR)
+        const { data: firstStage, error: stageError } = await supabase.from('pipeline_stages')
+            .select('id, name').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
+
+        if (stageError) {
+            console.error("⚠️ [DIAGNÓSTICO] Erro ao buscar pipeline_stages:", stageError.message);
+        }
+
+        const stageId = firstStage?.id || null;
+        
+        if (!stageId) {
+            console.warn(`⚠️ [ALERTA CRÍTICO] Lead será criado SEM etapa (stage_id: null). Ele ficará invisível no Kanban! Verifique se a empresa ${companyId} tem etapas criadas.`);
+        } else {
+            console.log(`📍 [DIAGNÓSTICO] Etapa encontrada: ${firstStage.name} (${stageId})`);
+        }
+
+        // Cria lead
+        const { data: newLead, error } = await supabase.from('leads').insert({
+            company_id: companyId,
+            name: pushName || `Novo Contato (${phone})`,
+            phone: phone,
+            status: 'new',
+            pipeline_stage_id: stageId 
+        }).select('id').single();
+
+        if (error) {
+            console.error("❌ [DIAGNÓSTICO] Falha ao INSERT lead:", error.message);
+            return null;
+        }
+        
+        console.log(`✨ [SUCESSO] Lead criado: ${newLead.id}`);
+        return newLead.id;
+
+    } catch (e) {
+        console.error("❌ [CRASH] Erro fatal no ensureLeadExists:", e);
+        return null;
     }
-    // --------------------------------------------------------------------------
-
-    const { data: existingLead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
-    if (existingLead) return existingLead.id;
-
-    // Pega primeira etapa
-    const { data: firstStage } = await supabase.from('pipeline_stages')
-        .select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
-
-    // Cria lead
-    const { data: newLead, error } = await supabase.from('leads').insert({
-        company_id: companyId,
-        name: pushName || `Novo Contato (${phone})`,
-        phone: phone,
-        status: 'new',
-        pipeline_stage_id: firstStage?.id || null 
-    }).select('id').single();
-
-    if (error) return null;
-    return newLead.id;
 };
 
 // --- HELPER 2: Upsert Contato ---
@@ -289,7 +317,7 @@ export const startSession = async (sessionId, companyId) => {
     return sock;
 };
 
-// --- PROCESSAMENTO INTELIGENTE (COM FILTRO DE LID E MÍDIA) ---
+// --- PROCESSAMENTO INTELIGENTE (COM FILTRO DE LID, MÍDIA E LOGS DE DEBUG) ---
 const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMedia = false) => {
     try {
         // 1. FILTRO DE SEGURANÇA: Ignora Status, Broadcasts e LIDs (Ids técnicos do WhatsApp)
@@ -310,7 +338,7 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
         // Se for texto vazio e não tem mídia, ignora
         if (!content && msgType === 'text') return;
 
-        console.log(`[MSG] Recebida de ${remoteJid} (${msgType})`);
+        console.log(`[MSG] Recebida de ${remoteJid} (${msgType}) | fromMe: ${fromMe}`);
 
         // 2. Garante Contato (Normaliza para @s.whatsapp.net)
         await upsertContact(remoteJid, sock, pushName, companyId);
@@ -318,13 +346,9 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
         // 3. Garante Lead (Se não for grupo)
         let leadId = null;
         if (!remoteJid.includes('@g.us')) {
-            if (!fromMe) {
-                leadId = await ensureLeadExists(remoteJid, pushName, companyId);
-            } else {
-                const phone = remoteJid.split('@')[0];
-                const { data: lead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
-                if (lead) leadId = lead.id;
-            }
+            // Se for conversa individual, tenta criar/vincular lead
+            // (Mesmo se for minha msg, quero garantir que o lead existe)
+            leadId = await ensureLeadExists(remoteJid, pushName, companyId);
         }
 
         // 4. Download de Mídia (Apenas se solicitado e for tipo mídia)
@@ -366,6 +390,7 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
         });
 
         if (error) console.error("❌ Erro DB Msg:", error.message);
+        else console.log(`✅ Mensagem salva. LeadID vinculado: ${leadId}`);
 
     } catch (e) {
         console.error("Erro processamento msg:", e);
