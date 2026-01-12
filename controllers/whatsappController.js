@@ -136,8 +136,11 @@ export const startSession = async (sessionId, companyId) => {
         await deleteSession(sessionId, companyId, false);
     }
 
+    console.log(`[DEBUG] Recuperando estado de autenticação para ${sessionId}...`);
     const { state, saveCreds } = await useSupabaseAuthState(sessionId);
-    const { version } = await fetchLatestBaileysVersion();
+    console.log(`[DEBUG] Buscando versão do Baileys...`);
+    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
+    console.log(`[DEBUG] Versão utilizada: ${version}`);
 
     const sock = makeWASocket({
         version,
@@ -145,14 +148,15 @@ export const startSession = async (sessionId, companyId) => {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
         },
-        printQRInTerminal: true,
+        printQRInTerminal: false,
         logger: pino({ level: "silent" }),
         browser: ["Wancora CRM", "Chrome", "10.0"],
-        syncFullHistory: true, 
+        syncFullHistory: false, // Reduz carga inicial
         markOnlineOnConnect: true,
         connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0, // Evita timeouts em queries iniciais
         keepAliveIntervalMs: 30000,
-        generateHighQualityLinkPreview: true,
+        generateHighQualityLinkPreview: false,
     });
 
     sock.companyId = companyId;
@@ -164,6 +168,7 @@ export const startSession = async (sessionId, companyId) => {
     // --- CONEXÃO ---
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect, qr } = update;
+        console.log(`[DEBUG] Connection Update para ${sessionId}:`, { connection, qr: !!qr });
 
         if (!sessions.has(sessionId)) return; 
 
