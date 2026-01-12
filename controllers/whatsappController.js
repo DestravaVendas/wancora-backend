@@ -276,10 +276,14 @@ export const startSession = async (sessionId, companyId) => {
     return sock;
 };
 
-// --- PROCESSAMENTO INTELIGENTE (AGORA COM SUPORTE A MÍDIA) ---
+// --- PROCESSAMENTO INTELIGENTE (COM FILTRO DE LID E MÍDIA) ---
 const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMedia = false) => {
     try {
-        if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
+        // 1. FILTRO DE SEGURANÇA: Ignora Status, Broadcasts e LIDs (Ids técnicos do WhatsApp)
+        if (!msg.message) return;
+        if (msg.key.remoteJid === 'status@broadcast') return;
+        if (msg.key.remoteJid.includes('@lid')) return; // <--- NOVA PROTEÇÃO CONTRA O ERRO FK
+        if (msg.key.remoteJid.includes('@broadcast')) return;
 
         const remoteJid = msg.key.remoteJid;
         const fromMe = msg.key.fromMe;
@@ -295,10 +299,10 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
 
         console.log(`[MSG] Recebida de ${remoteJid} (${msgType})`);
 
-        // 1. Garante Contato
+        // 2. Garante Contato (Normaliza para @s.whatsapp.net)
         await upsertContact(remoteJid, sock, pushName, companyId);
 
-        // 2. Garante Lead (Se não for grupo)
+        // 3. Garante Lead (Se não for grupo)
         let leadId = null;
         if (!remoteJid.includes('@g.us')) {
             if (!fromMe) {
@@ -310,7 +314,7 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
             }
         }
 
-        // 3. Download de Mídia (Apenas se solicitado e for tipo mídia)
+        // 4. Download de Mídia (Apenas se solicitado e for tipo mídia)
         if (shouldDownloadMedia && ['image', 'video', 'audio', 'document'].includes(msgType)) {
             try {
                 // Faz o download do binário usando a função do Baileys
@@ -319,7 +323,7 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
                 // Determina MimeType para salvar corretamente
                 let mimetype = 'application/octet-stream';
                 if (msg.message.imageMessage) mimetype = 'image/jpeg';
-                else if (msg.message.audioMessage) mimetype = 'audio/mp4'; // WhatsApp costuma usar mp4/ogg
+                else if (msg.message.audioMessage) mimetype = 'audio/mp4'; 
                 else if (msg.message.videoMessage) mimetype = 'video/mp4';
                 else if (msg.message.documentMessage) mimetype = msg.message.documentMessage.mimetype;
 
@@ -327,20 +331,20 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
                 mediaUrl = await uploadMediaToSupabase(buffer, mimetype);
                 if (mediaUrl) console.log(`[MEDIA] Upload concluído: ${mediaUrl}`);
             } catch (mediaErr) {
-                console.error('[MEDIA] Falha no download:', mediaErr.message);
+                console.error('[MEDIA] Falha no download (Ignorando):', mediaErr.message);
             }
         }
 
-        // 4. Salva Mensagem
+        // 5. Salva Mensagem
         const { error } = await supabase.from('messages').upsert({
             company_id: companyId,
             session_id: sessionId,
-            remote_jid: remoteJid,
+            remote_jid: remoteJid, // Agora temos certeza que é um JID válido (@s.whatsapp.net ou @g.us)
             whatsapp_id: whatsappId,
             from_me: fromMe,
             content: content || '[Mídia]',
             message_type: msgType,
-            media_url: mediaUrl, // Salva o link da mídia
+            media_url: mediaUrl, 
             status: fromMe ? 'sent' : 'received',
             lead_id: leadId, 
             created_at: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000) : new Date()
@@ -356,7 +360,6 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
 };
 
 // --- ENVIO (COM SUPORTE A MULTIMÍDIA) ---
-// Mantive a sua versão que já tinha suporte a vários tipos, apenas conferi a lógica
 export const sendMessage = async (sessionId, to, payload) => {
     const sock = sessions.get(sessionId);
     if (!sock) throw new Error("Sessão não ativa");
@@ -384,7 +387,7 @@ export const sendMessage = async (sessionId, to, payload) => {
             sentMsg = await sock.sendMessage(jid, { 
                 audio: { url: payload.url }, 
                 mimetype: 'audio/mp4',
-                ptt: payload.ptt || false // Se true, envia como nota de voz (PTT)
+                ptt: payload.ptt || false // Se true, envia como nota de voz
             });
         }
         else if (payload.type === 'document') {
