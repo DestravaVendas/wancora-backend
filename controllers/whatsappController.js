@@ -15,7 +15,46 @@ const sessions = new Map();
 const companyIndex = new Map();  
 const retries = new Map();       
 
-// --- HELPER 1: Determinar Tipo da Mensagem ---
+// --- HELPER NOVO: Garante que o Lead existe (Anti-Ghost) ---
+const ensureLeadExists = async (remoteJid, pushName, companyId) => {
+    // Ignora status e grupos na criação de LEAD (Lead geralmente é pessoa)
+    if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) return null;
+
+    const phone = remoteJid.split('@')[0];
+
+    // 1. Tenta achar o lead
+    const { data: existingLead } = await supabase
+        .from('leads')
+        .select('id')
+        .eq('phone', phone) // Busca pelo telefone limpo
+        .eq('company_id', companyId)
+        .maybeSingle();
+
+    if (existingLead) return existingLead.id;
+
+    console.log(`[AUTO-LEAD] Criando lead para ${phone}...`);
+
+    // 2. Se não existe, cria (Entrada Orgânica)
+    const { data: newLead, error } = await supabase
+        .from('leads')
+        .insert({
+            company_id: companyId,
+            name: pushName || `Novo Contato (${phone})`,
+            phone: phone,
+            status: 'new', // Status inicial no Kanban
+            funnel_stage_id: null // Pode configurar um padrão depois
+        })
+        .select('id')
+        .single();
+
+    if (error) {
+        console.error("[LEAD ERROR] Falha ao criar lead automático:", error.message);
+        return null;
+    }
+    return newLead.id;
+};
+
+// --- HELPER: Determinar Tipo da Mensagem ---
 const getMessageType = (msg) => {
     if (msg.imageMessage) return 'image';
     if (msg.videoMessage) return 'video';
@@ -27,27 +66,22 @@ const getMessageType = (msg) => {
     return 'text';
 };
 
-// --- HELPER 2: Extrair Conteúdo (Texto, Caption ou JSON de Enquete) ---
+// --- HELPER: Extrair Conteúdo ---
 const getMessageContent = (msg) => {
     if (!msg) return "";
     
-    // Texto Simples
     if (msg.conversation) return msg.conversation;
     if (msg.extendedTextMessage?.text) return msg.extendedTextMessage.text;
-    
-    // Mídias com Legenda
     if (msg.imageMessage?.caption) return msg.imageMessage.caption;
     if (msg.videoMessage?.caption) return msg.videoMessage.caption;
     if (msg.documentMessage?.caption) return msg.documentMessage.caption;
     
-    // Se for mídia sem legenda, retorna identificador
     if (msg.imageMessage) return "[Imagem]";
     if (msg.videoMessage) return "[Vídeo]";
     if (msg.audioMessage) return "[Áudio]";
     if (msg.documentMessage) return msg.documentMessage.fileName || "[Documento]";
     if (msg.stickerMessage) return "[Figurinha]";
 
-    // Enquete (Salva as opções como texto JSON para o frontend ler depois)
     if (msg.pollCreationMessage || msg.pollCreationMessageV3) {
         const pollData = (msg.pollCreationMessage || msg.pollCreationMessageV3);
         return JSON.stringify({
@@ -59,24 +93,16 @@ const getMessageContent = (msg) => {
     return "";
 };
 
-// --- HELPER 3: Upsert Contato Inteligente ---
+// --- HELPER: Upsert Contato ---
 const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
     try {
         if (!jid || jid.includes('status@broadcast')) return;
         
-        // Remove sufixos de dispositivo para garantir ID limpo
         const cleanJid = jid.split(':')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
-
         const isGroup = cleanJid.endsWith('@g.us');
         let name = pushName;
         let profilePicUrl = null;
 
-        // Tenta pegar foto (pode falhar por privacidade)
-        try {
-            // profilePicUrl = await sock.profilePictureUrl(cleanJid, 'image'); // Opcional: Descomente se quiser fotos (consome banda)
-        } catch (e) {}
-
-        // Se for grupo, força pegar o nome atualizado
         if (isGroup) {
             try {
                 const groupMetadata = await sock.groupMetadata(cleanJid);
@@ -90,7 +116,6 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
             updated_at: new Date()
         };
         
-        // Só atualiza nome se tiver um novo (não sobrescreve com null)
         if (name) {
             contactData.name = name;
             contactData.push_name = name;
@@ -98,15 +123,7 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
         if (companyId) contactData.company_id = companyId;
 
         await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
-    } catch (err) {
-        // Silencioso
-    }
-};
-
-// --- HELPER 4: Salvar Mensagem no Banco ---
-const saveMessageToDb = async (msgInfo) => {
-    const { error } = await supabase.from('messages').insert(msgInfo);
-    if (error) console.error("❌ Erro DB:", error.message);
+    } catch (err) {}
 };
 
 // ==============================================================================
@@ -136,10 +153,6 @@ export const startSession = async (sessionId, companyId) => {
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 30000,
         generateHighQualityLinkPreview: true,
-        getMessage: async (key) => {
-            // Necessário para re-envio em algumas situações
-            return { conversation: "hello" };
-        }
     });
 
     sock.companyId = companyId;
@@ -195,7 +208,7 @@ export const startSession = async (sessionId, companyId) => {
         }
     });
 
-    // --- PROCESSAMENTO DE MENSAGENS (TEXTO, MÍDIA, ENQUETES) ---
+    // --- PROCESSAMENTO DE MENSAGENS ---
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (!sessions.has(sessionId)) return;
 
@@ -214,8 +227,17 @@ export const startSession = async (sessionId, companyId) => {
                 // 1. Garante Contato
                 await upsertContact(remoteJid, sock, msg.pushName, companyId);
 
-                // 2. Salva Mensagem
-                await saveMessageToDb({
+                // 2. GARANTE LEAD (A Lógica Nova e Importante)
+                // Se não formos nós mandando, verificamos se o lead existe
+                let leadId = null;
+                if (!fromMe && !remoteJid.includes('@g.us')) {
+                    leadId = await ensureLeadExists(remoteJid, msg.pushName, companyId);
+                } else if (!fromMe && remoteJid.includes('@g.us')) {
+                    // Lógica futura para grupos
+                }
+
+                // 3. Salva Mensagem (Agora com lead_id se disponível)
+                const { error } = await supabase.from('messages').insert({
                     company_id: companyId,
                     session_id: sessionId,
                     remote_jid: remoteJid,
@@ -223,8 +245,11 @@ export const startSession = async (sessionId, companyId) => {
                     content: content,
                     message_type: msgType,
                     status: fromMe ? 'sent' : 'received',
+                    lead_id: leadId, // <--- Vincula ao Lead criado/existente
                     created_at: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000) : new Date()
                 });
+
+                if (error) console.error("❌ Erro DB:", error.message);
             }
         }
     });
@@ -233,64 +258,24 @@ export const startSession = async (sessionId, companyId) => {
 };
 
 // ==============================================================================
-// FUNÇÃO DE ENVIO UNIVERSAL (Texto, Imagem, Áudio, Doc, Enquete)
+// FUNÇÃO DE ENVIO UNIVERSAL
 // ==============================================================================
 export const sendMessage = async (sessionId, to, payload) => {
     const sock = sessions.get(sessionId);
     if (!sock) throw new Error("Sessão não ativa");
     
-    // Normaliza JID
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-    
-    // Payload pode ser string (texto simples) ou objeto (mídia/enquete)
-    // Formatos esperados no payload:
-    // Texto: { type: 'text', content: 'Olá' }
-    // Imagem: { type: 'image', url: 'https://...', caption: 'Olha isso' }
-    // Áudio: { type: 'audio', url: 'https://...', ptt: true }  (ptt=true manda como nota de voz)
-    // Doc: { type: 'document', url: 'https://...', fileName: 'contrato.pdf' }
-    // Enquete: { type: 'poll', name: 'Qual sua cor?', values: ['Azul', 'Vermelho'], selectableCount: 1 }
-
     const type = payload.type || 'text';
     let msgContent = {};
 
     switch (type) {
-        case 'text':
-            msgContent = { text: payload.content };
-            break;
-            
-        case 'image':
-            msgContent = { image: { url: payload.url }, caption: payload.caption || '' };
-            break;
-
-        case 'video':
-            msgContent = { video: { url: payload.url }, caption: payload.caption || '' };
-            break;
-
-        case 'audio':
-            // ptt: true faz aparecer como "nota de voz" (aquele microfone azul)
-            msgContent = { audio: { url: payload.url }, mimetype: 'audio/mp4', ptt: payload.ptt || false };
-            break;
-
-        case 'document':
-            msgContent = { 
-                document: { url: payload.url }, 
-                mimetype: payload.mimetype || 'application/pdf', 
-                fileName: payload.fileName || 'arquivo.pdf' 
-            };
-            break;
-
-        case 'poll':
-            msgContent = {
-                poll: {
-                    name: payload.name,
-                    values: payload.values, // Array de strings ['Opção 1', 'Opção 2']
-                    selectableCount: payload.selectableCount || 1
-                }
-            };
-            break;
-
-        default:
-            throw new Error(`Tipo de mensagem não suportado: ${type}`);
+        case 'text': msgContent = { text: payload.content }; break;
+        case 'image': msgContent = { image: { url: payload.url }, caption: payload.caption || '' }; break;
+        case 'video': msgContent = { video: { url: payload.url }, caption: payload.caption || '' }; break;
+        case 'audio': msgContent = { audio: { url: payload.url }, mimetype: 'audio/mp4', ptt: payload.ptt || false }; break;
+        case 'document': msgContent = { document: { url: payload.url }, mimetype: payload.mimetype || 'application/pdf', fileName: payload.fileName || 'arquivo.pdf' }; break;
+        case 'poll': msgContent = { poll: { name: payload.name, values: payload.values, selectableCount: payload.selectableCount || 1 } }; break;
+        default: throw new Error(`Tipo de mensagem não suportado: ${type}`);
     }
 
     const sent = await sock.sendMessage(jid, msgContent);
