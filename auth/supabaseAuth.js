@@ -4,11 +4,13 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+// --- MUDANÇA AQUI: Adicionei 'export' antes do const ---
+export const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
   auth: {
     persistSession: false // Otimização para backend
   }
 });
+// -------------------------------------------------------
 
 export const useSupabaseAuthState = async (sessionId) => {
   // Função auxiliar para escrever dados no banco (BLINDADA)
