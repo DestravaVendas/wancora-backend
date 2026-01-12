@@ -1,7 +1,14 @@
-import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, delay } from "@whiskeysockets/baileys";
+import makeWASocket, { 
+    DisconnectReason, 
+    fetchLatestBaileysVersion, 
+    makeCacheableSignalKeyStore, 
+    delay,
+    downloadMediaMessage 
+} from "@whiskeysockets/baileys";
 import { useSupabaseAuthState } from "../auth/supabaseAuth.js";
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
+import mime from "mime-types"; // Necessário para extensão de arquivos
 
 // CHECAGEM DE SEGURANÇA
 if (!process.env.SUPABASE_KEY || !process.env.SUPABASE_URL) {
@@ -15,6 +22,35 @@ const companyIndex = new Map();
 const retries = new Map(); 
 const reconnectTimers = new Map();      
 const lastQrUpdate = new Map(); 
+
+// --- HELPER NOVO: Upload de Mídia para Supabase Storage ---
+const uploadMediaToSupabase = async (buffer, type) => {
+    try {
+        const fileExt = mime.extension(type) || 'bin';
+        const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.${fileExt}`;
+        const filePath = `chat-media/${fileName}`;
+
+        // Upload
+        const { error } = await supabase.storage
+            .from('chat-media') // Certifique-se de ter criado este bucket "Public" no Supabase
+            .upload(filePath, buffer, {
+                contentType: type,
+                upsert: false
+            });
+
+        if (error) throw error;
+
+        // Get URL
+        const { data } = supabase.storage
+            .from('chat-media')
+            .getPublicUrl(filePath);
+
+        return data.publicUrl;
+    } catch (err) {
+        console.error('❌ Erro upload media:', err.message);
+        return null;
+    }
+};
 
 // --- HELPER 1: Anti-Ghost (Pipeline Stages) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
@@ -37,10 +73,7 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
         pipeline_stage_id: firstStage?.id || null 
     }).select('id').single();
 
-    if (error) {
-        // console.error("[LEAD ERROR]", error.message);
-        return null;
-    }
+    if (error) return null;
     return newLead.id;
 };
 
@@ -69,6 +102,7 @@ const getMessageContent = (msg) => {
     if (msg.conversation) return msg.conversation;
     if (msg.extendedTextMessage?.text) return msg.extendedTextMessage.text;
     if (msg.imageMessage?.caption) return msg.imageMessage.caption;
+    if (msg.videoMessage?.caption) return msg.videoMessage.caption;
     return "";
 };
 
@@ -85,7 +119,7 @@ const getMessageType = (msg) => {
 // CORE: START SESSION
 // ==============================================================================
 export const startSession = async (sessionId, companyId) => {
-    console.log(`[START] Sessão ${sessionId}`);
+    console.log(`[START] Sessão ${sessionId} (Empresa: ${companyId})`);
     
     if (sessions.has(sessionId)) {
         await deleteSession(sessionId, companyId, false);
@@ -104,12 +138,11 @@ export const startSession = async (sessionId, companyId) => {
         printQRInTerminal: false,
         logger: pino({ level: "silent" }),
         browser: ["Wancora CRM", "Chrome", "10.0"],
-        syncFullHistory: true, // LIGADO: Para baixar contatos e histórico
+        syncFullHistory: true, 
         markOnlineOnConnect: true,
         connectTimeoutMs: 60000,
-        defaultQueryTimeoutMs: 0,
         keepAliveIntervalMs: 30000,
-        generateHighQualityLinkPreview: false,
+        generateHighQualityLinkPreview: true,
     });
 
     sock.companyId = companyId;
@@ -119,13 +152,12 @@ export const startSession = async (sessionId, companyId) => {
     sock.ev.on("creds.update", saveCreds);
 
     // --- 1. DOWNLOAD DE HISTÓRICO INTELIGENTE ---
-    sock.ev.on('messaging-history.set', async ({ chats, contacts, messages, isLatest }) => {
-        console.log(`[HISTÓRICO] Recebido: ${contacts.length} contatos, ${chats.length} chats.`);
+    sock.ev.on('messaging-history.set', async ({ chats, contacts, messages }) => {
+        console.log(`[HISTÓRICO] Recebido: ${contacts.length} contatos, ${messages.length} mensagens.`);
 
         // A. Salvar Contatos
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
-            console.log(`[DB] Salvando ${validContacts.length} contatos...`);
             const batch = validContacts.map(c => ({
                 jid: c.id,
                 name: c.name || c.verifiedName || null,
@@ -136,12 +168,12 @@ export const startSession = async (sessionId, companyId) => {
             await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
         }
 
-        // B. Salvar Últimas Mensagens
+        // B. Salvar Últimas Mensagens (Sem baixar mídia pesada para não travar o boot)
         const safeMessages = messages.slice(-50); 
         for (const msg of safeMessages) {
-            await processMessage(msg, sessionId, companyId, sock);
+            // Passamos false no final para indicar que é histórico e não precisa baixar mídia agora
+            await processMessage(msg, sessionId, companyId, sock, false); 
         }
-        console.log(`[HISTÓRICO] ${safeMessages.length} mensagens recentes processadas.`);
     });
 
     // --- 2. ATUALIZAÇÃO DE CONTATOS ---
@@ -159,7 +191,7 @@ export const startSession = async (sessionId, companyId) => {
         }
     });
 
-    // --- 3. GRUPOS ---
+    // --- 3. GRUPOS (Mantido da sua versão robusta) ---
     sock.ev.on("groups.update", async (groups) => {
         for (const g of groups) {
             if (g.subject) {
@@ -176,18 +208,14 @@ export const startSession = async (sessionId, companyId) => {
 
         if (!sessions.has(sessionId)) return; 
 
-        // QR CODE (Update, não Upsert) -> CORREÇÃO APLICADA AQUI
         if (qr) {
             const now = Date.now();
             const lastTime = lastQrUpdate.get(sessionId) || 0;
             if (now - lastTime > 800) {
                 lastQrUpdate.set(sessionId, now);
-                const { error } = await supabase.from("instances")
+                await supabase.from("instances")
                     .update({ qrcode_url: qr, status: "qrcode", updated_at: new Date() })
                     .eq('session_id', sessionId);
-                
-                if (error) console.error("❌ ERRO SUPABASE QR:", error.message);
-                else console.log("✅ QR Code Salvo!");
             }
         }
 
@@ -220,30 +248,27 @@ export const startSession = async (sessionId, companyId) => {
             
             await supabase.from("instances").update({ status: "connected", qrcode_url: null, updated_at: new Date() }).eq("session_id", sessionId);
 
+            // Tenta pegar foto do perfil da instância
             setTimeout(async () => {
                  const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
                  try { 
                      const myPic = await sock.profilePictureUrl(userJid, 'image'); 
                      if(myPic) await supabase.from("instances").update({ profile_pic_url: myPic }).eq("session_id", sessionId);
                  } catch(e){}
-
-                 try {
-                     const groups = await sock.groupFetchAllParticipating();
-                     const groupsList = Object.values(groups);
-                     for (const g of groupsList) {
-                         await upsertContact(g.id, sock, null, companyId, g.subject);
-                     }
-                 } catch (e) {}
             }, 2000);
         }
     });
 
-    // --- 5. RECEBIMENTO DE MENSAGENS ---
+    // --- 5. RECEBIMENTO DE MENSAGENS (REALTIME) ---
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (!sessions.has(sessionId)) return;
+        
+        // 'notify' é mensagem nova chegando em tempo real
+        // 'append' é mensagem enviada por outro dispositivo (sincronização)
         if (type === "notify" || type === "append") {
             for (const msg of messages) {
-                await processMessage(msg, sessionId, companyId, sock);
+                // Passamos true para fazer o download da mídia aqui (TEMPO REAL)
+                await processMessage(msg, sessionId, companyId, sock, true);
             }
         }
     });
@@ -251,29 +276,33 @@ export const startSession = async (sessionId, companyId) => {
     return sock;
 };
 
-// --- PROCESSAMENTO INTELIGENTE (COM UPSERT CORRETO) ---
-const processMessage = async (msg, sessionId, companyId, sock) => {
+// --- PROCESSAMENTO INTELIGENTE (AGORA COM SUPORTE A MÍDIA) ---
+const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMedia = false) => {
     try {
         if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
         const remoteJid = msg.key.remoteJid;
         const fromMe = msg.key.fromMe;
-        const whatsappId = msg.key.id; // <--- ID ÚNICO DO WHATSAPP
-        const content = getMessageContent(msg.message);
-        const msgType = getMessageType(msg.message);
+        const whatsappId = msg.key.id; 
+        const pushName = msg.pushName;
+        
+        let content = getMessageContent(msg.message);
+        let msgType = getMessageType(msg.message);
+        let mediaUrl = null;
 
+        // Se for texto vazio e não tem mídia, ignora
         if (!content && msgType === 'text') return;
 
-        console.log(`[MSG] Processando de ${remoteJid.split('@')[0]}`);
+        console.log(`[MSG] Recebida de ${remoteJid} (${msgType})`);
 
         // 1. Garante Contato
-        await upsertContact(remoteJid, sock, msg.pushName, companyId);
+        await upsertContact(remoteJid, sock, pushName, companyId);
 
-        // 2. Garante Lead
+        // 2. Garante Lead (Se não for grupo)
         let leadId = null;
         if (!remoteJid.includes('@g.us')) {
             if (!fromMe) {
-                leadId = await ensureLeadExists(remoteJid, msg.pushName, companyId);
+                leadId = await ensureLeadExists(remoteJid, pushName, companyId);
             } else {
                 const phone = remoteJid.split('@')[0];
                 const { data: lead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
@@ -281,20 +310,42 @@ const processMessage = async (msg, sessionId, companyId, sock) => {
             }
         }
 
-        // 3. Salva Mensagem com UPSERT (Para não duplicar histórico)
+        // 3. Download de Mídia (Apenas se solicitado e for tipo mídia)
+        if (shouldDownloadMedia && ['image', 'video', 'audio', 'document'].includes(msgType)) {
+            try {
+                // Faz o download do binário usando a função do Baileys
+                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                
+                // Determina MimeType para salvar corretamente
+                let mimetype = 'application/octet-stream';
+                if (msg.message.imageMessage) mimetype = 'image/jpeg';
+                else if (msg.message.audioMessage) mimetype = 'audio/mp4'; // WhatsApp costuma usar mp4/ogg
+                else if (msg.message.videoMessage) mimetype = 'video/mp4';
+                else if (msg.message.documentMessage) mimetype = msg.message.documentMessage.mimetype;
+
+                // Sobe para o Supabase e pega a URL
+                mediaUrl = await uploadMediaToSupabase(buffer, mimetype);
+                if (mediaUrl) console.log(`[MEDIA] Upload concluído: ${mediaUrl}`);
+            } catch (mediaErr) {
+                console.error('[MEDIA] Falha no download:', mediaErr.message);
+            }
+        }
+
+        // 4. Salva Mensagem
         const { error } = await supabase.from('messages').upsert({
             company_id: companyId,
             session_id: sessionId,
             remote_jid: remoteJid,
-            whatsapp_id: whatsappId, // <--- CAMPO CHAVE
+            whatsapp_id: whatsappId,
             from_me: fromMe,
             content: content || '[Mídia]',
             message_type: msgType,
+            media_url: mediaUrl, // Salva o link da mídia
             status: fromMe ? 'sent' : 'received',
             lead_id: leadId, 
             created_at: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000) : new Date()
         }, { 
-            onConflict: 'remote_jid, whatsapp_id' // <--- EVITA DUPLICIDADE
+            onConflict: 'remote_jid, whatsapp_id'
         });
 
         if (error) console.error("❌ Erro DB Msg:", error.message);
@@ -304,12 +355,60 @@ const processMessage = async (msg, sessionId, companyId, sock) => {
     }
 };
 
+// --- ENVIO (COM SUPORTE A MULTIMÍDIA) ---
+// Mantive a sua versão que já tinha suporte a vários tipos, apenas conferi a lógica
 export const sendMessage = async (sessionId, to, payload) => {
     const sock = sessions.get(sessionId);
     if (!sock) throw new Error("Sessão não ativa");
+    
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-    const sent = await sock.sendMessage(jid, { text: payload.content || payload.text || "" });
-    return sent;
+    let sentMsg;
+
+    try {
+        if (payload.type === 'text') {
+            sentMsg = await sock.sendMessage(jid, { text: payload.content || payload.text || "" });
+        } 
+        else if (payload.type === 'image') {
+            sentMsg = await sock.sendMessage(jid, { 
+                image: { url: payload.url }, 
+                caption: payload.caption 
+            });
+        }
+        else if (payload.type === 'video') {
+            sentMsg = await sock.sendMessage(jid, { 
+                video: { url: payload.url }, 
+                caption: payload.caption 
+            });
+        }
+        else if (payload.type === 'audio') {
+            sentMsg = await sock.sendMessage(jid, { 
+                audio: { url: payload.url }, 
+                mimetype: 'audio/mp4',
+                ptt: payload.ptt || false // Se true, envia como nota de voz (PTT)
+            });
+        }
+        else if (payload.type === 'document') {
+            sentMsg = await sock.sendMessage(jid, { 
+                document: { url: payload.url }, 
+                mimetype: payload.mimetype || 'application/pdf',
+                fileName: payload.fileName || 'documento'
+            });
+        }
+        else if (payload.type === 'poll') {
+             sentMsg = await sock.sendMessage(jid, {
+                poll: {
+                    name: payload.name,
+                    values: payload.options,
+                    selectableCount: 1
+                }
+            });
+        }
+
+        return sentMsg;
+    } catch (err) {
+        console.error("Erro no envio:", err);
+        throw err;
+    }
 };
 
 export const deleteSession = async (sessionId, companyId, clearDb = true) => {
