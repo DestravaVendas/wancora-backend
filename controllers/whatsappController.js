@@ -3,6 +3,7 @@ import { useSupabaseAuthState } from "../auth/supabaseAuth.js";
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
+// CHECAGEM DE SEGURANÇA
 if (!process.env.SUPABASE_KEY || !process.env.SUPABASE_URL) {
     console.error("❌ ERRO FATAL: Chaves do Supabase não encontradas no .env");
 }
@@ -37,7 +38,7 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     }).select('id').single();
 
     if (error) {
-        console.error("[LEAD ERROR]", error.message);
+        // console.error("[LEAD ERROR]", error.message);
         return null;
     }
     return newLead.id;
@@ -118,11 +119,10 @@ export const startSession = async (sessionId, companyId) => {
     sock.ev.on("creds.update", saveCreds);
 
     // --- 1. DOWNLOAD DE HISTÓRICO INTELIGENTE ---
-    // Esse evento dispara assim que conecta. Vamos salvar contatos e as últimas msgs.
     sock.ev.on('messaging-history.set', async ({ chats, contacts, messages, isLatest }) => {
         console.log(`[HISTÓRICO] Recebido: ${contacts.length} contatos, ${chats.length} chats.`);
 
-        // A. Salvar Contatos (Prioridade)
+        // A. Salvar Contatos
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
             console.log(`[DB] Salvando ${validContacts.length} contatos...`);
@@ -133,22 +133,12 @@ export const startSession = async (sessionId, companyId) => {
                 company_id: companyId,
                 updated_at: new Date()
             }));
-            // Upsert em batch silencioso
             await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
         }
 
-        // B. Salvar Últimas Mensagens (Filtro)
-        // Pegamos apenas as últimas 5 mensagens para não travar o banco/render
-        let messagesToSave = [];
-        // O array 'messages' do Baileys já vem agrupado. Vamos tentar extrair.
-        // Nota: A estrutura pode variar, vamos iterar com segurança.
-        
-        // Se vier muitas mensagens, processamos apenas as recentes (últimas 50 no total)
+        // B. Salvar Últimas Mensagens
         const safeMessages = messages.slice(-50); 
-        
         for (const msg of safeMessages) {
-            if (!msg.message) continue;
-            // Reutiliza a lógica de processamento
             await processMessage(msg, sessionId, companyId, sock);
         }
         console.log(`[HISTÓRICO] ${safeMessages.length} mensagens recentes processadas.`);
@@ -186,7 +176,7 @@ export const startSession = async (sessionId, companyId) => {
 
         if (!sessions.has(sessionId)) return; 
 
-        // QR CODE (Update, não Upsert)
+        // QR CODE (Update, não Upsert) -> CORREÇÃO APLICADA AQUI
         if (qr) {
             const now = Date.now();
             const lastTime = lastQrUpdate.get(sessionId) || 0;
@@ -248,11 +238,9 @@ export const startSession = async (sessionId, companyId) => {
         }
     });
 
-    // --- 5. RECEBIMENTO DE MENSAGENS (Notify + Append) ---
+    // --- 5. RECEBIMENTO DE MENSAGENS ---
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (!sessions.has(sessionId)) return;
-        
-        // Aceitamos 'notify' (novas) e 'append' (histórico/envio próprio)
         if (type === "notify" || type === "append") {
             for (const msg of messages) {
                 await processMessage(msg, sessionId, companyId, sock);
@@ -263,57 +251,56 @@ export const startSession = async (sessionId, companyId) => {
     return sock;
 };
 
-// --- FUNÇÃO CENTRALIZADA DE PROCESSAMENTO DE MENSAGEM ---
+// --- PROCESSAMENTO INTELIGENTE (COM UPSERT CORRETO) ---
 const processMessage = async (msg, sessionId, companyId, sock) => {
     try {
         if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
         const remoteJid = msg.key.remoteJid;
         const fromMe = msg.key.fromMe;
+        const whatsappId = msg.key.id; // <--- ID ÚNICO DO WHATSAPP
         const content = getMessageContent(msg.message);
         const msgType = getMessageType(msg.message);
 
-        // Se não tiver conteúdo legível e não for mídia, ignora
         if (!content && msgType === 'text') return;
 
-        console.log(`[MSG] Recebida de ${remoteJid.split('@')[0]} (Eu? ${fromMe})`);
+        console.log(`[MSG] Processando de ${remoteJid.split('@')[0]}`);
 
         // 1. Garante Contato
         await upsertContact(remoteJid, sock, msg.pushName, companyId);
 
-        // 2. Garante Lead (Se não for grupo e não for eu)
+        // 2. Garante Lead
         let leadId = null;
         if (!remoteJid.includes('@g.us')) {
-            // Mesmo se for 'fromMe', tentamos achar o lead para vincular a mensagem
-            // Se não achar, e for 'fromMe', talvez não queiramos criar Lead agora (opcional)
-            // Aqui mantemos a lógica de criar apenas se recebermos msg
             if (!fromMe) {
                 leadId = await ensureLeadExists(remoteJid, msg.pushName, companyId);
             } else {
-                // Se eu enviei, tento achar o lead, mas não crio
                 const phone = remoteJid.split('@')[0];
                 const { data: lead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
                 if (lead) leadId = lead.id;
             }
         }
 
-        // 3. Salva Mensagem
-        const { error } = await supabase.from('messages').insert({
+        // 3. Salva Mensagem com UPSERT (Para não duplicar histórico)
+        const { error } = await supabase.from('messages').upsert({
             company_id: companyId,
             session_id: sessionId,
             remote_jid: remoteJid,
+            whatsapp_id: whatsappId, // <--- CAMPO CHAVE
             from_me: fromMe,
             content: content || '[Mídia]',
             message_type: msgType,
             status: fromMe ? 'sent' : 'received',
             lead_id: leadId, 
             created_at: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000) : new Date()
+        }, { 
+            onConflict: 'remote_jid, whatsapp_id' // <--- EVITA DUPLICIDADE
         });
 
         if (error) console.error("❌ Erro DB Msg:", error.message);
 
     } catch (e) {
-        console.error("Erro ao processar mensagem individual:", e);
+        console.error("Erro processamento msg:", e);
     }
 };
 
