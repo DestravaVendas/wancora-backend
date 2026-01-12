@@ -3,20 +3,20 @@ import { useSupabaseAuthState } from "../auth/supabaseAuth.js";
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
+// CHECAGEM DE SEGURANÇA
 if (!process.env.SUPABASE_KEY || !process.env.SUPABASE_URL) {
     console.error("❌ ERRO FATAL: Chaves do Supabase não encontradas no .env");
 }
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// Estruturas de Memória
 const sessions = new Map();      
 const companyIndex = new Map();  
 const retries = new Map(); 
 const reconnectTimers = new Map();      
 const lastQrUpdate = new Map(); 
 
-// --- HELPER 1: Anti-Ghost (Pipeline Stages) ---
+// --- HELPER 1: Anti-Ghost (Pipeline Stages - Validado) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) return null;
     const phone = remoteJid.split('@')[0];
@@ -61,9 +61,7 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null, saved
             updated_at: new Date()
         };
 
-        // Lógica de Nomes:
-        // savedName = Nome do Grupo ou Nome na Agenda (Prioridade Alta)
-        // pushName = Nome do Perfil (Prioridade Baixa)
+        // Lógica de Prioridade de Nomes
         if (savedName) contactData.name = savedName; 
         if (pushName) contactData.push_name = pushName;
         if (imgUrl) contactData.profile_pic_url = imgUrl;
@@ -114,7 +112,7 @@ export const startSession = async (sessionId, companyId) => {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
         },
-        printQRInTerminal: false, // Desligado para limpar log
+        printQRInTerminal: false,
         logger: pino({ level: "silent" }),
         browser: ["Wancora CRM", "Chrome", "10.0"],
         syncFullHistory: false, // MANTIDO FALSE PARA NÃO TRAVAR
@@ -165,24 +163,25 @@ export const startSession = async (sessionId, companyId) => {
 
         if (!sessions.has(sessionId)) return; 
 
-        // 1. QR CODE (Lógica Validada da Versão Antiga + Logs de Erro)
+        // 1. QR CODE (A CORREÇÃO ESTÁ AQUI ⬇️)
         if (qr) {
             const now = Date.now();
             const lastTime = lastQrUpdate.get(sessionId) || 0;
             
-            // Debounce reduzido (800ms) para garantir fluidez
+            // Debounce reduzido
             if (now - lastTime > 800) {
                 lastQrUpdate.set(sessionId, now);
                 console.log(`[QR] Tentando salvar no Supabase...`);
                 
-                // Mudei status para 'qrcode' (padrão antigo que funcionava)
-                const { error } = await supabase.from("instances").upsert({ 
-                    session_id: sessionId, 
-                    qrcode_url: qr, 
-                    status: "qrcode", 
-                    company_id: companyId, 
-                    updated_at: new Date()
-                }, { onConflict: 'session_id' });
+                // MUDEI DE .upsert() PARA .update()
+                // Isso evita o erro de "null name" porque ele atualiza a linha criada pelo Frontend
+                const { error } = await supabase.from("instances")
+                    .update({ 
+                        qrcode_url: qr, 
+                        status: "qrcode", 
+                        updated_at: new Date()
+                    })
+                    .eq('session_id', sessionId); // <--- IMPORTANTE: Só atualiza onde o ID bate
 
                 if (error) {
                     console.error("❌ ERRO SUPABASE QR:", error.message);
