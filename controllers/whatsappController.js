@@ -3,6 +3,7 @@ import { useSupabaseAuthState } from "../auth/supabaseAuth.js";
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
+// CHECAGEM DE SEGURANÇA
 if (!process.env.SUPABASE_KEY || !process.env.SUPABASE_URL) {
     console.error("❌ ERRO FATAL: Chaves do Supabase não encontradas no .env");
 }
@@ -15,7 +16,7 @@ const retries = new Map();
 const reconnectTimers = new Map();      
 const lastQrUpdate = new Map(); 
 
-// --- HELPER: Anti-Ghost (Usa pipeline_stages conforme validado) ---
+// --- HELPER: Anti-Ghost (Pipeline Stages) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) return null;
     const phone = remoteJid.split('@')[0];
@@ -49,37 +50,28 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     return newLead.id;
 };
 
-// --- HELPER: Upsert Contato Inteligente (Nomes, Perfis e Grupos) ---
+// --- HELPER: Upsert Contato Inteligente ---
 const upsertContact = async (jid, sock, pushName = null, companyId = null, savedName = null, imgUrl = null) => {
     try {
         const cleanJid = jid.split(':')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
         
-        // Objeto de dados para o banco
         const contactData = {
             jid: cleanJid,
             company_id: companyId,
             updated_at: new Date()
         };
 
-        // Lógica de Prioridade de Nomes
-        // 'name' = Nome salvo na agenda (ou nome do grupo)
-        // 'push_name' = Nome público do perfil
+        // Lógica de Prioridade:
+        // Se vier 'savedName' (da agenda ou nome do grupo), salvamos em 'name'.
+        // Se vier 'pushName' (perfil), salvamos em 'push_name'.
         
-        if (savedName) contactData.name = savedName; // Sobrescreve se tiver nome salvo
+        if (savedName) contactData.name = savedName; 
         if (pushName) contactData.push_name = pushName;
         if (imgUrl) contactData.profile_pic_url = imgUrl;
 
-        // Se for a primeira vez e não tiver nome salvo, usa o pushName como nome principal
-        // Isso evita que fique só o número na lista
-        if (pushName && !savedName) {
-            // Não forçamos contactData.name = pushName aqui para permitir que o frontend 
-            // decida mostrar o pushName se o name for null.
-            // Mas salvamos o push_name garantido.
-        }
-
         await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
     } catch (e) {
-        // console.error("Erro upsert contato:", e.message);
+        // Silencioso para não poluir log
     }
 };
 
@@ -121,10 +113,10 @@ export const startSession = async (sessionId, companyId) => {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
         },
-        printQRInTerminal: true,
+        printQRInTerminal: true, // Mantém true para debug no Render
         logger: pino({ level: "silent" }),
         browser: ["Wancora CRM", "Chrome", "10.0"],
-        syncFullHistory: false, // Mantém false para estabilidade
+        syncFullHistory: false, // CRÍTICO: False para não travar
         markOnlineOnConnect: true,
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 0,
@@ -138,12 +130,11 @@ export const startSession = async (sessionId, companyId) => {
 
     sock.ev.on("creds.update", saveCreds);
 
-    // --- SINCRONIZA CONTATOS E GRUPOS (Ao Conectar) ---
+    // --- SINCRONIZA CONTATOS (Ao Conectar) ---
     sock.ev.on("contacts.upsert", async (contacts) => {
-        // Filtra e prepara lote
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
-            console.log(`[CONTATOS] Processando ${validContacts.length} contatos...`);
+            console.log(`[CONTATOS] Sincronizando ${validContacts.length} contatos...`);
             const batch = validContacts.map(c => ({
                 jid: c.id,
                 name: c.name || c.verifiedName || null, // Nome salvo
@@ -155,11 +146,11 @@ export const startSession = async (sessionId, companyId) => {
         }
     });
 
-    // --- GRUPOS (Lógica Nova) ---
+    // --- GRUPOS (Sincroniza Nomes de Grupos) ---
     sock.ev.on("groups.update", async (groups) => {
-        // Atualiza nome de grupos se mudar
         for (const g of groups) {
             if (g.subject) {
+                // Nome do grupo vai em 'savedName' (que vira contact.name)
                 await upsertContact(g.id, sock, null, companyId, g.subject);
             }
         }
@@ -172,21 +163,22 @@ export const startSession = async (sessionId, companyId) => {
 
         if (!sessions.has(sessionId)) return; 
 
-        // 1. QR CODE (Ajustado para funcionar sempre)
+        // 1. QR CODE (Lógica Simplificada para GARANTIR exibição)
         if (qr) {
             const now = Date.now();
             const lastTime = lastQrUpdate.get(sessionId) || 0;
             
-            // Reduzi o tempo de debounce de 2000ms para 1000ms para ser mais responsivo
-            // E adicionei log para confirmar que entrou no IF
-            if (now - lastTime > 1000) {
+            // Se for o PRIMEIRO QR code (lastTime == 0), salva IMEDIATAMENTE.
+            // Se for atualização, usa um debounce curto (500ms).
+            if (lastTime === 0 || (now - lastTime > 500)) {
                 lastQrUpdate.set(sessionId, now);
-                console.log(`[QR] Atualizando no banco... (Comprimento: ${qr.length})`);
+                console.log(`[QR] Salvando no Supabase...`);
                 
+                // Força status 'qr_ready'
                 await supabase.from("instances").upsert({ 
                     session_id: sessionId, 
                     qrcode_url: qr, 
-                    status: "qr_ready", // Status vital para o frontend
+                    status: "qr_ready", 
                     company_id: companyId, 
                     updated_at: new Date()
                 }, { onConflict: 'session_id' });
@@ -200,6 +192,7 @@ export const startSession = async (sessionId, companyId) => {
 
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             if (statusCode === 401 || statusCode === 403) {
+                 console.log(`[STOP] Desconectado permanentemente.`);
                  await deleteSession(sessionId, companyId, true);
                  return;
             }
@@ -210,6 +203,8 @@ export const startSession = async (sessionId, companyId) => {
                 const attempt = (retries.get(sessionId) || 0) + 1;
                 retries.set(sessionId, attempt);
                 const delayMs = Math.min(attempt * 3000, 15000);
+                
+                console.log(`[RECONNECT] Tentativa ${attempt} em ${delayMs}ms...`);
                 const timeoutId = setTimeout(() => { if (sessions.has(sessionId)) startSession(sessionId, companyId); }, delayMs);
                 reconnectTimers.set(sessionId, timeoutId);
             } else {
@@ -222,19 +217,23 @@ export const startSession = async (sessionId, companyId) => {
             console.log(`[OPEN] Conectado!`);
             retries.set(sessionId, 0);
             
-            await supabase.from("instances").update({ status: "connected", qrcode_url: null, updated_at: new Date() }).eq("session_id", sessionId);
+            await supabase.from("instances").update({ 
+                status: "connected", 
+                qrcode_url: null, 
+                updated_at: new Date() 
+            }).eq("session_id", sessionId);
 
-            // Carrega GRUPOS e FOTO DE PERFIL
+            // Carrega GRUPOS e FOTO DE PERFIL após 2 segundos
             setTimeout(async () => {
                  const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
                  
-                 // 1. Pega Foto do Bot
+                 // Foto do Bot
                  try { 
                      const myPic = await sock.profilePictureUrl(userJid, 'image'); 
                      if(myPic) await supabase.from("instances").update({ profile_pic_url: myPic }).eq("session_id", sessionId);
                  } catch(e){}
 
-                 // 2. Busca e Salva GRUPOS (NOVIDADE)
+                 // Busca GRUPOS
                  try {
                      console.log("[GRUPOS] Buscando grupos...");
                      const groups = await sock.groupFetchAllParticipating();
@@ -242,7 +241,7 @@ export const startSession = async (sessionId, companyId) => {
                      console.log(`[GRUPOS] Encontrados: ${groupsList.length}`);
                      
                      for (const g of groupsList) {
-                         // Salva grupo como contato: Name = Nome do Grupo, PushName = null
+                         // Salva grupo como contato. Nome do grupo vai em 'name'.
                          await upsertContact(g.id, sock, null, companyId, g.subject);
                      }
                  } catch (e) {
@@ -264,7 +263,8 @@ export const startSession = async (sessionId, companyId) => {
                 const content = getMessageContent(msg.message);
                 const msgType = getMessageType(msg.message);
 
-                // Lógica de Nomes (Prioriza PushName se não tiver salvo)
+                // Nomes: Passamos pushName para o upsert. 
+                // O frontend decide se mostra o name (salvo) ou pushName (perfil).
                 await upsertContact(remoteJid, sock, msg.pushName, companyId);
 
                 let leadId = null;
@@ -299,7 +299,9 @@ export const sendMessage = async (sessionId, to, payload) => {
 };
 
 export const deleteSession = async (sessionId, companyId, clearDb = true) => {
+    console.log(`[DELETE] Sessão ${sessionId}`);
     if (companyId) companyIndex.delete(companyId);
+    
     lastQrUpdate.delete(sessionId);
     if (reconnectTimers.has(sessionId)) { clearTimeout(reconnectTimers.get(sessionId)); reconnectTimers.delete(sessionId); }
 
