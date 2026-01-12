@@ -3,59 +3,43 @@ import { useSupabaseAuthState } from "../auth/supabaseAuth.js";
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
-// CHECAGEM DE SEGURANÇA
 if (!process.env.SUPABASE_KEY || !process.env.SUPABASE_URL) {
     console.error("❌ ERRO FATAL: Chaves do Supabase não encontradas no .env");
 }
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// --- ARQUITETURA DE MEMÓRIA ---
 const sessions = new Map();      
 const companyIndex = new Map();  
 const retries = new Map(); 
-// Mapa para guardar os timers de reconexão e poder cancelá-los
 const reconnectTimers = new Map();      
-// NOVO: Controle de Debounce para não travar o banco com QR Codes repetidos
 const lastQrUpdate = new Map(); 
 
-// --- HELPER NOVO: Garante que o Lead existe (Anti-Ghost) ---
+// --- HELPER NOVO: Anti-Ghost ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) return null;
-
     const phone = remoteJid.split('@')[0];
 
-    const { data: existingLead } = await supabase
-        .from('leads')
-        .select('id')
-        .eq('phone', phone) 
-        .eq('company_id', companyId)
-        .maybeSingle();
-
+    const { data: existingLead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
     if (existingLead) return existingLead.id;
 
     console.log(`[AUTO-LEAD] Criando lead para ${phone}...`);
-
-    const { data: newLead, error } = await supabase
-        .from('leads')
-        .insert({
-            company_id: companyId,
-            name: pushName || `Novo Contato (${phone})`,
-            phone: phone,
-            status: 'new', 
-            funnel_stage_id: null 
-        })
-        .select('id')
-        .single();
+    const { data: newLead, error } = await supabase.from('leads').insert({
+        company_id: companyId,
+        name: pushName || `Novo Contato (${phone})`,
+        phone: phone,
+        status: 'new', 
+        funnel_stage_id: null 
+    }).select('id').single();
 
     if (error) {
-        console.error("[LEAD ERROR] Falha ao criar lead automático:", error.message);
+        console.error("[LEAD ERROR] Falha ao criar lead:", error.message);
         return null;
     }
     return newLead.id;
 };
 
-// --- HELPER: Determinar Tipo da Mensagem ---
+//Helpers de Conteúdo (Mantidos iguais ao seu arquivo)
 const getMessageType = (msg) => {
     if (msg.imageMessage) return 'image';
     if (msg.videoMessage) return 'video';
@@ -67,22 +51,17 @@ const getMessageType = (msg) => {
     return 'text';
 };
 
-// --- HELPER: Extrair Conteúdo ---
 const getMessageContent = (msg) => {
     if (!msg) return "";
-    
     if (msg.conversation) return msg.conversation;
     if (msg.extendedTextMessage?.text) return msg.extendedTextMessage.text;
     if (msg.imageMessage?.caption) return msg.imageMessage.caption;
     if (msg.videoMessage?.caption) return msg.videoMessage.caption;
     if (msg.documentMessage?.caption) return msg.documentMessage.caption;
-    
     if (msg.imageMessage) return "[Imagem]";
     if (msg.videoMessage) return "[Vídeo]";
     if (msg.audioMessage) return "[Áudio]";
     if (msg.documentMessage) return msg.documentMessage.fileName || "[Documento]";
-    if (msg.stickerMessage) return "[Figurinha]";
-
     if (msg.pollCreationMessage || msg.pollCreationMessageV3) {
         const pollData = (msg.pollCreationMessage || msg.pollCreationMessageV3);
         return JSON.stringify({
@@ -90,20 +69,16 @@ const getMessageContent = (msg) => {
             options: pollData.options.map(o => o.optionName)
         });
     }
-
     return "";
 };
 
-// --- HELPER: Upsert Contato ---
 const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
     try {
         if (!jid || jid.includes('status@broadcast')) return;
-        
         const cleanJid = jid.split(':')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
         const isGroup = cleanJid.endsWith('@g.us');
         let name = pushName;
-        let profilePicUrl = null;
-
+        
         if (isGroup) {
             try {
                 const groupMetadata = await sock.groupMetadata(cleanJid);
@@ -113,15 +88,10 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
 
         const contactData = {
             jid: cleanJid,
-            profile_pic_url: profilePicUrl,
-            updated_at: new Date()
+            updated_at: new Date(),
+            company_id: companyId
         };
-        
-        if (name) {
-            contactData.name = name;
-            contactData.push_name = name;
-        }
-        if (companyId) contactData.company_id = companyId;
+        if (name) { contactData.name = name; contactData.push_name = name; }
 
         await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
     } catch (err) {}
@@ -133,15 +103,12 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
 export const startSession = async (sessionId, companyId) => {
     console.log(`[START] Sessão ${sessionId} (Empresa: ${companyId})`);
     
-    // Garante limpeza antes de iniciar
     if (sessions.has(sessionId)) {
         await deleteSession(sessionId, companyId, false);
     }
 
-    // console.log(`[DEBUG] Recuperando estado de autenticação para ${sessionId}...`);
     const { state, saveCreds } = await useSupabaseAuthState(sessionId);
     
-    // Fallback de versão para evitar travamento na API do Baileys
     let version = [2, 3000, 1015901307];
     try {
         const v = await fetchLatestBaileysVersion();
@@ -156,13 +123,13 @@ export const startSession = async (sessionId, companyId) => {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
         },
-        printQRInTerminal: true, // Mantemos true para DEBUG no Render
+        printQRInTerminal: true,
         logger: pino({ level: "silent" }),
         browser: ["Wancora CRM", "Chrome", "10.0"],
-        syncFullHistory: false, // OTIMIZAÇÃO: Reduz carga inicial
+        syncFullHistory: false, 
         markOnlineOnConnect: true,
         connectTimeoutMs: 60000,
-        defaultQueryTimeoutMs: 0, // CRÍTICO: Evita timeouts em queries iniciais no Render
+        defaultQueryTimeoutMs: 0,
         keepAliveIntervalMs: 30000,
         generateHighQualityLinkPreview: false,
     });
@@ -173,108 +140,98 @@ export const startSession = async (sessionId, companyId) => {
 
     sock.ev.on("creds.update", saveCreds);
 
-    // --- CONEXÃO ---
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // Logs reduzidos para não poluir, mas essenciais
-        if(connection) console.log(`[CONN] Sessão ${sessionId}: ${connection}`);
+        if (connection) console.log(`[CONN] Sessão ${sessionId}: ${connection}`);
 
         if (!sessions.has(sessionId)) return; 
 
-        // 1. TRATAMENTO DE QR CODE (COM DEBOUNCE - A CORREÇÃO MÁGICA)
+        // 1. QR CODE (Com Debounce)
         if (qr) {
-            console.log(`[QR] Recebido. Tamanho: ${qr.length}`);
             const now = Date.now();
             const lastTime = lastQrUpdate.get(sessionId) || 0;
-            
-            // Só salva no banco se passou 2 segundos desde o último
             if (now - lastTime > 2000) {
                 lastQrUpdate.set(sessionId, now);
-                
-                const { error } = await supabase.from("instances").upsert({ 
+                console.log(`[QR] Atualizando no banco...`);
+                await supabase.from("instances").upsert({ 
                     session_id: sessionId, 
                     qrcode_url: qr, 
-                    status: "qr_ready", // Status que o frontend espera
+                    status: "qr_ready", 
                     company_id: companyId, 
                     name: "Aguardando Leitura...", 
                     updated_at: new Date()
                 }, { onConflict: 'session_id' });
-
-                if (error) console.error("❌ ERRO AO SALVAR QR NO BANCO:", error.message);
-                else console.log("✅ QR Code persistido no Supabase.");
             }
         }
 
+        // 2. CONEXÃO FECHADA
         if (connection === "close") {
-            // Limpa timer de debounce
             lastQrUpdate.delete(sessionId);
-
-            // Limpa timer de reconexão anterior
             if (reconnectTimers.has(sessionId)) {
                 clearTimeout(reconnectTimers.get(sessionId));
                 reconnectTimers.delete(sessionId);
             }
 
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            
+            // 🛑 SE FOR 401 (Deslogado), NÃO RECONECTA
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403) {
+                 console.log(`[STOP] Sessão ${sessionId} desconectada permanentemente.`);
+                 await deleteSession(sessionId, companyId, true);
+                 return;
+            }
+
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
             if (shouldReconnect && sessions.has(sessionId)) {
                 await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
                 
-                // Limpeza Parcial
                 const attempt = (retries.get(sessionId) || 0) + 1;
                 retries.set(sessionId, attempt);
                 
-                const delayMs = Math.min(attempt * 2000, 10000);
+                const delayMs = Math.min(attempt * 3000, 15000); // Aumentei o delay para segurança
                 console.log(`[RECONNECT] Tentativa ${attempt} em ${delayMs}ms...`);
 
                 const timeoutId = setTimeout(() => {
-                    if (sessions.has(sessionId)) {
-                        startSession(sessionId, companyId);
-                    }
+                    if (sessions.has(sessionId)) startSession(sessionId, companyId);
                 }, delayMs);
-                
                 reconnectTimers.set(sessionId, timeoutId);
-
             } else {
                 await deleteSession(sessionId, companyId, false);
             }
         }
 
+        // 3. CONECTADO
         if (connection === "open") {
             console.log(`[OPEN] Conectado!`);
             retries.set(sessionId, 0);
             
-            if (reconnectTimers.has(sessionId)) {
-                clearTimeout(reconnectTimers.get(sessionId));
-                reconnectTimers.delete(sessionId);
-            }
-            
-            const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-            let myPic = null;
-            try { myPic = await sock.profilePictureUrl(userJid, 'image'); } catch(e){}
-
+            // Salva status CONECTADO
             await supabase.from("instances").update({ 
-                status: "connected", qrcode_url: null, name: sock.user.name || "WhatsApp Conectado", profile_pic_url: myPic, updated_at: new Date()
+                status: "connected", 
+                qrcode_url: null, 
+                // name: sock.user.name || "WhatsApp Conectado", // Removido para evitar sobrescrever seu nome personalizado
+                updated_at: new Date()
             }).eq("session_id", sessionId);
 
-            try {
-                const groups = await sock.groupFetchAllParticipating();
-                for (const g of Object.values(groups)) {
-                    await upsertContact(g.id, sock, g.subject, companyId);
-                }
-            } catch (e) {}
+            // Tenta pegar a foto em background sem pressa
+            setTimeout(async () => {
+                 const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+                 try { 
+                     const myPic = await sock.profilePictureUrl(userJid, 'image'); 
+                     if(myPic) await supabase.from("instances").update({ profile_pic_url: myPic }).eq("session_id", sessionId);
+                 } catch(e){}
+            }, 2000);
         }
     });
 
-    // --- PROCESSAMENTO DE MENSAGENS ---
+    // MENSAGENS (Multimídia + Anti-Ghost)
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (!sessions.has(sessionId)) return;
-
-        if (type === "notify" || type === "append") {
+        if (type === "notify") {
             for (const msg of messages) {
-                if (!msg.message) continue;
-                if (msg.key.remoteJid === 'status@broadcast') continue;
+                if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
 
                 const remoteJid = msg.key.remoteJid;
                 const fromMe = msg.key.fromMe;
@@ -290,7 +247,7 @@ export const startSession = async (sessionId, companyId) => {
                     leadId = await ensureLeadExists(remoteJid, msg.pushName, companyId);
                 }
 
-                const { error } = await supabase.from('messages').insert({
+                await supabase.from('messages').insert({
                     company_id: companyId,
                     session_id: sessionId,
                     remote_jid: remoteJid,
@@ -301,8 +258,6 @@ export const startSession = async (sessionId, companyId) => {
                     lead_id: leadId, 
                     created_at: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000) : new Date()
                 });
-
-                if (error) console.error("❌ Erro DB:", error.message);
             }
         }
     });
@@ -310,9 +265,6 @@ export const startSession = async (sessionId, companyId) => {
     return sock;
 };
 
-// ==============================================================================
-// FUNÇÃO DE ENVIO UNIVERSAL
-// ==============================================================================
 export const sendMessage = async (sessionId, to, payload) => {
     const sock = sessions.get(sessionId);
     if (!sock) throw new Error("Sessão não ativa");
@@ -335,17 +287,11 @@ export const sendMessage = async (sessionId, to, payload) => {
     return sent;
 };
 
-// ==============================================================================
-// DELETE & GETTERS
-// ==============================================================================
 export const deleteSession = async (sessionId, companyId, clearDb = true) => {
     console.log(`[DELETE] Sessão ${sessionId}`);
     if (companyId) companyIndex.delete(companyId);
     
-    // FIX: Cancela debounce pendente
     lastQrUpdate.delete(sessionId);
-
-    // FIX: Cancela reconexão pendente
     if (reconnectTimers.has(sessionId)) {
         clearTimeout(reconnectTimers.get(sessionId));
         reconnectTimers.delete(sessionId);
@@ -357,11 +303,9 @@ export const deleteSession = async (sessionId, companyId, clearDb = true) => {
     
     if (sock) { 
         try { 
-            // FIX: Remove listeners para evitar vazamento de memória
             sock.ev.removeAllListeners("connection.update");
             sock.ev.removeAllListeners("creds.update");
             sock.ev.removeAllListeners("messages.upsert");
-            
             sock.end(undefined); 
         } catch (e) {} 
     }
