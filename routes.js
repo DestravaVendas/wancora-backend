@@ -11,6 +11,7 @@ router.post("/session/start", async (req, res) => {
   const { sessionId, companyId } = req.body;
   if (!sessionId || !companyId) return res.status(400).json({ error: "Dados incompletos" });
 
+  // Inicia sem travar a resposta
   whatsappController.startSession(sessionId, companyId).catch(err => console.error(err));
   res.status(200).json({ message: "Iniciando..." });
 });
@@ -21,6 +22,7 @@ router.post("/session/logout", async (req, res) => {
   res.json({ message: "Desconectado." });
 });
 
+// ⚠️ ROTA VITAL QUE A OUTRA IA TINHA REMOVIDO ⚠️
 router.get("/session/status/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const { data, error } = await supabase.from("instances").select("*").eq("session_id", sessionId).single();
@@ -28,39 +30,41 @@ router.get("/session/status/:sessionId", async (req, res) => {
   res.json(data);
 });
 
-// --- ENVIO DE MENSAGENS (UPGRADED 🚀) ---
+// --- ENVIO DE MENSAGENS (UPGRADED) ---
 router.post("/message/send", async (req, res) => {
-  // Agora aceitamos 'type' e 'url'/'caption'/'options' além de 'text'
   const { sessionId, to, text, type, url, caption, options, companyId } = req.body;
   
   try {
-    // Monta o payload baseado no que o Frontend mandou
     const payload = {
-        type: type || 'text', // Se não mandar tipo, assume texto
-        content: text,        // Para texto simples
-        url: url,             // Para mídia
-        caption: caption,     // Para legenda de mídia
-        values: options,      // Para enquete
-        ptt: true             // Para áudio (default voice note)
+        type: type || 'text',
+        content: text,
+        url: url,
+        caption: caption,
+        values: options,
+        ptt: true
     };
 
     const sentMsg = await whatsappController.sendMessage(sessionId, to, payload);
     
-    // Salva no banco manualmente para garantir feedback instantâneo no chat (optimistic)
+    // Salva no banco (Optimistic UI)
     if (companyId && to) {
         const remoteJid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-        // Busca Lead ID se existir
-        const { data: lead } = await supabase.from("leads").select("id").eq("phone", to.split('@')[0]).eq("company_id", companyId).single();
+        const phone = to.split('@')[0];
+        
+        // Garante que o lead existe antes de salvar msg de saída (Anti-Erro)
+        let leadId = null;
+        const { data: lead } = await supabase.from("leads").select("id").eq("phone", phone).eq("company_id", companyId).maybeSingle();
+        if (lead) leadId = lead.id;
 
         await supabase.from("messages").insert({
             company_id: companyId,
-            lead_id: lead?.id || null,
+            lead_id: leadId,
             session_id: sessionId,
             remote_jid: remoteJid,
             direction: "outbound",
             from_me: true,
             type: payload.type,
-            content: text || caption || (payload.type === 'poll' ? JSON.stringify({name: 'Enquete', options}) : `[${payload.type}]`),
+            content: text || caption || (payload.type === 'poll' ? 'Enquete' : `[${payload.type}]`),
             status: "sent",
             created_at: new Date()
         });
@@ -73,6 +77,7 @@ router.post("/message/send", async (req, res) => {
   }
 });
 
+// Rota de Campanhas (Mantida)
 router.post("/campaigns/send", createCampaign);
 
 export default router;
