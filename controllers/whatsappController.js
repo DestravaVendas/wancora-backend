@@ -169,7 +169,7 @@ export const startSession = async (sessionId, companyId) => {
 
         if (qr) {
             await supabase.from("instances").upsert({ 
-                session_id: sessionId, qrcode_url: qr, status: "qrcode", company_id: companyId, name: "Conectando...", updated_at: new Date()
+                session_id: sessionId, qrcode_url: qr, status: "qr_ready", company_id: companyId, name: "Conectando...", updated_at: new Date()
             }, { onConflict: 'session_id' });
         }
 
