@@ -14,8 +14,10 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const sessions = new Map();      
 const companyIndex = new Map();  
 const retries = new Map(); 
-// NOVO: Mapa para guardar os timers de reconexão e poder cancelá-los
+// Mapa para guardar os timers de reconexão e poder cancelá-los
 const reconnectTimers = new Map();      
+// NOVO: Controle de Debounce para não travar o banco com QR Codes repetidos
+const lastQrUpdate = new Map(); 
 
 // --- HELPER NOVO: Garante que o Lead existe (Anti-Ghost) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
@@ -136,11 +138,17 @@ export const startSession = async (sessionId, companyId) => {
         await deleteSession(sessionId, companyId, false);
     }
 
-    console.log(`[DEBUG] Recuperando estado de autenticação para ${sessionId}...`);
+    // console.log(`[DEBUG] Recuperando estado de autenticação para ${sessionId}...`);
     const { state, saveCreds } = await useSupabaseAuthState(sessionId);
-    console.log(`[DEBUG] Buscando versão do Baileys...`);
-    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
-    console.log(`[DEBUG] Versão utilizada: ${version}`);
+    
+    // Fallback de versão para evitar travamento na API do Baileys
+    let version = [2, 3000, 1015901307];
+    try {
+        const v = await fetchLatestBaileysVersion();
+        version = v.version;
+    } catch (e) {
+        console.log("[AVISO] Falha na versão, usando fallback estável.");
+    }
 
     const sock = makeWASocket({
         version,
@@ -148,13 +156,13 @@ export const startSession = async (sessionId, companyId) => {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
         },
-        printQRInTerminal: false,
+        printQRInTerminal: true, // Mantemos true para DEBUG no Render
         logger: pino({ level: "silent" }),
         browser: ["Wancora CRM", "Chrome", "10.0"],
-        syncFullHistory: false, // Reduz carga inicial
+        syncFullHistory: false, // OTIMIZAÇÃO: Reduz carga inicial
         markOnlineOnConnect: true,
         connectTimeoutMs: 60000,
-        defaultQueryTimeoutMs: 0, // Evita timeouts em queries iniciais
+        defaultQueryTimeoutMs: 0, // CRÍTICO: Evita timeouts em queries iniciais no Render
         keepAliveIntervalMs: 30000,
         generateHighQualityLinkPreview: false,
     });
@@ -168,18 +176,41 @@ export const startSession = async (sessionId, companyId) => {
     // --- CONEXÃO ---
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect, qr } = update;
-        console.log(`[DEBUG] Connection Update para ${sessionId}:`, { connection, qr: !!qr });
+        
+        // Logs reduzidos para não poluir, mas essenciais
+        if(connection) console.log(`[CONN] Sessão ${sessionId}: ${connection}`);
 
         if (!sessions.has(sessionId)) return; 
 
+        // 1. TRATAMENTO DE QR CODE (COM DEBOUNCE - A CORREÇÃO MÁGICA)
         if (qr) {
-            await supabase.from("instances").upsert({ 
-                session_id: sessionId, qrcode_url: qr, status: "qr_ready", company_id: companyId, name: "Conectando...", updated_at: new Date()
-            }, { onConflict: 'session_id' });
+            console.log(`[QR] Recebido. Tamanho: ${qr.length}`);
+            const now = Date.now();
+            const lastTime = lastQrUpdate.get(sessionId) || 0;
+            
+            // Só salva no banco se passou 2 segundos desde o último
+            if (now - lastTime > 2000) {
+                lastQrUpdate.set(sessionId, now);
+                
+                const { error } = await supabase.from("instances").upsert({ 
+                    session_id: sessionId, 
+                    qrcode_url: qr, 
+                    status: "qr_ready", // Status que o frontend espera
+                    company_id: companyId, 
+                    name: "Aguardando Leitura...", 
+                    updated_at: new Date()
+                }, { onConflict: 'session_id' });
+
+                if (error) console.error("❌ ERRO AO SALVAR QR NO BANCO:", error.message);
+                else console.log("✅ QR Code persistido no Supabase.");
+            }
         }
 
         if (connection === "close") {
-            // Limpa timer anterior se existir
+            // Limpa timer de debounce
+            lastQrUpdate.delete(sessionId);
+
+            // Limpa timer de reconexão anterior
             if (reconnectTimers.has(sessionId)) {
                 clearTimeout(reconnectTimers.get(sessionId));
                 reconnectTimers.delete(sessionId);
@@ -190,16 +221,14 @@ export const startSession = async (sessionId, companyId) => {
             if (shouldReconnect && sessions.has(sessionId)) {
                 await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
                 
-                // Limpeza Parcial (mantém sessão no mapa mas prepara reconexão)
+                // Limpeza Parcial
                 const attempt = (retries.get(sessionId) || 0) + 1;
                 retries.set(sessionId, attempt);
                 
                 const delayMs = Math.min(attempt * 2000, 10000);
                 console.log(`[RECONNECT] Tentativa ${attempt} em ${delayMs}ms...`);
 
-                // FIX: Salva o ID do timeout para poder cancelar no logout
                 const timeoutId = setTimeout(() => {
-                    // Verifica novamente se a sessão ainda deve existir
                     if (sessions.has(sessionId)) {
                         startSession(sessionId, companyId);
                     }
@@ -216,7 +245,6 @@ export const startSession = async (sessionId, companyId) => {
             console.log(`[OPEN] Conectado!`);
             retries.set(sessionId, 0);
             
-            // Limpa timers de reconexão pois conectou
             if (reconnectTimers.has(sessionId)) {
                 clearTimeout(reconnectTimers.get(sessionId));
                 reconnectTimers.delete(sessionId);
@@ -297,7 +325,6 @@ export const sendMessage = async (sessionId, to, payload) => {
         case 'text': msgContent = { text: payload.content }; break;
         case 'image': msgContent = { image: { url: payload.url }, caption: payload.caption || '' }; break;
         case 'video': msgContent = { video: { url: payload.url }, caption: payload.caption || '' }; break;
-        // Ajuste no mimetype do áudio para tentar compatibilidade
         case 'audio': msgContent = { audio: { url: payload.url }, mimetype: 'audio/mp4', ptt: payload.ptt || false }; break;
         case 'document': msgContent = { document: { url: payload.url }, mimetype: payload.mimetype || 'application/pdf', fileName: payload.fileName || 'arquivo.pdf' }; break;
         case 'poll': msgContent = { poll: { name: payload.name, values: payload.values, selectableCount: payload.selectableCount || 1 } }; break;
@@ -315,7 +342,10 @@ export const deleteSession = async (sessionId, companyId, clearDb = true) => {
     console.log(`[DELETE] Sessão ${sessionId}`);
     if (companyId) companyIndex.delete(companyId);
     
-    // FIX: Cancela qualquer reconexão pendente
+    // FIX: Cancela debounce pendente
+    lastQrUpdate.delete(sessionId);
+
+    // FIX: Cancela reconexão pendente
     if (reconnectTimers.has(sessionId)) {
         clearTimeout(reconnectTimers.get(sessionId));
         reconnectTimers.delete(sessionId);
