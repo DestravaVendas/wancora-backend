@@ -3,7 +3,6 @@ import { useSupabaseAuthState } from "../auth/supabaseAuth.js";
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
-// CHECAGEM DE SEGURANÇA
 if (!process.env.SUPABASE_KEY || !process.env.SUPABASE_URL) {
     console.error("❌ ERRO FATAL: Chaves do Supabase não encontradas no .env");
 }
@@ -16,7 +15,7 @@ const retries = new Map();
 const reconnectTimers = new Map();      
 const lastQrUpdate = new Map(); 
 
-// --- HELPER: Anti-Ghost (CORRIGIDO PARA SEU BANCO: pipeline_stages) ---
+// --- HELPER: Anti-Ghost (Usa pipeline_stages conforme validado) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) return null;
     const phone = remoteJid.split('@')[0];
@@ -25,7 +24,7 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     const { data: existingLead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
     if (existingLead) return existingLead.id;
 
-    // 2. Busca a primeira etapa do Kanban na tabela PIPELINE_STAGES
+    // 2. Busca primeira etapa do Kanban
     const { data: firstStage } = await supabase
         .from('pipeline_stages')
         .select('id')
@@ -34,15 +33,13 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
         .limit(1)
         .maybeSingle();
 
-    console.log(`[AUTO-LEAD] Criando lead para ${phone}...`);
-    
-    // 3. Cria novo lead (usando pipeline_stage_id)
+    // 3. Cria novo lead
     const { data: newLead, error } = await supabase.from('leads').insert({
         company_id: companyId,
         name: pushName || `Novo Contato (${phone})`,
         phone: phone,
         status: 'new',
-        pipeline_stage_id: firstStage?.id || null // <--- CORRIGIDO AQUI
+        pipeline_stage_id: firstStage?.id || null 
     }).select('id').single();
 
     if (error) {
@@ -52,21 +49,38 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     return newLead.id;
 };
 
-// --- HELPER: Upsert Contato ---
-const upsertContact = async (jid, sock, pushName = null, companyId = null) => {
+// --- HELPER: Upsert Contato Inteligente (Nomes, Perfis e Grupos) ---
+const upsertContact = async (jid, sock, pushName = null, companyId = null, savedName = null, imgUrl = null) => {
     try {
         const cleanJid = jid.split(':')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
         
+        // Objeto de dados para o banco
         const contactData = {
             jid: cleanJid,
-            name: pushName,
             company_id: companyId,
             updated_at: new Date()
         };
 
-        // Salva contato sem travar
+        // Lógica de Prioridade de Nomes
+        // 'name' = Nome salvo na agenda (ou nome do grupo)
+        // 'push_name' = Nome público do perfil
+        
+        if (savedName) contactData.name = savedName; // Sobrescreve se tiver nome salvo
+        if (pushName) contactData.push_name = pushName;
+        if (imgUrl) contactData.profile_pic_url = imgUrl;
+
+        // Se for a primeira vez e não tiver nome salvo, usa o pushName como nome principal
+        // Isso evita que fique só o número na lista
+        if (pushName && !savedName) {
+            // Não forçamos contactData.name = pushName aqui para permitir que o frontend 
+            // decida mostrar o pushName se o name for null.
+            // Mas salvamos o push_name garantido.
+        }
+
         await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
-    } catch (e) {}
+    } catch (e) {
+        // console.error("Erro upsert contato:", e.message);
+    }
 };
 
 // Helpers de Conteúdo
@@ -80,8 +94,8 @@ const getMessageContent = (msg) => {
 
 const getMessageType = (msg) => {
     if (msg.imageMessage) return 'image';
-    if (msg.videoMessage) return 'video';
     if (msg.audioMessage) return 'audio';
+    if (msg.videoMessage) return 'video';
     if (msg.documentMessage) return 'document';
     if (msg.pollCreationMessage) return 'poll';
     return 'text';
@@ -91,14 +105,13 @@ const getMessageType = (msg) => {
 // CORE: START SESSION
 // ==============================================================================
 export const startSession = async (sessionId, companyId) => {
-    console.log(`[START] Sessão ${sessionId} (Empresa: ${companyId})`);
+    console.log(`[START] Sessão ${sessionId}`);
     
     if (sessions.has(sessionId)) {
         await deleteSession(sessionId, companyId, false);
     }
 
     const { state, saveCreds } = await useSupabaseAuthState(sessionId);
-    
     let version = [2, 3000, 1015901307];
     try { const v = await fetchLatestBaileysVersion(); version = v.version; } catch (e) {}
 
@@ -111,7 +124,7 @@ export const startSession = async (sessionId, companyId) => {
         printQRInTerminal: true,
         logger: pino({ level: "silent" }),
         browser: ["Wancora CRM", "Chrome", "10.0"],
-        syncFullHistory: false, // CRÍTICO: Mantém false para não derrubar o Render
+        syncFullHistory: false, // Mantém false para estabilidade
         markOnlineOnConnect: true,
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 0,
@@ -125,24 +138,30 @@ export const startSession = async (sessionId, companyId) => {
 
     sock.ev.on("creds.update", saveCreds);
 
-    // --- SINCRONIZA CONTATOS (Sem Mensagens) ---
-    // Isso atende seu pedido de baixar contatos sem travar
+    // --- SINCRONIZA CONTATOS E GRUPOS (Ao Conectar) ---
     sock.ev.on("contacts.upsert", async (contacts) => {
+        // Filtra e prepara lote
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
-        
         if (validContacts.length > 0) {
-            console.log(`[CONTATOS] Sincronizando ${validContacts.length} contatos...`);
-            
-            // Processa em lote para ser rápido
+            console.log(`[CONTATOS] Processando ${validContacts.length} contatos...`);
             const batch = validContacts.map(c => ({
                 jid: c.id,
-                name: c.name || c.notify || c.verifiedName || null,
+                name: c.name || c.verifiedName || null, // Nome salvo
+                push_name: c.notify || null, // Nome do perfil
                 company_id: companyId,
                 updated_at: new Date()
             }));
+            await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
+        }
+    });
 
-            const { error } = await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
-            if(error) console.error("Erro ao salvar contatos:", error.message);
+    // --- GRUPOS (Lógica Nova) ---
+    sock.ev.on("groups.update", async (groups) => {
+        // Atualiza nome de grupos se mudar
+        for (const g of groups) {
+            if (g.subject) {
+                await upsertContact(g.id, sock, null, companyId, g.subject);
+            }
         }
     });
 
@@ -153,18 +172,21 @@ export const startSession = async (sessionId, companyId) => {
 
         if (!sessions.has(sessionId)) return; 
 
-        // 1. QR CODE
+        // 1. QR CODE (Ajustado para funcionar sempre)
         if (qr) {
             const now = Date.now();
             const lastTime = lastQrUpdate.get(sessionId) || 0;
-            if (now - lastTime > 2000) {
+            
+            // Reduzi o tempo de debounce de 2000ms para 1000ms para ser mais responsivo
+            // E adicionei log para confirmar que entrou no IF
+            if (now - lastTime > 1000) {
                 lastQrUpdate.set(sessionId, now);
-                console.log(`[QR] Atualizando no banco...`);
-                // CORREÇÃO DE NOME: Não enviamos 'name' aqui para não sobrescrever
+                console.log(`[QR] Atualizando no banco... (Comprimento: ${qr.length})`);
+                
                 await supabase.from("instances").upsert({ 
                     session_id: sessionId, 
                     qrcode_url: qr, 
-                    status: "qr_ready", 
+                    status: "qr_ready", // Status vital para o frontend
                     company_id: companyId, 
                     updated_at: new Date()
                 }, { onConflict: 'session_id' });
@@ -177,10 +199,7 @@ export const startSession = async (sessionId, companyId) => {
             if (reconnectTimers.has(sessionId)) { clearTimeout(reconnectTimers.get(sessionId)); reconnectTimers.delete(sessionId); }
 
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            
-            // 401/403: Desconectado pelo celular -> Para de tentar
             if (statusCode === 401 || statusCode === 403) {
-                 console.log(`[STOP] Desconectado pelo usuário.`);
                  await deleteSession(sessionId, companyId, true);
                  return;
             }
@@ -188,12 +207,9 @@ export const startSession = async (sessionId, companyId) => {
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect && sessions.has(sessionId)) {
                 await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
-                
                 const attempt = (retries.get(sessionId) || 0) + 1;
                 retries.set(sessionId, attempt);
                 const delayMs = Math.min(attempt * 3000, 15000);
-                
-                console.log(`[RECONNECT] Tentativa ${attempt} em ${delayMs}ms...`);
                 const timeoutId = setTimeout(() => { if (sessions.has(sessionId)) startSession(sessionId, companyId); }, delayMs);
                 reconnectTimers.set(sessionId, timeoutId);
             } else {
@@ -206,25 +222,37 @@ export const startSession = async (sessionId, companyId) => {
             console.log(`[OPEN] Conectado!`);
             retries.set(sessionId, 0);
             
-            // CORREÇÃO DE NOME: Não enviamos 'name' para preservar o que você digitou
-            await supabase.from("instances").update({ 
-                status: "connected", 
-                qrcode_url: null, 
-                updated_at: new Date() 
-            }).eq("session_id", sessionId);
+            await supabase.from("instances").update({ status: "connected", qrcode_url: null, updated_at: new Date() }).eq("session_id", sessionId);
 
-            // Foto de perfil
+            // Carrega GRUPOS e FOTO DE PERFIL
             setTimeout(async () => {
                  const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+                 
+                 // 1. Pega Foto do Bot
                  try { 
                      const myPic = await sock.profilePictureUrl(userJid, 'image'); 
                      if(myPic) await supabase.from("instances").update({ profile_pic_url: myPic }).eq("session_id", sessionId);
                  } catch(e){}
+
+                 // 2. Busca e Salva GRUPOS (NOVIDADE)
+                 try {
+                     console.log("[GRUPOS] Buscando grupos...");
+                     const groups = await sock.groupFetchAllParticipating();
+                     const groupsList = Object.values(groups);
+                     console.log(`[GRUPOS] Encontrados: ${groupsList.length}`);
+                     
+                     for (const g of groupsList) {
+                         // Salva grupo como contato: Name = Nome do Grupo, PushName = null
+                         await upsertContact(g.id, sock, null, companyId, g.subject);
+                     }
+                 } catch (e) {
+                     console.error("Erro ao buscar grupos:", e);
+                 }
+
             }, 2000);
         }
     });
 
-    // MENSAGENS (Multimídia + Anti-Ghost)
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (!sessions.has(sessionId)) return;
         if (type === "notify") {
@@ -236,10 +264,9 @@ export const startSession = async (sessionId, companyId) => {
                 const content = getMessageContent(msg.message);
                 const msgType = getMessageType(msg.message);
 
-                // Garante que o contato exista
+                // Lógica de Nomes (Prioriza PushName se não tiver salvo)
                 await upsertContact(remoteJid, sock, msg.pushName, companyId);
 
-                // Garante que o Lead exista (usando pipeline_stages agora)
                 let leadId = null;
                 if (!fromMe && !remoteJid.includes('@g.us')) {
                     leadId = await ensureLeadExists(remoteJid, msg.pushName, companyId);
@@ -254,7 +281,7 @@ export const startSession = async (sessionId, companyId) => {
                     message_type: msgType,
                     status: fromMe ? 'sent' : 'received',
                     lead_id: leadId, 
-                    created_at: new Date() // Usa data atual para novas mensagens
+                    created_at: new Date()
                 });
             }
         }
@@ -272,9 +299,7 @@ export const sendMessage = async (sessionId, to, payload) => {
 };
 
 export const deleteSession = async (sessionId, companyId, clearDb = true) => {
-    console.log(`[DELETE] Sessão ${sessionId}`);
     if (companyId) companyIndex.delete(companyId);
-    
     lastQrUpdate.delete(sessionId);
     if (reconnectTimers.has(sessionId)) { clearTimeout(reconnectTimers.get(sessionId)); reconnectTimers.delete(sessionId); }
 
@@ -282,15 +307,7 @@ export const deleteSession = async (sessionId, companyId, clearDb = true) => {
     sessions.delete(sessionId);
     retries.delete(sessionId);
     
-    if (sock) { 
-        try { 
-            sock.ev.removeAllListeners("connection.update");
-            sock.ev.removeAllListeners("creds.update");
-            sock.ev.removeAllListeners("messages.upsert");
-            sock.ev.removeAllListeners("contacts.upsert"); // Limpa listener de contatos
-            sock.end(undefined); 
-        } catch (e) {} 
-    }
+    if (sock) { try { sock.end(undefined); } catch (e) {} }
 
     if (clearDb) {
         await supabase.from("instances").delete().eq("session_id", sessionId);
