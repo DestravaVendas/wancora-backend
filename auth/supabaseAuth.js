@@ -11,7 +11,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 });
 
 export const useSupabaseAuthState = async (sessionId) => {
-  // Função auxiliar para escrever dados no banco (com retry simples)
+  // Função auxiliar para escrever dados no banco (BLINDADA)
   const writeData = async (data, type, id) => {
     try {
         const payload = JSON.parse(JSON.stringify(data, BufferJSON.replacer));
@@ -26,8 +26,11 @@ export const useSupabaseAuthState = async (sessionId) => {
         }, { onConflict: 'session_id, data_type, key_id' });
 
         if (error) {
-            // Se falhar, tentamos uma segunda vez após 500ms (ajuda em oscilações)
-            await new Promise(r => setTimeout(r, 500));
+            // ESTRATÉGIA ANTI-CRASH:
+            // Se der erro de banco (timeout, rate limit), esperamos um pouco e tentamos de novo.
+            // Se falhar de novo, APENAS LOGAMOS. Não jogamos erro para o Baileys não desconectar.
+            await new Promise(r => setTimeout(r, 1000));
+            
             const { error: retryError } = await supabase.from("baileys_auth_state").upsert({
                 session_id: sessionId,
                 data_type: type,
@@ -36,10 +39,13 @@ export const useSupabaseAuthState = async (sessionId) => {
                 updated_at: new Date()
             }, { onConflict: 'session_id, data_type, key_id' });
             
-            if (retryError) console.error(`[AUTH ERROR] Falha final ao salvar ${type}/${id}:`, retryError.message);
+            if (retryError) {
+                console.warn(`[AUTH WARN] Falha não-crítica ao salvar ${type}/${id}. Ignorando para manter conexão.`);
+            }
         }
     } catch (e) {
-        console.error(`[AUTH CRITICAL] Erro de rede ao salvar ${type}:`, e.message);
+        // Engole o erro de rede para não derrubar o socket
+        console.error(`[AUTH SILENT] Erro de rede ao salvar ${type}:`, e.message);
     }
   };
 
@@ -51,7 +57,7 @@ export const useSupabaseAuthState = async (sessionId) => {
           .eq("session_id", sessionId)
           .eq("data_type", type)
           .eq("key_id", id)
-          .single();
+          .maybeSingle();
 
         if (error || !data) return null;
         return JSON.parse(JSON.stringify(data.payload), BufferJSON.reviver);
@@ -81,7 +87,6 @@ export const useSupabaseAuthState = async (sessionId) => {
       keys: {
         get: async (type, ids) => {
           const res = {};
-          // Otimização de leitura: Fazemos Promise.all para ser rápido na leitura
           await Promise.all(ids.map(async (id) => {
             let value = await readData(type, id);
             if (type === "app-state-sync-key" && value) {
@@ -94,23 +99,21 @@ export const useSupabaseAuthState = async (sessionId) => {
         set: async (data) => {
           const tasks = [];
           
-          // 1. Prepara todas as tarefas
           for (const type in data) {
             for (const id in data[type]) {
               const value = data[type][id];
-              // Adicionamos a tarefa na lista
               tasks.push(() => value ? writeData(value, type, id) : removeData(type, id));
             }
           }
 
-          // 2. 🔥 EXECUÇÃO EM LOTES (BATCHING) 🔥
-          // Reduzimos o BATCH_SIZE para 20 para evitar sobrecarga no Supabase/Network
-          const BATCH_SIZE = 20; 
+          // 🔥 EXECUÇÃO EM LOTES (BATCHING SEGURO) 🔥
+          // Reduzimos ainda mais para garantir estabilidade em servidores menores
+          const BATCH_SIZE = 10; 
           for (let i = 0; i < tasks.length; i += BATCH_SIZE) {
             const chunk = tasks.slice(i, i + BATCH_SIZE);
             await Promise.all(chunk.map(task => task()));
-            // Pequeno delay entre lotes para estabilidade
-            await new Promise(r => setTimeout(r, 100));
+            // Delay vital
+            await new Promise(r => setTimeout(r, 50));
           }
         },
       },
