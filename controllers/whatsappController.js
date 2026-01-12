@@ -52,10 +52,23 @@ const uploadMediaToSupabase = async (buffer, type) => {
     }
 };
 
-// --- HELPER 1: Anti-Ghost (Pipeline Stages) ---
+// --- HELPER 1: Anti-Ghost Inteligente (Com verificação de is_ignored) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) return null;
     const phone = remoteJid.split('@')[0];
+
+    // --- NOVA LÓGICA: Verifica se o usuário pediu para IGNORAR este contato ---
+    const { data: contact } = await supabase
+        .from('contacts')
+        .select('is_ignored')
+        .eq('jid', remoteJid)
+        .maybeSingle();
+
+    if (contact && contact.is_ignored) {
+        console.log(`[Anti-Ghost] Ignorando contato ${phone} (Definido pelo usuário)`);
+        return null; // Retorna null e NÃO cria o lead
+    }
+    // --------------------------------------------------------------------------
 
     const { data: existingLead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
     if (existingLead) return existingLead.id;
