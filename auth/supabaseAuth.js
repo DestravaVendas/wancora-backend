@@ -104,12 +104,13 @@ export const useSupabaseAuthState = async (sessionId) => {
           }
 
           // 2. 🔥 EXECUÇÃO EM LOTES (BATCHING) 🔥
-          // Isso resolve o erro "fetch failed". Enviamos 50 de cada vez.
-          const BATCH_SIZE = 50; 
+          // Reduzimos o BATCH_SIZE para 20 para evitar sobrecarga no Supabase/Network
+          const BATCH_SIZE = 20; 
           for (let i = 0; i < tasks.length; i += BATCH_SIZE) {
             const chunk = tasks.slice(i, i + BATCH_SIZE);
-            // Executa 50 tarefas simultâneas e espera elas terminarem antes de mandar as próximas
             await Promise.all(chunk.map(task => task()));
+            // Pequeno delay entre lotes para estabilidade
+            await new Promise(r => setTimeout(r, 100));
           }
         },
       },
