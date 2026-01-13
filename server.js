@@ -14,6 +14,11 @@ dotenv.config();
 
 const app = express();
 
+// Rota de Health Check (Para o Cron-job.org não deixar o Render dormir)
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
 // Middlewares de Segurança e Performance
 app.use(helmet());
 app.use(cors({
