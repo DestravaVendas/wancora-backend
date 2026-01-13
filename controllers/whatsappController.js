@@ -1,3 +1,4 @@
+// controllers/whatsappController.js
 import makeWASocket, { 
     DisconnectReason, 
     fetchLatestBaileysVersion, 
@@ -8,7 +9,7 @@ import makeWASocket, {
 import { useSupabaseAuthState } from "../auth/supabaseAuth.js";
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
-import mime from "mime-types"; // Necessário para extensão de arquivos
+import mime from "mime-types";
 
 // CHECAGEM DE SEGURANÇA
 if (!process.env.SUPABASE_KEY || !process.env.SUPABASE_URL) {
@@ -23,28 +24,20 @@ const retries = new Map();
 const reconnectTimers = new Map();      
 const lastQrUpdate = new Map(); 
 
-// --- HELPER NOVO: Upload de Mídia para Supabase Storage ---
+// --- HELPER: Upload de Mídia ---
 const uploadMediaToSupabase = async (buffer, type) => {
     try {
         const fileExt = mime.extension(type) || 'bin';
         const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.${fileExt}`;
         const filePath = `chat-media/${fileName}`;
 
-        // Upload
         const { error } = await supabase.storage
-            .from('chat-media') // Certifique-se de ter criado este bucket "Public" no Supabase
-            .upload(filePath, buffer, {
-                contentType: type,
-                upsert: false
-            });
+            .from('chat-media')
+            .upload(filePath, buffer, { contentType: type, upsert: false });
 
         if (error) throw error;
 
-        // Get URL
-        const { data } = supabase.storage
-            .from('chat-media')
-            .getPublicUrl(filePath);
-
+        const { data } = supabase.storage.from('chat-media').getPublicUrl(filePath);
         return data.publicUrl;
     } catch (err) {
         console.error('❌ Erro upload media:', err.message);
@@ -52,51 +45,24 @@ const uploadMediaToSupabase = async (buffer, type) => {
     }
 };
 
-// --- HELPER 1: Anti-Ghost Inteligente (COM LOGS DE DIAGNÓSTICO) ---
+// --- HELPER: Anti-Ghost Inteligente ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     try {
         if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) return null;
         const phone = remoteJid.split('@')[0];
 
-        // --- NOVA LÓGICA: Verifica se o usuário pediu para IGNORAR este contato ---
-        const { data: contact } = await supabase
-            .from('contacts')
-            .select('is_ignored')
-            .eq('jid', remoteJid)
-            .maybeSingle();
-
-        if (contact && contact.is_ignored) {
-            console.log(`🚫 [Anti-Ghost] Ignorando contato ${phone} (Definido pelo usuário)`);
-            return null; // Retorna null e NÃO cria o lead
-        }
-        // --------------------------------------------------------------------------
+        // Verifica ignore
+        const { data: contact } = await supabase.from('contacts').select('is_ignored').eq('jid', remoteJid).maybeSingle();
+        if (contact && contact.is_ignored) return null;
 
         const { data: existingLead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
-        if (existingLead) {
-            // console.log(`ℹ️ Lead já existe para ${phone}`);
-            return existingLead.id;
-        }
+        if (existingLead) return existingLead.id;
 
-        console.log(`🆕 [Anti-Ghost] Tentando criar Lead para ${phone}...`);
-
-        // Pega primeira etapa (COM LOG DE ERRO SE FALHAR)
-        const { data: firstStage, error: stageError } = await supabase.from('pipeline_stages')
-            .select('id, name').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
-
-        if (stageError) {
-            console.error("⚠️ [DIAGNÓSTICO] Erro ao buscar pipeline_stages:", stageError.message);
-        }
-
+        // Pega primeira etapa
+        const { data: firstStage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
         const stageId = firstStage?.id || null;
-        
-        if (!stageId) {
-            console.warn(`⚠️ [ALERTA CRÍTICO] Lead será criado SEM etapa (stage_id: null). Ele ficará invisível no Kanban! Verifique se a empresa ${companyId} tem etapas criadas.`);
-        } else {
-            console.log(`📍 [DIAGNÓSTICO] Etapa encontrada: ${firstStage.name} (${stageId})`);
-        }
 
-        // Cria lead
-        const { data: newLead, error } = await supabase.from('leads').insert({
+        const { data: newLead } = await supabase.from('leads').insert({
             company_id: companyId,
             name: pushName || `Novo Contato (${phone})`,
             phone: phone,
@@ -104,35 +70,21 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
             pipeline_stage_id: stageId 
         }).select('id').single();
 
-        if (error) {
-            console.error("❌ [DIAGNÓSTICO] Falha ao INSERT lead:", error.message);
-            return null;
-        }
-        
-        console.log(`✨ [SUCESSO] Lead criado: ${newLead.id}`);
-        return newLead.id;
-
+        return newLead?.id || null;
     } catch (e) {
-        console.error("❌ [CRASH] Erro fatal no ensureLeadExists:", e);
+        console.error("Erro ensureLeadExists:", e);
         return null;
     }
 };
 
-// --- HELPER 2: Upsert Contato ---
+// --- HELPER: Upsert Contato ---
 const upsertContact = async (jid, sock, pushName = null, companyId = null, savedName = null, imgUrl = null) => {
     try {
         const cleanJid = jid.split(':')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
-        
-        const contactData = {
-            jid: cleanJid,
-            company_id: companyId,
-            updated_at: new Date()
-        };
-
+        const contactData = { jid: cleanJid, company_id: companyId, updated_at: new Date() };
         if (savedName) contactData.name = savedName; 
         if (pushName) contactData.push_name = pushName;
         if (imgUrl) contactData.profile_pic_url = imgUrl;
-
         await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
     } catch (e) {}
 };
@@ -152,7 +104,9 @@ const getMessageType = (msg) => {
     if (msg.audioMessage) return 'audio';
     if (msg.videoMessage) return 'video';
     if (msg.documentMessage) return 'document';
-    if (msg.pollCreationMessage) return 'poll';
+    if (msg.pollCreationMessage || msg.pollCreationMessageV3) return 'poll';
+    if (msg.locationMessage) return 'location';
+    if (msg.contactMessage) return 'contact';
     return 'text';
 };
 
@@ -192,11 +146,8 @@ export const startSession = async (sessionId, companyId) => {
 
     sock.ev.on("creds.update", saveCreds);
 
-    // --- 1. DOWNLOAD DE HISTÓRICO INTELIGENTE ---
-    sock.ev.on('messaging-history.set', async ({ chats, contacts, messages }) => {
-        console.log(`[HISTÓRICO] Recebido: ${contacts.length} contatos, ${messages.length} mensagens.`);
-
-        // A. Salvar Contatos
+    // --- 1. HISTÓRICO ---
+    sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
             const batch = validContacts.map(c => ({
@@ -208,16 +159,13 @@ export const startSession = async (sessionId, companyId) => {
             }));
             await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
         }
-
-        // B. Salvar Últimas Mensagens (Sem baixar mídia pesada para não travar o boot)
         const safeMessages = messages.slice(-50); 
         for (const msg of safeMessages) {
-            // Passamos false no final para indicar que é histórico e não precisa baixar mídia agora
             await processMessage(msg, sessionId, companyId, sock, false); 
         }
     });
 
-    // --- 2. ATUALIZAÇÃO DE CONTATOS ---
+    // --- 2. CONTATOS ---
     sock.ev.on("contacts.upsert", async (contacts) => {
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
@@ -232,21 +180,16 @@ export const startSession = async (sessionId, companyId) => {
         }
     });
 
-    // --- 3. GRUPOS (Mantido da sua versão robusta) ---
+    // --- 3. GRUPOS ---
     sock.ev.on("groups.update", async (groups) => {
         for (const g of groups) {
-            if (g.subject) {
-                await upsertContact(g.id, sock, null, companyId, g.subject);
-            }
+            if (g.subject) await upsertContact(g.id, sock, null, companyId, g.subject);
         }
     });
 
     // --- 4. CONEXÃO ---
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
-        if (connection) console.log(`[CONN] Sessão ${sessionId}: ${connection}`);
-
         if (!sessions.has(sessionId)) return; 
 
         if (qr) {
@@ -254,9 +197,7 @@ export const startSession = async (sessionId, companyId) => {
             const lastTime = lastQrUpdate.get(sessionId) || 0;
             if (now - lastTime > 800) {
                 lastQrUpdate.set(sessionId, now);
-                await supabase.from("instances")
-                    .update({ qrcode_url: qr, status: "qrcode", updated_at: new Date() })
-                    .eq('session_id', sessionId);
+                await supabase.from("instances").update({ qrcode_url: qr, status: "qrcode", updated_at: new Date() }).eq('session_id', sessionId);
             }
         }
 
@@ -284,12 +225,8 @@ export const startSession = async (sessionId, companyId) => {
         }
 
         if (connection === "open") {
-            console.log(`[OPEN] Conectado!`);
             retries.set(sessionId, 0);
-            
             await supabase.from("instances").update({ status: "connected", qrcode_url: null, updated_at: new Date() }).eq("session_id", sessionId);
-
-            // Tenta pegar foto do perfil da instância
             setTimeout(async () => {
                  const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
                  try { 
@@ -300,15 +237,11 @@ export const startSession = async (sessionId, companyId) => {
         }
     });
 
-    // --- 5. RECEBIMENTO DE MENSAGENS (REALTIME) ---
+    // --- 5. RECEBIMENTO ---
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (!sessions.has(sessionId)) return;
-        
-        // 'notify' é mensagem nova chegando em tempo real
-        // 'append' é mensagem enviada por outro dispositivo (sincronização)
         if (type === "notify" || type === "append") {
             for (const msg of messages) {
-                // Passamos true para fazer o download da mídia aqui (TEMPO REAL)
                 await processMessage(msg, sessionId, companyId, sock, true);
             }
         }
@@ -317,13 +250,12 @@ export const startSession = async (sessionId, companyId) => {
     return sock;
 };
 
-// --- PROCESSAMENTO INTELIGENTE (COM FILTRO DE LID, MÍDIA E LOGS DE DEBUG) ---
+// --- PROCESSAMENTO ---
 const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMedia = false) => {
     try {
-        // 1. FILTRO DE SEGURANÇA: Ignora Status, Broadcasts e LIDs (Ids técnicos do WhatsApp)
         if (!msg.message) return;
         if (msg.key.remoteJid === 'status@broadcast') return;
-        if (msg.key.remoteJid.includes('@lid')) return; // <--- NOVA PROTEÇÃO CONTRA O ERRO FK
+        if (msg.key.remoteJid.includes('@lid')) return; 
         if (msg.key.remoteJid.includes('@broadcast')) return;
 
         const remoteJid = msg.key.remoteJid;
@@ -335,48 +267,50 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
         let msgType = getMessageType(msg.message);
         let mediaUrl = null;
 
-        // Se for texto vazio e não tem mídia, ignora
         if (!content && msgType === 'text') return;
 
-        console.log(`[MSG] Recebida de ${remoteJid} (${msgType}) | fromMe: ${fromMe}`);
-
-        // 2. Garante Contato (Normaliza para @s.whatsapp.net)
         await upsertContact(remoteJid, sock, pushName, companyId);
 
-        // 3. Garante Lead (Se não for grupo)
         let leadId = null;
         if (!remoteJid.includes('@g.us')) {
-            // Se for conversa individual, tenta criar/vincular lead
-            // (Mesmo se for minha msg, quero garantir que o lead existe)
             leadId = await ensureLeadExists(remoteJid, pushName, companyId);
         }
 
-        // 4. Download de Mídia (Apenas se solicitado e for tipo mídia)
+        // DOWNLOAD MÍDIA
         if (shouldDownloadMedia && ['image', 'video', 'audio', 'document'].includes(msgType)) {
             try {
-                // Faz o download do binário usando a função do Baileys
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                 
-                // Determina MimeType para salvar corretamente
                 let mimetype = 'application/octet-stream';
                 if (msg.message.imageMessage) mimetype = 'image/jpeg';
                 else if (msg.message.audioMessage) mimetype = 'audio/mp4'; 
                 else if (msg.message.videoMessage) mimetype = 'video/mp4';
                 else if (msg.message.documentMessage) mimetype = msg.message.documentMessage.mimetype;
 
-                // Sobe para o Supabase e pega a URL
                 mediaUrl = await uploadMediaToSupabase(buffer, mimetype);
-                if (mediaUrl) console.log(`[MEDIA] Upload concluído: ${mediaUrl}`);
             } catch (mediaErr) {
-                console.error('[MEDIA] Falha no download (Ignorando):', mediaErr.message);
+                console.error('[MEDIA] Falha no download:', mediaErr.message);
             }
         }
 
-        // 5. Salva Mensagem
-        const { error } = await supabase.from('messages').upsert({
+        // Se for POLL (Enquete), formata o content como JSON
+        if (msgType === 'poll') {
+            try {
+                const pollData = msg.message.pollCreationMessage || msg.message.pollCreationMessageV3;
+                if (pollData) {
+                    content = JSON.stringify({
+                        name: pollData.name,
+                        options: pollData.options.map(o => o.optionName),
+                        selectableOptionsCount: pollData.selectableOptionsCount
+                    });
+                }
+            } catch(e) { content = 'Enquete'; }
+        }
+
+        await supabase.from('messages').upsert({
             company_id: companyId,
             session_id: sessionId,
-            remote_jid: remoteJid, // Agora temos certeza que é um JID válido (@s.whatsapp.net ou @g.us)
+            remote_jid: remoteJid,
             whatsapp_id: whatsappId,
             from_me: fromMe,
             content: content || '[Mídia]',
@@ -389,15 +323,12 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
             onConflict: 'remote_jid, whatsapp_id'
         });
 
-        if (error) console.error("❌ Erro DB Msg:", error.message);
-        else console.log(`✅ Mensagem salva. LeadID vinculado: ${leadId}`);
-
     } catch (e) {
         console.error("Erro processamento msg:", e);
     }
 };
 
-// --- ENVIO (COM SUPORTE A MULTIMÍDIA) ---
+// --- ENVIO (ATUALIZADO) ---
 export const sendMessage = async (sessionId, to, payload) => {
     const sock = sessions.get(sessionId);
     if (!sock) throw new Error("Sessão não ativa");
@@ -406,48 +337,92 @@ export const sendMessage = async (sessionId, to, payload) => {
     let sentMsg;
 
     try {
-        if (payload.type === 'text') {
-            sentMsg = await sock.sendMessage(jid, { text: payload.content || payload.text || "" });
-        } 
-        else if (payload.type === 'image') {
-            sentMsg = await sock.sendMessage(jid, { 
-                image: { url: payload.url }, 
-                caption: payload.caption 
-            });
-        }
-        else if (payload.type === 'video') {
-            sentMsg = await sock.sendMessage(jid, { 
-                video: { url: payload.url }, 
-                caption: payload.caption 
-            });
-        }
-        else if (payload.type === 'audio') {
-            sentMsg = await sock.sendMessage(jid, { 
-                audio: { url: payload.url }, 
-                mimetype: 'audio/mp4',
-                ptt: payload.ptt || false // Se true, envia como nota de voz
-            });
-        }
-        else if (payload.type === 'document') {
-            sentMsg = await sock.sendMessage(jid, { 
-                document: { url: payload.url }, 
-                mimetype: payload.mimetype || 'application/pdf',
-                fileName: payload.fileName || 'documento'
-            });
-        }
-        else if (payload.type === 'poll') {
-             sentMsg = await sock.sendMessage(jid, {
-                poll: {
-                    name: payload.name,
-                    values: payload.options,
-                    selectableCount: 1
+        console.log(`[SEND] Enviando para ${jid}. Tipo: ${payload.type}`);
+
+        switch (payload.type) {
+            case 'text':
+                // Tratamento especial para Pix (envia como texto formatado)
+                if (payload.text && payload.text.startsWith('Chave Pix:')) {
+                    sentMsg = await sock.sendMessage(jid, { text: payload.text });
+                } else {
+                    sentMsg = await sock.sendMessage(jid, { text: payload.content || payload.text || "" });
                 }
-            });
+                break;
+
+            case 'image':
+                sentMsg = await sock.sendMessage(jid, { 
+                    image: { url: payload.url }, 
+                    caption: payload.caption 
+                });
+                break;
+
+            case 'video':
+                sentMsg = await sock.sendMessage(jid, { 
+                    video: { url: payload.url }, 
+                    caption: payload.caption 
+                });
+                break;
+
+            case 'audio':
+                // Suporte CRÍTICO a PTT vs Arquivo de Áudio
+                const isPtt = payload.ptt === true; // Frontend deve enviar bool
+                sentMsg = await sock.sendMessage(jid, { 
+                    audio: { url: payload.url }, 
+                    mimetype: 'audio/mp4', // WhatsApp exige isso para áudios
+                    ptt: isPtt 
+                });
+                break;
+
+            case 'document':
+                sentMsg = await sock.sendMessage(jid, { 
+                    document: { url: payload.url }, 
+                    mimetype: payload.mimetype || 'application/pdf',
+                    fileName: payload.fileName || 'documento'
+                });
+                break;
+
+            case 'poll':
+                // Payload esperado: { poll: { name: 'Pergunta', options: ['A', 'B'], selectableOptionsCount: 1 } }
+                if (!payload.poll || !payload.poll.options || payload.poll.options.length < 2) {
+                    throw new Error("Invalid poll values: Mínimo 2 opções requeridas.");
+                }
+                sentMsg = await sock.sendMessage(jid, {
+                    poll: {
+                        name: payload.poll.name,
+                        values: payload.poll.options, // Baileys usa 'values', Frontend envia 'options'
+                        selectableCount: payload.poll.selectableOptionsCount || 1
+                    }
+                });
+                break;
+
+            case 'location':
+                // Payload esperado: { location: { latitude: 123, longitude: 123 } }
+                sentMsg = await sock.sendMessage(jid, {
+                    location: {
+                        degreesLatitude: payload.location.latitude,
+                        degreesLongitude: payload.location.longitude
+                    }
+                });
+                break;
+
+            case 'contact':
+                // Payload esperado: { contact: { displayName: 'Nome', vcard: 'BEGIN:VCARD...' } }
+                sentMsg = await sock.sendMessage(jid, {
+                    contacts: {
+                        displayName: payload.contact.displayName,
+                        contacts: [{ vcard: payload.contact.vcard }]
+                    }
+                });
+                break;
+
+            default:
+                // Fallback para texto
+                sentMsg = await sock.sendMessage(jid, { text: payload.text || payload.content || "" });
         }
 
         return sentMsg;
     } catch (err) {
-        console.error("Erro no envio:", err);
+        console.error("❌ Erro no envio:", err);
         throw err;
     }
 };
