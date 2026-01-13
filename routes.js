@@ -1,3 +1,4 @@
+// routes.js
 import express from "express";
 import * as whatsappController from "./controllers/whatsappController.js";
 import { createCampaign } from "./controllers/campaignController.js";
@@ -7,7 +8,7 @@ const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // ==============================================================================
-// 1. ROTAS DE SESSÃO (CONEXÃO)
+// 1. ROTAS DE SESSÃO
 // ==============================================================================
 
 router.post("/session/start", async (req, res) => {
@@ -17,8 +18,6 @@ router.post("/session/start", async (req, res) => {
     return res.status(400).json({ error: "Dados incompletos (sessionId/companyId faltando)" });
   }
 
-  // IMPORTANTE: Não usamos 'await' no startSession para não travar a requisição HTTP.
-  // O Frontend recebe "Iniciando..." imediatamente e o QR Code aparece depois via banco.
   whatsappController.startSession(sessionId, companyId).catch(err => {
     console.error(`❌ Erro fatal ao iniciar sessão ${sessionId}:`, err);
   });
@@ -37,29 +36,35 @@ router.post("/session/logout", async (req, res) => {
   }
 });
 
-// ROTA VITAL: O Frontend chama isso a cada 2s para ver se o QR Code chegou
 router.get("/session/status/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
-  
-  // Consultamos direto o Supabase, pois é a "Fonte da Verdade"
-  const { data, error } = await supabase
-    .from("instances")
-    .select("*")
-    .eq("session_id", sessionId)
-    .maybeSingle();
-
+  const { data, error } = await supabase.from("instances").select("*").eq("session_id", sessionId).maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ status: "not_found" });
-
   res.json(data);
 });
 
 // ==============================================================================
-// 2. ROTAS DE MENSAGEM (MULTIMÍDIA + ANTI-ERRO)
+// 2. ROTAS DE MENSAGEM (CORRIGIDA E EXPANDIDA)
 // ==============================================================================
 
 router.post("/message/send", async (req, res) => {
-  const { sessionId, to, text, type, url, caption, options, companyId } = req.body;
+  // Desestrutura TODOS os campos possíveis vindos do Frontend moderno
+  const { 
+      sessionId, 
+      to, 
+      text, 
+      type, 
+      url, 
+      caption, 
+      poll,      // Objeto JSON: { name, options, selectableOptionsCount }
+      location,  // Objeto JSON: { latitude, longitude }
+      contact,   // Objeto JSON: { displayName, vcard }
+      ptt,       // Boolean (para áudio)
+      mimetype,  // String (para doc/audio)
+      fileName,  // String (para doc)
+      companyId 
+  } = req.body;
   
   // Validação básica
   if (!sessionId || !to) {
@@ -67,49 +72,52 @@ router.post("/message/send", async (req, res) => {
   }
 
   try {
-    // 1. Monta o Payload Inteligente (Suporta Texto, Imagem, Áudio, Enquete)
+    // 1. Monta o Payload Unificado para o Controller
     const payload = {
         type: type || 'text',
         content: text,
+        text: text, // Fallback
         url: url,
         caption: caption,
-        values: options, // Para enquetes
-        ptt: true        // Se for áudio, força ser "Voice Note" (microfone azul)
+        poll: poll,
+        location: location,
+        contact: contact,
+        ptt: ptt,
+        mimetype: mimetype,
+        fileName: fileName
     };
 
     // 2. Envia via Controller (Baileys)
     const sentMsg = await whatsappController.sendMessage(sessionId, to, payload);
     
-    // 3. Salva no Banco (Optimistic UI + Segurança)
+    // 3. Salva no Banco (Para manter histórico de saída)
     if (companyId) {
         const remoteJid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
         const phone = to.split('@')[0];
         
-        // Anti-Erro: Verifica se o lead existe antes de salvar a mensagem de saída
         let leadId = null;
-        const { data: lead } = await supabase
-            .from("leads")
-            .select("id")
-            .eq("phone", phone)
-            .eq("company_id", companyId)
-            .maybeSingle();
-            
+        const { data: lead } = await supabase.from("leads").select("id").eq("phone", phone).eq("company_id", companyId).maybeSingle();
         if (lead) leadId = lead.id;
 
-        // Formata o conteúdo para o histórico ficar legível
+        // Formata o conteúdo visual para o banco
         let displayContent = text || caption || `[${payload.type}]`;
-        if (payload.type === 'poll') displayContent = '📊 Enquete';
+        
+        if (payload.type === 'poll' && poll) displayContent = JSON.stringify(poll);
+        else if (payload.type === 'location' && location) displayContent = JSON.stringify(location);
+        else if (payload.type === 'contact' && contact) displayContent = JSON.stringify(contact);
+        else if (payload.type === 'pix') displayContent = text; // Pix é texto no final das contas
 
         await supabase.from("messages").insert({
             company_id: companyId,
             lead_id: leadId,
             session_id: sessionId,
             remote_jid: remoteJid,
-            direction: "outbound",
+            whatsapp_id: sentMsg?.key?.id || `sent-${Date.now()}`,
             from_me: true,
-            type: payload.type,
+            message_type: payload.type, // Salva o tipo correto no banco
             content: displayContent,
-            status: "sent", // Assumimos enviado pois o baileys não deu erro
+            media_url: url, // Salva URL se houver
+            status: "sent",
             created_at: new Date()
         });
     }
@@ -122,9 +130,6 @@ router.post("/message/send", async (req, res) => {
   }
 });
 
-// ==============================================================================
-// 3. ROTAS DE CAMPANHA
-// ==============================================================================
 router.post("/campaigns/send", createCampaign);
 
 export default router;
