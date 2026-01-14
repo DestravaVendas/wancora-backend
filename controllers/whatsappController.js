@@ -193,15 +193,13 @@ export const startSession = async (sessionId, companyId) => {
 
     sock.ev.on("creds.update", saveCreds);
 
-    // --- 1. HISTÓRICO INTELIGENTE (CHUNKED) ---
-    // Corrige o problema de só pegar 50 msgs e evita travamento do node
+    // --- 1. HISTÓRICO INTELIGENTE (SMART SYNC: TODAS AS CONVERSAS, 10 MSGS CADA) ---
     sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
-        console.log(`📚 [HISTÓRICO] Recebido. Contatos: ${contacts.length}, Msgs: ${messages.length}`);
+        console.log(`📚 [HISTÓRICO] Recebido Bruto. Contatos: ${contacts.length}, Msgs: ${messages.length}`);
 
-        // A. Salvar Contatos
+        // A. Salvar Contatos (Garante que TODAS as conversas apareçam no Inbox)
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
-            // Upsert em batch é seguro para contatos
             const batch = validContacts.map(c => ({
                 jid: c.id,
                 name: c.name || c.verifiedName || null,
@@ -209,29 +207,56 @@ export const startSession = async (sessionId, companyId) => {
                 company_id: companyId,
                 updated_at: new Date()
             }));
-            await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
+            
+            // Usamos upsert para criar ou atualizar quem já existe
+            const { error } = await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
+            if (error) console.error("⚠️ Erro ao salvar contatos do histórico:", error.message);
         }
 
-        // B. Salvar Mensagens em CHUNKS (Lotes)
-        // Isso resolve o problema de memória e de "histórico incompleto"
+        // B. Filtragem Inteligente: Apenas as últimas 10 mensagens de CADA contato
+        const messagesByChat = new Map();
+
+        // 1. Agrupa mensagens por JID (Conversa) na memória
+        messages.forEach(msg => {
+            const jid = msg.key.remoteJid;
+            if (!messagesByChat.has(jid)) {
+                messagesByChat.set(jid, []);
+            }
+            messagesByChat.get(jid).push(msg);
+        });
+
+        const smartMessages = [];
+        const MSG_LIMIT_PER_CHAT = 7; // <--- Defina aqui quantas msgs quer por conversa (7 é ótimo)
+
+        // 2. Ordena e Corta cada conversa individualmente
+        messagesByChat.forEach((chatMsgs, jid) => {
+            // Ordena: Mais antiga para mais recente (para o chat ficar na ordem certa)
+            chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+            
+            // Pega apenas as últimas X mensagens (slice negativo pega do final)
+            const topMessages = chatMsgs.slice(-MSG_LIMIT_PER_CHAT);
+            
+            smartMessages.push(...topMessages);
+        });
+
+        console.log(`🧠 [SMART SYNC] Filtrado de ${messages.length} para ${smartMessages.length} mensagens (Top ${MSG_LIMIT_PER_CHAT} recentes por chat).`);
+
+        // C. Salvar Mensagens Filtradas em CHUNKS (Lotes)
         const CHUNK_SIZE = 50; 
-        const totalMessages = messages.length;
-        
-        console.log(`📚 [HISTÓRICO] Processando ${totalMessages} mensagens em lotes de ${CHUNK_SIZE}...`);
+        const totalMessages = smartMessages.length; 
 
         for (let i = 0; i < totalMessages; i += CHUNK_SIZE) {
-            const chunk = messages.slice(i, i + CHUNK_SIZE);
+            const chunk = smartMessages.slice(i, i + CHUNK_SIZE);
             
-            // Processa o lote em paralelo para velocidade, mas espera o lote acabar para ir pro próximo
+            // Processa o lote em paralelo
             await Promise.all(chunk.map(msg => processMessage(msg, sessionId, companyId, sock, false)));
             
-            // Pequeno delay para não sufocar o Event Loop do Node ou o Banco
-            await delay(100); 
+            await delay(100); // Pausa para não travar CPU
             
             if (i % 500 === 0 && i > 0) console.log(`📚 [HISTÓRICO] Progresso: ${i}/${totalMessages}`);
         }
         
-        console.log(`✅ [HISTÓRICO] Sincronização concluída.`);
+        console.log(`✅ [HISTÓRICO] Sincronização Inteligente concluída.`);
     });
 
     // --- 2. CONTATOS ---
