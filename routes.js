@@ -102,10 +102,11 @@ router.post("/message/send", async (req, res) => {
         // Formata o conteúdo visual para o banco
         let displayContent = text || caption || `[${payload.type}]`;
         
+        // Garante a serialização correta para tipos complexos
         if (payload.type === 'poll' && poll) displayContent = JSON.stringify(poll);
         else if (payload.type === 'location' && location) displayContent = JSON.stringify(location);
         else if (payload.type === 'contact' && contact) displayContent = JSON.stringify(contact);
-        else if (payload.type === 'pix') displayContent = text; // Pix é texto no final das contas
+        else if (payload.type === 'pix') displayContent = text; // Pix é tratado como texto no front
 
         await supabase.from("messages").insert({
             company_id: companyId,
