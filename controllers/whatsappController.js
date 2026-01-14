@@ -29,7 +29,7 @@ const contactCache = new Set(); // Cache para evitar SPAM de upsert de contatos
 const leadCreationLock = new Set(); // Mutex para evitar duplicidade de Leads em rajadas
 
 // --- HELPER: Unwrap Message (Desenrola mensagens temporárias/visualização única) ---
-// CRÍTICO: Sem isso, mensagens temporárias aparecem como vazias ou indefinidas.
+// CORREÇÃO CRÍTICA: Expandido para cobrir documentsWithCaption e V2
 const unwrapMessage = (msg) => {
     if (!msg.message) return msg;
     
@@ -39,13 +39,21 @@ const unwrapMessage = (msg) => {
     if (content.ephemeralMessage) {
         content = content.ephemeralMessage.message;
     }
-    // Desenrola ViewOnce (Visualização única)
+    // Desenrola ViewOnce (Visualização única V1)
     if (content.viewOnceMessage) {
         content = content.viewOnceMessage.message;
     }
-    // Desenrola ViewOnceV2
+    // Desenrola ViewOnceV2 (Visualização única V2 - comum em áudios/vídeos novos)
     if (content.viewOnceMessageV2) {
         content = content.viewOnceMessageV2.message;
+    }
+    // Desenrola Documentos com Legenda (Novo formato WhatsApp)
+    if (content.documentWithCaptionMessage) {
+        content = content.documentWithCaptionMessage.message;
+    }
+    // Desenrola Mensagens Editadas
+    if (content.editedMessage) {
+        content = content.editedMessage.message.protocolMessage.editedMessage;
     }
 
     return { ...msg, message: content };
@@ -72,6 +80,55 @@ const uploadMediaToSupabase = async (buffer, type) => {
     }
 };
 
+// --- HELPER: Atualização Inteligente de Nome (Hierarquia) ---
+// Prioridade: 1. Agenda (contacts.name) > 2. Perfil (pushName) > 3. Número
+const smartUpdateLeadName = async (phone, pushName, companyId) => {
+    try {
+        // 1. Busca dados atuais do Lead e do Contato
+        const { data: lead } = await supabase
+            .from('leads')
+            .select('id, name')
+            .eq('phone', phone)
+            .eq('company_id', companyId)
+            .maybeSingle();
+
+        if (!lead) return;
+
+        // Busca se temos um nome salvo na agenda (tabela contacts)
+        // O sufixo do JID é necessário para a busca
+        const remoteJid = `${phone}@s.whatsapp.net`;
+        const { data: contact } = await supabase
+            .from('contacts')
+            .select('name')
+            .eq('jid', remoteJid)
+            .eq('company_id', companyId)
+            .maybeSingle();
+
+        const savedName = contact?.name; // Nome salvo na agenda
+        
+        // Define o "Melhor Nome Disponível"
+        const bestName = savedName || pushName;
+
+        if (!bestName) return; // Se não tem nome nenhum melhor, aborta
+
+        // Lógica de Proteção: Só atualiza se o nome atual no CRM for "Genérico" (número)
+        const currentNameClean = lead.name.replace(/\D/g, '');
+        const phoneClean = phone.replace(/\D/g, '');
+        
+        // Verifica se o nome atual é basicamente o número de telefone
+        const isGenericName = currentNameClean.includes(phoneClean) || lead.name.startsWith('+') || lead.name === phone;
+
+        // Se o nome atual é genérico E temos um nome melhor -> Atualiza
+        if (isGenericName && lead.name !== bestName) {
+            console.log(`✨ [SMART SYNC] Atualizando Lead ${phone}: "${lead.name}" -> "${bestName}"`);
+            await supabase.from('leads').update({ name: bestName }).eq('id', lead.id);
+        }
+
+    } catch (e) {
+        console.error("Erro no smartUpdateLeadName:", e);
+    }
+};
+
 // --- HELPER: Anti-Ghost Inteligente (Com Mutex de Criação) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     // 1. Ignora infraestrutura do WhatsApp
@@ -82,7 +139,6 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
 
     // 2. Verifica se já estamos criando este lead AGORA (Mutex)
     if (leadCreationLock.has(lockKey)) {
-        // Se já está criando, espera um pouco e retorna o ID (o outro processo vai terminar)
         await delay(1000); 
         const { data: lead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
         return lead?.id || null;
@@ -96,7 +152,7 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
             .from('contacts')
             .select('is_ignored, name')
             .eq('jid', remoteJid)
-            .eq('company_id', companyId) // Importante filtrar por empresa
+            .eq('company_id', companyId)
             .maybeSingle();
 
         if (contact && contact.is_ignored) {
@@ -110,7 +166,8 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
 
         console.log(`🆕 [Anti-Ghost] Criando Lead para ${phone}...`);
 
-        // 5. Definição de Nome (Agenda > PushName > Número)
+        // 5. Definição de Nome Inicial (Agenda > PushName > Número)
+        // Aqui usamos o nome do contato se existir, senão o pushname
         const finalName = contact?.name || pushName || `+${phone}`; 
 
         // 6. Pipeline Padrão
@@ -165,11 +222,10 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null, saved
         
         if (!error) {
             contactCache.add(cacheKey);
-            // Expira cache em 10 minutos
             setTimeout(() => contactCache.delete(cacheKey), 10 * 60 * 1000);
         }
     } catch (e) {
-        // Silencioso para não poluir logs, upsert falha é tolerável
+        // Silencioso para não poluir logs
     }
 };
 
@@ -181,6 +237,7 @@ const getMessageContent = (msg) => {
     if (msg.extendedTextMessage?.text) return msg.extendedTextMessage.text;
     if (msg.imageMessage?.caption) return msg.imageMessage.caption;
     if (msg.videoMessage?.caption) return msg.videoMessage.caption;
+    if (msg.documentMessage?.caption) return msg.documentMessage.caption;
     if (msg.templateButtonReplyMessage?.selectedId) return msg.templateButtonReplyMessage.selectedId;
     if (msg.buttonsResponseMessage?.selectedButtonId) return msg.buttonsResponseMessage.selectedButtonId;
     if (msg.listResponseMessage?.singleSelectReply?.selectedRowId) return msg.listResponseMessage.singleSelectReply.selectedRowId;
@@ -189,7 +246,7 @@ const getMessageContent = (msg) => {
 
 const getMessageType = (msg) => {
     if (msg.imageMessage) return 'image';
-    if (msg.audioMessage) return 'audio'; // PTT é tratado como audio aqui, flag ptt salva no envio
+    if (msg.audioMessage) return 'audio'; 
     if (msg.videoMessage) return 'video';
     if (msg.documentMessage) return 'document';
     if (msg.stickerMessage) return 'sticker';
@@ -197,31 +254,6 @@ const getMessageType = (msg) => {
     if (msg.locationMessage) return 'location';
     if (msg.contactMessage) return 'contact';
     return 'text';
-};
-
-// --- HELPER: Enriquecimento de Nome ---
-const enrichLeadName = async (remoteJid, pushName, companyId) => {
-    try {
-        if (!pushName) return; 
-        const phone = remoteJid.split('@')[0];
-
-        const { data: lead } = await supabase
-            .from('leads')
-            .select('id, name')
-            .eq('phone', phone)
-            .eq('company_id', companyId)
-            .maybeSingle();
-
-        if (!lead) return;
-
-        // Se o nome atual parece um número de telefone, atualizamos com o PushName
-        const isGenericName = lead.name.includes(phone) || lead.name === `+${phone}`;
-        
-        if (isGenericName && pushName !== lead.name) {
-            console.log(`✨ [ENRICH] Nome atualizado: "${lead.name}" -> "${pushName}"`);
-            await supabase.from('leads').update({ name: pushName }).eq('id', lead.id);
-        }
-    } catch (e) {}
 };
 
 // ==============================================================================
@@ -245,7 +277,7 @@ export const startSession = async (sessionId, companyId) => {
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
         },
         printQRInTerminal: false,
-        logger: pino({ level: "silent" }), // Mantém limpo, aumente level se quiser debug profundo
+        logger: pino({ level: "silent" }),
         // FINGERPRINT OTIMIZADO PARA SERVIDOR (Evita banimento e loops)
         browser: ["Wancora CRM", "Ubuntu", "24.04"], 
         syncFullHistory: true, 
@@ -254,7 +286,6 @@ export const startSession = async (sessionId, companyId) => {
         keepAliveIntervalMs: 30000,
         generateHighQualityLinkPreview: true,
         getMessage: async (key) => {
-            // Suporte essencial para reenvio de mensagens e citação
             return { conversation: 'hello' }; 
         }
     });
@@ -293,7 +324,7 @@ export const startSession = async (sessionId, companyId) => {
         });
 
         const smartMessages = [];
-        const MSG_LIMIT_PER_CHAT = 15; // Aumentado ligeiramente para melhor contexto
+        const MSG_LIMIT_PER_CHAT = 20; // Aumentado ligeiramente para melhor contexto
 
         messagesByChat.forEach((chatMsgs, jid) => {
             // Ordena cronologicamente
@@ -309,8 +340,9 @@ export const startSession = async (sessionId, companyId) => {
         const CHUNK_SIZE = 50; 
         for (let i = 0; i < smartMessages.length; i += CHUNK_SIZE) {
             const chunk = smartMessages.slice(i, i + CHUNK_SIZE);
+            // Processa sem baixar mídia antiga para economizar recursos
             await Promise.all(chunk.map(msg => processMessage(msg, sessionId, companyId, sock, false)));
-            await delay(50); // Delay mínimo para aliviar I/O do banco
+            await delay(50);
         }
         
         console.log(`✅ [HISTÓRICO] Sync Completo.`);
@@ -403,10 +435,10 @@ export const startSession = async (sessionId, companyId) => {
         
         console.log(`📨 [REALTIME] Upsert ${type}. Qtd: ${messages.length}`);
 
-        // Processa apenas mensagens novas ou appends relevantes
         if (type === "notify" || type === "append") {
             for (const msg of messages) {
                 // Desenrola mensagens temporárias ANTES de processar
+                // CORREÇÃO: Isso garante que 'content' não seja vazio depois
                 const cleanMsg = unwrapMessage(msg);
                 await processMessage(cleanMsg, sessionId, companyId, sock, true);
             }
@@ -430,19 +462,19 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
         if (remoteJid === 'status@broadcast') return; 
         if (remoteJid.includes('@broadcast')) return;
 
+        // CORREÇÃO: Extração de conteúdo da mensagem JÁ DESENROLADA
         let content = getMessageContent(msg.message);
         let msgType = getMessageType(msg.message);
         let mediaUrl = null;
 
         // Ignora mensagens de protocolo vazias
         if (!content && msgType === 'text') {
-            // Check adicional para Sticker que às vezes não tem caption
             if (!msg.message.stickerMessage) return;
         }
 
-        console.log(`⚡ [MSG] ${remoteJid} | Tipo: ${msgType} | FromMe: ${fromMe}`);
+        console.log(`⚡ [MSG] ${remoteJid} | Tipo: ${msgType} | FromMe: ${fromMe} | Content: ${content.slice(0, 20)}...`);
 
-        // 1. Atualiza Contato
+        // 1. Atualiza Contato (PushName é atualizado aqui)
         await upsertContact(remoteJid, sock, pushName, companyId);
 
         let leadId = null;
@@ -450,9 +482,11 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
             // 2. Garante Lead (com Mutex)
             leadId = await ensureLeadExists(remoteJid, pushName, companyId);
             
-            // 3. Enriquece Nome
-            if (pushName && !fromMe) {
-                await enrichLeadName(remoteJid, pushName, companyId);
+            // 3. ATUALIZAÇÃO INTELIGENTE DE NOME (Novo Recurso)
+            // Tenta melhorar o nome do lead se for apenas um número
+            if (!fromMe) {
+                const phone = remoteJid.split('@')[0];
+                await smartUpdateLeadName(phone, pushName, companyId);
             }
         }
 
@@ -460,8 +494,7 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
         const supportedTypes = ['image', 'video', 'audio', 'document', 'sticker'];
         if (shouldDownloadMedia && supportedTypes.includes(msgType)) {
             try {
-                // Verificação de segurança de tamanho (evita crash com arquivos > 50MB)
-                // Nota: Baileys nem sempre expõe fileLength confiável no topo, mas tentamos
+                // Verificação de segurança de tamanho
                 const specificMsg = msg.message[msgType + 'Message'] || msg.message;
                 const fileSize = specificMsg?.fileLength;
                 
@@ -473,6 +506,7 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
                     const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                     
                     let mimetype = 'application/octet-stream';
+                    // Correção de Mime Types para compatibilidade HTML5
                     if (msg.message.imageMessage) mimetype = 'image/jpeg';
                     else if (msg.message.audioMessage) mimetype = 'audio/mp4'; 
                     else if (msg.message.videoMessage) mimetype = 'video/mp4';
@@ -509,7 +543,7 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
             remote_jid: remoteJid,
             whatsapp_id: whatsappId,
             from_me: fromMe,
-            content: content || (mediaUrl ? '[Mídia]' : ''),
+            content: content || (mediaUrl ? '[Mídia]' : ''), // Garante que não salve string vazia se tiver mídia
             message_type: msgType,
             media_url: mediaUrl, 
             status: fromMe ? 'sent' : 'received',
