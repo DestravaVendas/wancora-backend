@@ -157,6 +157,38 @@ const getMessageType = (msg) => {
     return 'text';
 };
 
+// --- HELPER: Enriquecimento de Nome (Atualiza nome se for apenas número) ---
+const enrichLeadName = async (remoteJid, pushName, companyId) => {
+    try {
+        if (!pushName) return; // Se não veio nome novo, não faz nada
+        const phone = remoteJid.split('@')[0];
+
+        // 1. Busca o Lead atual
+        const { data: lead } = await supabase
+            .from('leads')
+            .select('id, name')
+            .eq('phone', phone)
+            .eq('company_id', companyId)
+            .maybeSingle();
+
+        if (!lead) return;
+
+        // 2. A Lógica da Prioridade:
+        // Se o nome atual contém o número de telefone (significa que é um nome genérico/padrão)
+        // E o novo pushName é diferente...
+        // ENTÃO atualizamos.
+        // Se o nome for "Antonio Produto 2", essa verificação falha e mantém o seu nome.
+        const isGenericName = lead.name.includes(phone) || lead.name === `+${phone}` || lead.name === phone;
+        
+        if (isGenericName && pushName !== lead.name) {
+            console.log(`✨ [ENRICH] Atualizando nome de ${phone}: "${lead.name}" -> "${pushName}"`);
+            await supabase.from('leads').update({ name: pushName }).eq('id', lead.id);
+        }
+    } catch (e) {
+        console.error("Erro enrichLeadName:", e);
+    }
+};
+
 // ==============================================================================
 // CORE: START SESSION
 // ==============================================================================
@@ -383,11 +415,18 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
         // LOG DO SUCESSO DO PARSER
         console.log(`⚡ [PROCESS] Msg de: ${remoteJid} | Tipo: ${msgType} | FromMe: ${fromMe} | Content: ${content?.substring(0, 20)}...`);
 
+        // 1. Salva na Agenda (Contacts)
         await upsertContact(remoteJid, sock, pushName, companyId);
 
         let leadId = null;
         if (!remoteJid.includes('@g.us')) {
+            // 2. Garante que o Lead existe
             leadId = await ensureLeadExists(remoteJid, pushName, companyId);
+            
+            // 3. NOVO: Tenta melhorar o nome do Lead se ele ainda estiver como número
+            if (pushName && !fromMe) {
+                await enrichLeadName(remoteJid, pushName, companyId);
+            }
         }
 
         // DOWNLOAD MÍDIA
