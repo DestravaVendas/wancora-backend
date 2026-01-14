@@ -22,7 +22,8 @@ const sessions = new Map();
 const companyIndex = new Map();  
 const retries = new Map(); 
 const reconnectTimers = new Map();      
-const lastQrUpdate = new Map(); 
+const lastQrUpdate = new Map();
+const contactCache = new Set(); // <--- Memória RAM para contatos recentes
 
 // --- HELPER: Upload de Mídia ---
 const uploadMediaToSupabase = async (buffer, type) => {
@@ -95,11 +96,16 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     }
 };
 
-// --- HELPER: Upsert Contato (BLINDADO) ---
+// --- HELPER: Upsert Contato (COM CACHE INTELIGENTE) ---
 const upsertContact = async (jid, sock, pushName = null, companyId = null, savedName = null, imgUrl = null) => {
     try {
         const cleanJid = jid.split(':')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
         
+        // [OTIMIZAÇÃO] Se já salvamos este contato recentemente (5min), ignora o banco
+        if (contactCache.has(cleanJid)) {
+            return; 
+        }
+
         // Dados básicos
         const contactData = { 
             jid: cleanJid, 
@@ -107,23 +113,26 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null, saved
             updated_at: new Date() 
         };
 
-        // Só atualiza campos se eles vierem preenchidos (para não apagar dados existentes)
+        // Só preenche se tiver dados (para não apagar info existente)
         if (savedName) contactData.name = savedName; 
         if (pushName) contactData.push_name = pushName;
         if (imgUrl) contactData.profile_pic_url = imgUrl;
 
-        // Tenta salvar e LOGA se der erro
+        // Vai ao banco
         const { error } = await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
         
-        if (error) {
-            console.error(`❌ [CONTACT ERROR] Falha ao salvar contato ${cleanJid}:`, error.message);
-            // Se der erro de RLS, tenta apenas um SELECT para garantir que existe na memória do banco
-            // Mas o ideal é corrigir o RLS no banco.
+        if (!error) {
+            // SUCESSO: Adiciona ao cache para não incomodar o banco nos próximos minutos
+            contactCache.add(cleanJid);
+            
+            // Remove do cache após 5 minutos (para permitir atualizações futuras de foto/nome)
+            setTimeout(() => contactCache.delete(cleanJid), 5 * 60 * 1000);
         } else {
-            // console.log(`👤 Contato garantido: ${cleanJid}`);
+            // Se der erro, apenas loga, mas não trava o sistema
+            console.error(`⚠️ [CONTACT WARN] Falha ao atualizar contato ${cleanJid}:`, error.message);
         }
     } catch (e) {
-        console.error('❌ Erro crítico upsertContact:', e);
+        console.error('❌ Erro upsertContact:', e);
     }
 };
 
