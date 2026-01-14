@@ -45,31 +45,44 @@ const uploadMediaToSupabase = async (buffer, type) => {
     }
 };
 
-// --- HELPER: Anti-Ghost Inteligente ---
+// --- HELPER: Anti-Ghost Inteligente (Corrigido para Nomes) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     try {
-        if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) return null;
+        // Ignora grupos, status e LIDs
+        if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us') || remoteJid.includes('@lid')) return null;
+        
         const phone = remoteJid.split('@')[0];
 
-        // Verifica ignore
-        const { data: contact } = await supabase.from('contacts').select('is_ignored').eq('jid', remoteJid).maybeSingle();
+        // 1. Verifica se foi ignorado E busca o nome salvo na agenda (se houver)
+        const { data: contact } = await supabase
+            .from('contacts')
+            .select('is_ignored, name') // <--- ADICIONADO: 'name'
+            .eq('jid', remoteJid)
+            .maybeSingle();
+
         if (contact && contact.is_ignored) {
             console.log(`🚫 [Anti-Ghost] Contato ${phone} ignorado (Config do usuário).`);
             return null;
         }
 
+        // 2. Verifica se Lead já existe
         const { data: existingLead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
         if (existingLead) return existingLead.id;
 
         console.log(`🆕 [Anti-Ghost] Criando Lead para ${phone}...`);
 
-        // Pega primeira etapa
+        // 3. Define o Nome Correto (Sua Regra de Hierarquia)
+        // Prioridade: Nome Salvo (Agenda) > Nome do Perfil (WhatsApp) > Número Formatado
+        const finalName = contact?.name || pushName || `+${phone}`; 
+
+        // 4. Pega primeira etapa
         const { data: firstStage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
         const stageId = firstStage?.id || null;
 
+        // 5. Cria o Lead com o nome correto
         const { data: newLead } = await supabase.from('leads').insert({
             company_id: companyId,
-            name: pushName || `Novo Contato (${phone})`,
+            name: finalName, // <--- USA O NOME LIMPO
             phone: phone,
             status: 'new',
             pipeline_stage_id: stageId 
