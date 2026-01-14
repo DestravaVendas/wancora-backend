@@ -53,10 +53,15 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
 
         // Verifica ignore
         const { data: contact } = await supabase.from('contacts').select('is_ignored').eq('jid', remoteJid).maybeSingle();
-        if (contact && contact.is_ignored) return null;
+        if (contact && contact.is_ignored) {
+            console.log(`🚫 [Anti-Ghost] Contato ${phone} ignorado (Config do usuário).`);
+            return null;
+        }
 
         const { data: existingLead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
         if (existingLead) return existingLead.id;
+
+        console.log(`🆕 [Anti-Ghost] Criando Lead para ${phone}...`);
 
         // Pega primeira etapa
         const { data: firstStage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
@@ -146,10 +151,15 @@ export const startSession = async (sessionId, companyId) => {
 
     sock.ev.on("creds.update", saveCreds);
 
-    // --- 1. HISTÓRICO ---
+    // --- 1. HISTÓRICO INTELIGENTE (CHUNKED) ---
+    // Corrige o problema de só pegar 50 msgs e evita travamento do node
     sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
+        console.log(`📚 [HISTÓRICO] Recebido. Contatos: ${contacts.length}, Msgs: ${messages.length}`);
+
+        // A. Salvar Contatos
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
+            // Upsert em batch é seguro para contatos
             const batch = validContacts.map(c => ({
                 jid: c.id,
                 name: c.name || c.verifiedName || null,
@@ -159,10 +169,27 @@ export const startSession = async (sessionId, companyId) => {
             }));
             await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
         }
-        const safeMessages = messages.slice(-50); 
-        for (const msg of safeMessages) {
-            await processMessage(msg, sessionId, companyId, sock, false); 
+
+        // B. Salvar Mensagens em CHUNKS (Lotes)
+        // Isso resolve o problema de memória e de "histórico incompleto"
+        const CHUNK_SIZE = 50; 
+        const totalMessages = messages.length;
+        
+        console.log(`📚 [HISTÓRICO] Processando ${totalMessages} mensagens em lotes de ${CHUNK_SIZE}...`);
+
+        for (let i = 0; i < totalMessages; i += CHUNK_SIZE) {
+            const chunk = messages.slice(i, i + CHUNK_SIZE);
+            
+            // Processa o lote em paralelo para velocidade, mas espera o lote acabar para ir pro próximo
+            await Promise.all(chunk.map(msg => processMessage(msg, sessionId, companyId, sock, false)));
+            
+            // Pequeno delay para não sufocar o Event Loop do Node ou o Banco
+            await delay(100); 
+            
+            if (i % 500 === 0 && i > 0) console.log(`📚 [HISTÓRICO] Progresso: ${i}/${totalMessages}`);
         }
+        
+        console.log(`✅ [HISTÓRICO] Sincronização concluída.`);
     });
 
     // --- 2. CONTATOS ---
@@ -191,6 +218,8 @@ export const startSession = async (sessionId, companyId) => {
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect, qr } = update;
         if (!sessions.has(sessionId)) return; 
+
+        if (connection) console.log(`🔌 [CONN] Sessão ${sessionId}: ${connection}`);
 
         if (qr) {
             const now = Date.now();
@@ -237,9 +266,12 @@ export const startSession = async (sessionId, companyId) => {
         }
     });
 
-    // --- 5. RECEBIMENTO ---
+    // --- 5. RECEBIMENTO (REALTIME DEBUG) ---
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (!sessions.has(sessionId)) return;
+        
+        console.log(`📨 [REALTIME] Upsert recebido. Tipo: ${type}. Qtd: ${messages.length}`);
+
         if (type === "notify" || type === "append") {
             for (const msg of messages) {
                 await processMessage(msg, sessionId, companyId, sock, true);
@@ -250,24 +282,39 @@ export const startSession = async (sessionId, companyId) => {
     return sock;
 };
 
-// --- PROCESSAMENTO ---
+// --- PROCESSAMENTO DETALHADO (DEBUGGER FOFQUEIRO) ---
 const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMedia = false) => {
     try {
         if (!msg.message) return;
-        if (msg.key.remoteJid === 'status@broadcast') return;
-        if (msg.key.remoteJid.includes('@lid')) return; 
-        if (msg.key.remoteJid.includes('@broadcast')) return;
-
+        
         const remoteJid = msg.key.remoteJid;
         const fromMe = msg.key.fromMe;
         const whatsappId = msg.key.id; 
         const pushName = msg.pushName;
-        
+
+        // --- FILTROS DE SEGURANÇA (LOGADOS) ---
+        if (remoteJid === 'status@broadcast') {
+            // console.log('[DEBUG] Ignorando status update'); 
+            return; 
+        }
+        if (remoteJid.includes('@lid')) { 
+            console.log(`[DEBUG] Ignorando mensagem de LID: ${remoteJid}`); 
+            return; 
+        } 
+        if (remoteJid.includes('@broadcast')) return;
+
         let content = getMessageContent(msg.message);
         let msgType = getMessageType(msg.message);
         let mediaUrl = null;
 
-        if (!content && msgType === 'text') return;
+        // Ignora mensagens vazias e sem mídia
+        if (!content && msgType === 'text') {
+            console.log(`[DEBUG] Mensagem vazia de ${remoteJid}. Ignorando.`);
+            return;
+        }
+
+        // LOG DO SUCESSO DO PARSER
+        console.log(`⚡ [PROCESS] Msg de: ${remoteJid} | Tipo: ${msgType} | FromMe: ${fromMe} | Content: ${content?.substring(0, 20)}...`);
 
         await upsertContact(remoteJid, sock, pushName, companyId);
 
@@ -279,6 +326,7 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
         // DOWNLOAD MÍDIA
         if (shouldDownloadMedia && ['image', 'video', 'audio', 'document'].includes(msgType)) {
             try {
+                console.log(`📥 [MEDIA] Baixando mídia...`);
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                 
                 let mimetype = 'application/octet-stream';
@@ -288,12 +336,13 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
                 else if (msg.message.documentMessage) mimetype = msg.message.documentMessage.mimetype;
 
                 mediaUrl = await uploadMediaToSupabase(buffer, mimetype);
+                console.log(`📤 [MEDIA] Upload OK: ${mediaUrl}`);
             } catch (mediaErr) {
-                console.error('[MEDIA] Falha no download:', mediaErr.message);
+                console.error('❌ [MEDIA] Falha no download:', mediaErr.message);
             }
         }
 
-        // Se for POLL (Enquete), formata o content como JSON
+        // Parse POLL
         if (msgType === 'poll') {
             try {
                 const pollData = msg.message.pollCreationMessage || msg.message.pollCreationMessageV3;
@@ -307,7 +356,8 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
             } catch(e) { content = 'Enquete'; }
         }
 
-        await supabase.from('messages').upsert({
+        // --- SALVAMENTO NO BANCO ---
+        const { error } = await supabase.from('messages').upsert({
             company_id: companyId,
             session_id: sessionId,
             remote_jid: remoteJid,
@@ -323,8 +373,14 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
             onConflict: 'remote_jid, whatsapp_id'
         });
 
+        if (error) {
+            console.error(`❌ [DB ERROR] Falha ao salvar msg ${whatsappId}:`, error.message);
+        } else {
+            // console.log(`✅ [DB OK] Msg salva.`); // Descomente se quiser muito flood
+        }
+
     } catch (e) {
-        console.error("Erro processamento msg:", e);
+        console.error("❌ [CRASH] Erro processamento msg:", e);
     }
 };
 
@@ -341,7 +397,6 @@ export const sendMessage = async (sessionId, to, payload) => {
 
         switch (payload.type) {
             case 'text':
-                // Tratamento especial para Pix (envia como texto formatado)
                 if (payload.text && payload.text.startsWith('Chave Pix:')) {
                     sentMsg = await sock.sendMessage(jid, { text: payload.text });
                 } else {
@@ -365,10 +420,10 @@ export const sendMessage = async (sessionId, to, payload) => {
 
             case 'audio':
                 // Suporte CRÍTICO a PTT vs Arquivo de Áudio
-                const isPtt = payload.ptt === true; // Frontend deve enviar bool
+                const isPtt = payload.ptt === true; 
                 sentMsg = await sock.sendMessage(jid, { 
                     audio: { url: payload.url }, 
-                    mimetype: 'audio/mp4', // WhatsApp exige isso para áudios
+                    mimetype: 'audio/mp4', // WhatsApp exige isso
                     ptt: isPtt 
                 });
                 break;
@@ -382,21 +437,19 @@ export const sendMessage = async (sessionId, to, payload) => {
                 break;
 
             case 'poll':
-                // Payload esperado: { poll: { name: 'Pergunta', options: ['A', 'B'], selectableOptionsCount: 1 } }
                 if (!payload.poll || !payload.poll.options || payload.poll.options.length < 2) {
                     throw new Error("Invalid poll values: Mínimo 2 opções requeridas.");
                 }
                 sentMsg = await sock.sendMessage(jid, {
                     poll: {
                         name: payload.poll.name,
-                        values: payload.poll.options, // Baileys usa 'values', Frontend envia 'options'
+                        values: payload.poll.options, 
                         selectableCount: payload.poll.selectableOptionsCount || 1
                     }
                 });
                 break;
 
             case 'location':
-                // Payload esperado: { location: { latitude: 123, longitude: 123 } }
                 sentMsg = await sock.sendMessage(jid, {
                     location: {
                         degreesLatitude: payload.location.latitude,
@@ -406,7 +459,6 @@ export const sendMessage = async (sessionId, to, payload) => {
                 break;
 
             case 'contact':
-                // Payload esperado: { contact: { displayName: 'Nome', vcard: 'BEGIN:VCARD...' } }
                 sentMsg = await sock.sendMessage(jid, {
                     contacts: {
                         displayName: payload.contact.displayName,
@@ -416,7 +468,6 @@ export const sendMessage = async (sessionId, to, payload) => {
                 break;
 
             default:
-                // Fallback para texto
                 sentMsg = await sock.sendMessage(jid, { text: payload.text || payload.content || "" });
         }
 
