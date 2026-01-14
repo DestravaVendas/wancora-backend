@@ -82,16 +82,36 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     }
 };
 
-// --- HELPER: Upsert Contato ---
+// --- HELPER: Upsert Contato (BLINDADO) ---
 const upsertContact = async (jid, sock, pushName = null, companyId = null, savedName = null, imgUrl = null) => {
     try {
         const cleanJid = jid.split(':')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
-        const contactData = { jid: cleanJid, company_id: companyId, updated_at: new Date() };
+        
+        // Dados básicos
+        const contactData = { 
+            jid: cleanJid, 
+            company_id: companyId, 
+            updated_at: new Date() 
+        };
+
+        // Só atualiza campos se eles vierem preenchidos (para não apagar dados existentes)
         if (savedName) contactData.name = savedName; 
         if (pushName) contactData.push_name = pushName;
         if (imgUrl) contactData.profile_pic_url = imgUrl;
-        await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
-    } catch (e) {}
+
+        // Tenta salvar e LOGA se der erro
+        const { error } = await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
+        
+        if (error) {
+            console.error(`❌ [CONTACT ERROR] Falha ao salvar contato ${cleanJid}:`, error.message);
+            // Se der erro de RLS, tenta apenas um SELECT para garantir que existe na memória do banco
+            // Mas o ideal é corrigir o RLS no banco.
+        } else {
+            // console.log(`👤 Contato garantido: ${cleanJid}`);
+        }
+    } catch (e) {
+        console.error('❌ Erro crítico upsertContact:', e);
+    }
 };
 
 // Helpers de Conteúdo
