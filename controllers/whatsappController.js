@@ -4,7 +4,8 @@ import makeWASocket, {
     fetchLatestBaileysVersion, 
     makeCacheableSignalKeyStore, 
     delay,
-    downloadMediaMessage 
+    downloadMediaMessage,
+    getContentType
 } from "@whiskeysockets/baileys";
 import { useSupabaseAuthState } from "../auth/supabaseAuth.js";
 import { createClient } from "@supabase/supabase-js";
@@ -18,14 +19,39 @@ if (!process.env.SUPABASE_KEY || !process.env.SUPABASE_URL) {
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const sessions = new Map();      
-const companyIndex = new Map();  
+// GESTÃO DE ESTADO EM MEMÓRIA (RAM)
+const sessions = new Map();       
+const companyIndex = new Map();   
 const retries = new Map(); 
-const reconnectTimers = new Map();      
+const reconnectTimers = new Map();       
 const lastQrUpdate = new Map();
-const contactCache = new Set(); // <--- Memória RAM para contatos recentes
+const contactCache = new Set(); // Cache para evitar SPAM de upsert de contatos
+const leadCreationLock = new Set(); // Mutex para evitar duplicidade de Leads em rajadas
 
-// --- HELPER: Upload de Mídia ---
+// --- HELPER: Unwrap Message (Desenrola mensagens temporárias/visualização única) ---
+// CRÍTICO: Sem isso, mensagens temporárias aparecem como vazias ou indefinidas.
+const unwrapMessage = (msg) => {
+    if (!msg.message) return msg;
+    
+    let content = msg.message;
+    
+    // Desenrola Ephemeral (Mensagens temporárias)
+    if (content.ephemeralMessage) {
+        content = content.ephemeralMessage.message;
+    }
+    // Desenrola ViewOnce (Visualização única)
+    if (content.viewOnceMessage) {
+        content = content.viewOnceMessage.message;
+    }
+    // Desenrola ViewOnceV2
+    if (content.viewOnceMessageV2) {
+        content = content.viewOnceMessageV2.message;
+    }
+
+    return { ...msg, message: content };
+};
+
+// --- HELPER: Upload de Mídia com Retry ---
 const uploadMediaToSupabase = async (buffer, type) => {
     try {
         const fileExt = mime.extension(type) || 'bin';
@@ -46,72 +72,89 @@ const uploadMediaToSupabase = async (buffer, type) => {
     }
 };
 
-// --- HELPER: Anti-Ghost Inteligente (Corrigido para Nomes) ---
+// --- HELPER: Anti-Ghost Inteligente (Com Mutex de Criação) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
-    try {
-        // Ignora grupos, status e LIDs
-        if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us') || remoteJid.includes('@lid')) return null;
-        
-        const phone = remoteJid.split('@')[0];
+    // 1. Ignora infraestrutura do WhatsApp
+    if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us') || remoteJid.includes('@lid')) return null;
+    
+    const phone = remoteJid.split('@')[0];
+    const lockKey = `${companyId}:${phone}`;
 
-        // 1. Verifica se foi ignorado E busca o nome salvo na agenda (se houver)
+    // 2. Verifica se já estamos criando este lead AGORA (Mutex)
+    if (leadCreationLock.has(lockKey)) {
+        // Se já está criando, espera um pouco e retorna o ID (o outro processo vai terminar)
+        await delay(1000); 
+        const { data: lead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
+        return lead?.id || null;
+    }
+
+    try {
+        leadCreationLock.add(lockKey); // 🔒 TRAVA
+
+        // 3. Verifica Ignore List (Anti-Ghost) e Nome Salvo
         const { data: contact } = await supabase
             .from('contacts')
-            .select('is_ignored, name') // <--- ADICIONADO: 'name'
+            .select('is_ignored, name')
             .eq('jid', remoteJid)
+            .eq('company_id', companyId) // Importante filtrar por empresa
             .maybeSingle();
 
         if (contact && contact.is_ignored) {
-            console.log(`🚫 [Anti-Ghost] Contato ${phone} ignorado (Config do usuário).`);
+            console.log(`🚫 [Anti-Ghost] Contato ${phone} ignorado.`);
             return null;
         }
 
-        // 2. Verifica se Lead já existe
+        // 4. Verifica existência (Double Check)
         const { data: existingLead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
         if (existingLead) return existingLead.id;
 
         console.log(`🆕 [Anti-Ghost] Criando Lead para ${phone}...`);
 
-        // 3. Define o Nome Correto (Sua Regra de Hierarquia)
-        // Prioridade: Nome Salvo (Agenda) > Nome do Perfil (WhatsApp) > Número Formatado
+        // 5. Definição de Nome (Agenda > PushName > Número)
         const finalName = contact?.name || pushName || `+${phone}`; 
 
-        // 4. Pega primeira etapa
-        const { data: firstStage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
+        // 6. Pipeline Padrão
+        const { data: firstStage } = await supabase.from('pipeline_stages')
+            .select('id')
+            .eq('company_id', companyId)
+            .order('position', { ascending: true })
+            .limit(1)
+            .maybeSingle();
+        
         const stageId = firstStage?.id || null;
 
-        // 5. Cria o Lead com o nome correto
+        // 7. Inserção Atômica
         const { data: newLead } = await supabase.from('leads').insert({
             company_id: companyId,
-            name: finalName, // <--- USA O NOME LIMPO
+            name: finalName,
             phone: phone,
             status: 'new',
             pipeline_stage_id: stageId 
         }).select('id').single();
 
         return newLead?.id || null;
+
     } catch (e) {
         console.error("Erro ensureLeadExists:", e);
         return null;
+    } finally {
+        leadCreationLock.delete(lockKey); // 🔓 DESTRAVA
     }
 };
 
-// --- HELPER: Upsert Contato (CACHE V3 - SUPORTE A LID) ---
+// --- HELPER: Upsert Contato (Otimizado) ---
 const upsertContact = async (jid, sock, pushName = null, companyId = null, savedName = null, imgUrl = null) => {
     try {
-        // [CORREÇÃO CRÍTICA] Respeita se for @lid, @g.us ou @s.whatsapp.net
         let suffix = '@s.whatsapp.net';
         if (jid.includes('@g.us')) suffix = '@g.us';
-        if (jid.includes('@lid')) suffix = '@lid'; // <--- ISSO AQUI EVITA O ERRO DB ERROR
+        if (jid.includes('@lid')) suffix = '@lid';
 
         const cleanJid = jid.split(':')[0] + suffix;
+        const cacheKey = `${companyId}:${cleanJid}`;
         
-        // [LÓGICA DO PORTEIRO]
-        // Se já temos no cache E não veio informação nova (nome/foto), ignora o banco
+        // Cache Check: Se já processamos recentemente E não há dados novos vitais, pula
         const hasNewInfo = pushName || savedName || imgUrl;
-        if (contactCache.has(cleanJid) && !hasNewInfo) {
-            return; 
-        }
+        if (contactCache.has(cacheKey) && !hasNewInfo) return; 
 
         const contactData = { jid: cleanJid, company_id: companyId, updated_at: new Date() };
         if (savedName) contactData.name = savedName; 
@@ -121,43 +164,47 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null, saved
         const { error } = await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
         
         if (!error) {
-            contactCache.add(cleanJid);
-            // Remove do cache após 5 minutos para permitir atualizações futuras
-            setTimeout(() => contactCache.delete(cleanJid), 5 * 60 * 1000);
+            contactCache.add(cacheKey);
+            // Expira cache em 10 minutos
+            setTimeout(() => contactCache.delete(cacheKey), 10 * 60 * 1000);
         }
     } catch (e) {
-        console.error('❌ Erro upsertContact:', e);
+        // Silencioso para não poluir logs, upsert falha é tolerável
     }
 };
 
-// Helpers de Conteúdo
+// --- HELPER: Extração de Conteúdo Robusta ---
 const getMessageContent = (msg) => {
     if (!msg) return "";
+    // Ordem de prioridade importa
     if (msg.conversation) return msg.conversation;
     if (msg.extendedTextMessage?.text) return msg.extendedTextMessage.text;
     if (msg.imageMessage?.caption) return msg.imageMessage.caption;
     if (msg.videoMessage?.caption) return msg.videoMessage.caption;
+    if (msg.templateButtonReplyMessage?.selectedId) return msg.templateButtonReplyMessage.selectedId;
+    if (msg.buttonsResponseMessage?.selectedButtonId) return msg.buttonsResponseMessage.selectedButtonId;
+    if (msg.listResponseMessage?.singleSelectReply?.selectedRowId) return msg.listResponseMessage.singleSelectReply.selectedRowId;
     return "";
 };
 
 const getMessageType = (msg) => {
     if (msg.imageMessage) return 'image';
-    if (msg.audioMessage) return 'audio';
+    if (msg.audioMessage) return 'audio'; // PTT é tratado como audio aqui, flag ptt salva no envio
     if (msg.videoMessage) return 'video';
     if (msg.documentMessage) return 'document';
+    if (msg.stickerMessage) return 'sticker';
     if (msg.pollCreationMessage || msg.pollCreationMessageV3) return 'poll';
     if (msg.locationMessage) return 'location';
     if (msg.contactMessage) return 'contact';
     return 'text';
 };
 
-// --- HELPER: Enriquecimento de Nome (Atualiza nome se for apenas número) ---
+// --- HELPER: Enriquecimento de Nome ---
 const enrichLeadName = async (remoteJid, pushName, companyId) => {
     try {
-        if (!pushName) return; // Se não veio nome novo, não faz nada
+        if (!pushName) return; 
         const phone = remoteJid.split('@')[0];
 
-        // 1. Busca o Lead atual
         const { data: lead } = await supabase
             .from('leads')
             .select('id, name')
@@ -167,29 +214,22 @@ const enrichLeadName = async (remoteJid, pushName, companyId) => {
 
         if (!lead) return;
 
-        // 2. A Lógica da Prioridade:
-        // Se o nome atual contém o número de telefone (significa que é um nome genérico/padrão)
-        // E o novo pushName é diferente...
-        // ENTÃO atualizamos.
-        // Se o nome for "Antonio Produto 2", essa verificação falha e mantém o seu nome.
-        const isGenericName = lead.name.includes(phone) || lead.name === `+${phone}` || lead.name === phone;
+        // Se o nome atual parece um número de telefone, atualizamos com o PushName
+        const isGenericName = lead.name.includes(phone) || lead.name === `+${phone}`;
         
         if (isGenericName && pushName !== lead.name) {
-            console.log(`✨ [ENRICH] Atualizando nome de ${phone}: "${lead.name}" -> "${pushName}"`);
+            console.log(`✨ [ENRICH] Nome atualizado: "${lead.name}" -> "${pushName}"`);
             await supabase.from('leads').update({ name: pushName }).eq('id', lead.id);
         }
-    } catch (e) {
-        console.error("Erro enrichLeadName:", e);
-    }
+    } catch (e) {}
 };
 
 // ==============================================================================
-// CORE: START SESSION (ANTI-BOOTLOOP & CORREÇÃO 440)
+// CORE: START SESSION
 // ==============================================================================
 export const startSession = async (sessionId, companyId) => {
     console.log(`[START] Sessão ${sessionId} (Empresa: ${companyId})`);
     
-    // Se já existe sessão na memória, limpamos apenas a memória (false), não o banco
     if (sessions.has(sessionId)) {
         await deleteSession(sessionId, companyId, false);
     }
@@ -205,14 +245,18 @@ export const startSession = async (sessionId, companyId) => {
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
         },
         printQRInTerminal: false,
-        logger: pino({ level: "silent" }),
-        browser: ["Ubuntu", "Chrome", "20.0.04"],
-        // [CORREÇÃO 1] Desligar syncFullHistory para evitar Timeout na conexão
-        syncFullHistory: false, 
+        logger: pino({ level: "silent" }), // Mantém limpo, aumente level se quiser debug profundo
+        // FINGERPRINT OTIMIZADO PARA SERVIDOR (Evita banimento e loops)
+        browser: ["Wancora CRM", "Ubuntu", "24.04"], 
+        syncFullHistory: true, 
         markOnlineOnConnect: true,
         connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 10000,
+        keepAliveIntervalMs: 30000,
         generateHighQualityLinkPreview: true,
+        getMessage: async (key) => {
+            // Suporte essencial para reenvio de mensagens e citação
+            return { conversation: 'hello' }; 
+        }
     });
 
     sock.companyId = companyId;
@@ -221,21 +265,55 @@ export const startSession = async (sessionId, companyId) => {
 
     sock.ev.on("creds.update", saveCreds);
 
-    // --- 1. HISTÓRICO INTELIGENTE ---
+    // --- 1. HISTÓRICO INTELIGENTE (SMART SYNC) ---
     sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
-        // ... (Mantenha seu código de Smart Sync aqui) ...
-        // Vou resumir para caber na resposta, mas use o código COMPLETO que você já tem
+        console.log(`📚 [HISTÓRICO] Recebido. Contatos: ${contacts.length}, Msgs Brutas: ${messages.length}`);
+
+        // A. Salvar Contatos
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
             const batch = validContacts.map(c => ({
-                jid: c.id, name: c.name || c.verifiedName || null, push_name: c.notify || null,
-                company_id: companyId, updated_at: new Date()
+                jid: c.id,
+                name: c.name || c.verifiedName || null,
+                push_name: c.notify || null,
+                company_id: companyId,
+                updated_at: new Date()
             }));
             await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
         }
+
+        // B. Filtragem e Processamento
+        const messagesByChat = new Map();
+        messages.forEach(msg => {
+            // Unwrapping aqui é importante para o histórico também
+            const unwrapped = unwrapMessage(msg);
+            const jid = unwrapped.key.remoteJid;
+            if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
+            messagesByChat.get(jid).push(unwrapped);
+        });
+
+        const smartMessages = [];
+        const MSG_LIMIT_PER_CHAT = 15; // Aumentado ligeiramente para melhor contexto
+
+        messagesByChat.forEach((chatMsgs, jid) => {
+            // Ordena cronologicamente
+            chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+            // Pega as últimas X
+            const topMessages = chatMsgs.slice(-MSG_LIMIT_PER_CHAT);
+            smartMessages.push(...topMessages);
+        });
+
+        console.log(`🧠 [SMART SYNC] Processando ${smartMessages.length} mensagens recentes.`);
+
+        // C. Chunk Processing
+        const CHUNK_SIZE = 50; 
+        for (let i = 0; i < smartMessages.length; i += CHUNK_SIZE) {
+            const chunk = smartMessages.slice(i, i + CHUNK_SIZE);
+            await Promise.all(chunk.map(msg => processMessage(msg, sessionId, companyId, sock, false)));
+            await delay(50); // Delay mínimo para aliviar I/O do banco
+        }
         
-        // ... Logica do Smart Sync (Chunk, limit 7, upsert messages) ...
-        console.log(`✅ [HISTÓRICO] Sincronização processada (Background).`);
+        console.log(`✅ [HISTÓRICO] Sync Completo.`);
     });
 
     // --- 2. CONTATOS ---
@@ -243,8 +321,11 @@ export const startSession = async (sessionId, companyId) => {
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
             const batch = validContacts.map(c => ({
-                jid: c.id, name: c.name || c.verifiedName || null, push_name: c.notify || null,
-                company_id: companyId, updated_at: new Date()
+                jid: c.id,
+                name: c.name || c.verifiedName || null,
+                push_name: c.notify || null,
+                company_id: companyId,
+                updated_at: new Date()
             }));
             await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
         }
@@ -257,16 +338,18 @@ export const startSession = async (sessionId, companyId) => {
         }
     });
 
-    // --- 4. CONEXÃO (CORRIGIDA PARA ERRO 440) ---
+    // --- 4. CONEXÃO ---
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
-        if (connection) console.log(`🔌 [CONN] Sessão ${sessionId}: ${connection}`);
+        if (!sessions.has(sessionId)) return; 
+
+        if (connection) console.log(`🔌 [CONN] ${sessionId}: ${connection}`);
 
         if (qr) {
             const now = Date.now();
             const lastTime = lastQrUpdate.get(sessionId) || 0;
-            if (now - lastTime > 2000) {
+            // Throttle de atualização do QR Code (800ms)
+            if (now - lastTime > 800) {
                 lastQrUpdate.set(sessionId, now);
                 await supabase.from("instances").update({ qrcode_url: qr, status: "qrcode", updated_at: new Date() }).eq('session_id', sessionId);
             }
@@ -277,57 +360,55 @@ export const startSession = async (sessionId, companyId) => {
             if (reconnectTimers.has(sessionId)) { clearTimeout(reconnectTimers.get(sessionId)); reconnectTimers.delete(sessionId); }
 
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            console.log(`❌ [CLOSE] Código: ${statusCode} | Erro: ${lastDisconnect?.error?.message}`);
-
-            // [CORREÇÃO CRÍTICA]
-            // Se for 401 (Logout), 403 (Ban) OU 440 (Substituído/Inválido) -> DELETE TUDO
-            const isFatalError = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403 || statusCode === 440;
-
-            if (isFatalError) {
-                 console.log(`🚫 [FATAL] Sessão inválida (${statusCode}). Limpando banco para novo QR Code.`);
-                 // O 'true' aqui apaga as credenciais do banco, forçando novo QR
+            if (statusCode === 401 || statusCode === 403) {
                  await deleteSession(sessionId, companyId, true);
-            } else {
-                // Outros erros (515, Timeout) -> Tenta reconectar sem apagar banco
-                console.log(`🔄 [RETRY] Tentando reconectar em breve...`);
+                 return;
+            }
+
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect && sessions.has(sessionId)) {
                 await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
                 
+                // Exponential Backoff limitado
                 const attempt = (retries.get(sessionId) || 0) + 1;
                 retries.set(sessionId, attempt);
-                const delayMs = Math.min(attempt * 2000, 10000);
+                const delayMs = Math.min(attempt * 2000, 15000); // Max 15s
                 
                 const timeoutId = setTimeout(() => { 
-                    // Importante checar se a sessão não foi deletada nesse meio tempo
-                    startSession(sessionId, companyId); 
+                    if (sessions.has(sessionId)) startSession(sessionId, companyId); 
                 }, delayMs);
-                
                 reconnectTimers.set(sessionId, timeoutId);
+            } else {
+                await deleteSession(sessionId, companyId, false);
             }
         }
 
         if (connection === "open") {
-            console.log(`✅ [OPEN] Conexão estável.`);
             retries.set(sessionId, 0);
             await supabase.from("instances").update({ status: "connected", qrcode_url: null, updated_at: new Date() }).eq("session_id", sessionId);
-            
+            // Pequeno delay para buscar a foto do perfil da própria instância
             setTimeout(async () => {
-                 const userJid = sock.user?.id ? sock.user.id.split(':')[0] + '@s.whatsapp.net' : null;
-                 if (userJid) {
-                     try { 
-                         const myPic = await sock.profilePictureUrl(userJid, 'image'); 
-                         if(myPic) await supabase.from("instances").update({ profile_pic_url: myPic }).eq("session_id", sessionId);
-                     } catch(e){}
-                 }
+                 const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+                 try { 
+                     const myPic = await sock.profilePictureUrl(userJid, 'image'); 
+                     if(myPic) await supabase.from("instances").update({ profile_pic_url: myPic }).eq("session_id", sessionId);
+                 } catch(e){}
             }, 3000);
         }
     });
 
-    // --- 5. RECEBIMENTO (MANTIDO) ---
+    // --- 5. RECEBIMENTO (REALTIME) ---
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (!sessions.has(sessionId)) return;
+        
+        console.log(`📨 [REALTIME] Upsert ${type}. Qtd: ${messages.length}`);
+
+        // Processa apenas mensagens novas ou appends relevantes
         if (type === "notify" || type === "append") {
             for (const msg of messages) {
-                await processMessage(msg, sessionId, companyId, sock, true);
+                // Desenrola mensagens temporárias ANTES de processar
+                const cleanMsg = unwrapMessage(msg);
+                await processMessage(cleanMsg, sessionId, companyId, sock, true);
             }
         }
     });
@@ -335,7 +416,7 @@ export const startSession = async (sessionId, companyId) => {
     return sock;
 };
 
-// --- PROCESSAMENTO DETALHADO (DEBUGGER FOFQUEIRO) ---
+// --- PROCESSAMENTO PRINCIPAL ---
 const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMedia = false) => {
     try {
         if (!msg.message) return;
@@ -345,61 +426,69 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
         const whatsappId = msg.key.id; 
         const pushName = msg.pushName;
 
-        // --- FILTROS DE SEGURANÇA (LOGADOS) ---
-        if (remoteJid === 'status@broadcast') {
-            // console.log('[DEBUG] Ignorando status update'); 
-            return; 
-        }
-        
+        // Filtros de Ignorados
+        if (remoteJid === 'status@broadcast') return; 
         if (remoteJid.includes('@broadcast')) return;
 
         let content = getMessageContent(msg.message);
         let msgType = getMessageType(msg.message);
         let mediaUrl = null;
 
-        // Ignora mensagens vazias e sem mídia
+        // Ignora mensagens de protocolo vazias
         if (!content && msgType === 'text') {
-            console.log(`[DEBUG] Mensagem vazia de ${remoteJid}. Ignorando.`);
-            return;
+            // Check adicional para Sticker que às vezes não tem caption
+            if (!msg.message.stickerMessage) return;
         }
 
-        // LOG DO SUCESSO DO PARSER
-        console.log(`⚡ [PROCESS] Msg de: ${remoteJid} | Tipo: ${msgType} | FromMe: ${fromMe} | Content: ${content?.substring(0, 20)}...`);
+        console.log(`⚡ [MSG] ${remoteJid} | Tipo: ${msgType} | FromMe: ${fromMe}`);
 
-        // 1. Salva na Agenda (Contacts)
+        // 1. Atualiza Contato
         await upsertContact(remoteJid, sock, pushName, companyId);
 
         let leadId = null;
         if (!remoteJid.includes('@g.us')) {
-            // 2. Garante que o Lead existe
+            // 2. Garante Lead (com Mutex)
             leadId = await ensureLeadExists(remoteJid, pushName, companyId);
             
-            // 3. NOVO: Tenta melhorar o nome do Lead se ele ainda estiver como número
+            // 3. Enriquece Nome
             if (pushName && !fromMe) {
                 await enrichLeadName(remoteJid, pushName, companyId);
             }
         }
 
-        // DOWNLOAD MÍDIA
-        if (shouldDownloadMedia && ['image', 'video', 'audio', 'document'].includes(msgType)) {
+        // 4. Download de Mídia Seguro
+        const supportedTypes = ['image', 'video', 'audio', 'document', 'sticker'];
+        if (shouldDownloadMedia && supportedTypes.includes(msgType)) {
             try {
-                console.log(`📥 [MEDIA] Baixando mídia...`);
-                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                // Verificação de segurança de tamanho (evita crash com arquivos > 50MB)
+                // Nota: Baileys nem sempre expõe fileLength confiável no topo, mas tentamos
+                const specificMsg = msg.message[msgType + 'Message'] || msg.message;
+                const fileSize = specificMsg?.fileLength;
                 
-                let mimetype = 'application/octet-stream';
-                if (msg.message.imageMessage) mimetype = 'image/jpeg';
-                else if (msg.message.audioMessage) mimetype = 'audio/mp4'; 
-                else if (msg.message.videoMessage) mimetype = 'video/mp4';
-                else if (msg.message.documentMessage) mimetype = msg.message.documentMessage.mimetype;
+                if (fileSize && Number(fileSize) > 50 * 1024 * 1024) {
+                    console.warn(`⚠️ Mídia muito grande (${fileSize} bytes). Ignorando download.`);
+                    content = `[Arquivo Grande > 50MB]`;
+                } else {
+                    console.log(`📥 [MEDIA] Baixando ${msgType}...`);
+                    const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                    
+                    let mimetype = 'application/octet-stream';
+                    if (msg.message.imageMessage) mimetype = 'image/jpeg';
+                    else if (msg.message.audioMessage) mimetype = 'audio/mp4'; 
+                    else if (msg.message.videoMessage) mimetype = 'video/mp4';
+                    else if (msg.message.documentMessage) mimetype = msg.message.documentMessage.mimetype;
+                    else if (msg.message.stickerMessage) mimetype = 'image/webp';
 
-                mediaUrl = await uploadMediaToSupabase(buffer, mimetype);
-                console.log(`📤 [MEDIA] Upload OK: ${mediaUrl}`);
+                    mediaUrl = await uploadMediaToSupabase(buffer, mimetype);
+                    console.log(`📤 [MEDIA] URL: ${mediaUrl}`);
+                }
             } catch (mediaErr) {
-                console.error('❌ [MEDIA] Falha no download:', mediaErr.message);
+                console.error('❌ [MEDIA] Erro download:', mediaErr.message);
+                content = `[Erro no Download da Mídia]`;
             }
         }
 
-        // Parse POLL
+        // 5. Parseamento de Enquete
         if (msgType === 'poll') {
             try {
                 const pollData = msg.message.pollCreationMessage || msg.message.pollCreationMessageV3;
@@ -413,14 +502,14 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
             } catch(e) { content = 'Enquete'; }
         }
 
-        // --- SALVAMENTO NO BANCO ---
+        // 6. Persistência
         const { error } = await supabase.from('messages').upsert({
             company_id: companyId,
             session_id: sessionId,
             remote_jid: remoteJid,
             whatsapp_id: whatsappId,
             from_me: fromMe,
-            content: content || '[Mídia]',
+            content: content || (mediaUrl ? '[Mídia]' : ''),
             message_type: msgType,
             media_url: mediaUrl, 
             status: fromMe ? 'sent' : 'received',
@@ -430,18 +519,14 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
             onConflict: 'remote_jid, whatsapp_id'
         });
 
-        if (error) {
-            console.error(`❌ [DB ERROR] Falha ao salvar msg ${whatsappId}:`, error.message);
-        } else {
-            // console.log(`✅ [DB OK] Msg salva.`); // Descomente se quiser muito flood
-        }
+        if (error) console.error(`❌ [DB] Falha msg ${whatsappId}:`, error.message);
 
     } catch (e) {
-        console.error("❌ [CRASH] Erro processamento msg:", e);
+        console.error("❌ [CRASH] Erro fatal processamento:", e);
     }
 };
 
-// --- ENVIO (ATUALIZADO) ---
+// --- ENVIO DE MENSAGENS ---
 export const sendMessage = async (sessionId, to, payload) => {
     const sock = sessions.get(sessionId);
     if (!sock) throw new Error("Sessão não ativa");
@@ -450,7 +535,7 @@ export const sendMessage = async (sessionId, to, payload) => {
     let sentMsg;
 
     try {
-        console.log(`[SEND] Enviando para ${jid}. Tipo: ${payload.type}`);
+        console.log(`[SEND] Para: ${jid} | Tipo: ${payload.type}`);
 
         switch (payload.type) {
             case 'text':
@@ -476,11 +561,10 @@ export const sendMessage = async (sessionId, to, payload) => {
                 break;
 
             case 'audio':
-                // Suporte CRÍTICO a PTT vs Arquivo de Áudio
                 const isPtt = payload.ptt === true; 
                 sentMsg = await sock.sendMessage(jid, { 
                     audio: { url: payload.url }, 
-                    mimetype: 'audio/mp4', // WhatsApp exige isso
+                    mimetype: 'audio/mp4', // WhatsApp requer mp4 para áudio
                     ptt: isPtt 
                 });
                 break;
@@ -495,7 +579,7 @@ export const sendMessage = async (sessionId, to, payload) => {
 
             case 'poll':
                 if (!payload.poll || !payload.poll.options || payload.poll.options.length < 2) {
-                    throw new Error("Invalid poll values: Mínimo 2 opções requeridas.");
+                    throw new Error("Enquete precisa de pelo menos 2 opções.");
                 }
                 sentMsg = await sock.sendMessage(jid, {
                     poll: {
