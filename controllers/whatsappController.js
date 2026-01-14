@@ -96,40 +96,30 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     }
 };
 
-// --- HELPER: Upsert Contato (COM CACHE INTELIGENTE) ---
+// --- HELPER: Upsert Contato (CACHE INTELIGENTE V2) ---
 const upsertContact = async (jid, sock, pushName = null, companyId = null, savedName = null, imgUrl = null) => {
     try {
         const cleanJid = jid.split(':')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
         
-        // [OTIMIZAÇÃO] Se já salvamos este contato recentemente (5min), ignora o banco
-        if (contactCache.has(cleanJid)) {
+        // [LÓGICA DO PORTEIRO MELHORADA]
+        // Só ignora (usa cache) SE já estiver em cache E se NÃO estivermos tentando salvar um nome novo.
+        // Se vier um pushName ou savedName, a gente força a ida ao banco para atualizar/enriquecer.
+        const hasNewInfo = pushName || savedName || imgUrl;
+        if (contactCache.has(cleanJid) && !hasNewInfo) {
             return; 
         }
 
-        // Dados básicos
-        const contactData = { 
-            jid: cleanJid, 
-            company_id: companyId, 
-            updated_at: new Date() 
-        };
-
-        // Só preenche se tiver dados (para não apagar info existente)
+        const contactData = { jid: cleanJid, company_id: companyId, updated_at: new Date() };
         if (savedName) contactData.name = savedName; 
         if (pushName) contactData.push_name = pushName;
         if (imgUrl) contactData.profile_pic_url = imgUrl;
 
-        // Vai ao banco
         const { error } = await supabase.from('contacts').upsert(contactData, { onConflict: 'jid' });
         
         if (!error) {
-            // SUCESSO: Adiciona ao cache para não incomodar o banco nos próximos minutos
             contactCache.add(cleanJid);
-            
-            // Remove do cache após 5 minutos (para permitir atualizações futuras de foto/nome)
+            // Cache dura 5 min, mas se vier nome novo a lógica acima deixa passar
             setTimeout(() => contactCache.delete(cleanJid), 5 * 60 * 1000);
-        } else {
-            // Se der erro, apenas loga, mas não trava o sistema
-            console.error(`⚠️ [CONTACT WARN] Falha ao atualizar contato ${cleanJid}:`, error.message);
         }
     } catch (e) {
         console.error('❌ Erro upsertContact:', e);
@@ -396,10 +386,7 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
             // console.log('[DEBUG] Ignorando status update'); 
             return; 
         }
-        if (remoteJid.includes('@lid')) { 
-            console.log(`[DEBUG] Ignorando mensagem de LID: ${remoteJid}`); 
-            return; 
-        } 
+        
         if (remoteJid.includes('@broadcast')) return;
 
         let content = getMessageContent(msg.message);
