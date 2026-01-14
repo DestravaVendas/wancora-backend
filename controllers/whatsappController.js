@@ -96,14 +96,19 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     }
 };
 
-// --- HELPER: Upsert Contato (CACHE INTELIGENTE V2) ---
+// --- HELPER: Upsert Contato (CACHE V3 - SUPORTE A LID) ---
 const upsertContact = async (jid, sock, pushName = null, companyId = null, savedName = null, imgUrl = null) => {
     try {
-        const cleanJid = jid.split(':')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
+        // [CORREÇÃO CRÍTICA] Respeita se for @lid, @g.us ou @s.whatsapp.net
+        // Isso impede que o código transforme LID em número comum e quebre o banco
+        let suffix = '@s.whatsapp.net';
+        if (jid.includes('@g.us')) suffix = '@g.us';
+        if (jid.includes('@lid')) suffix = '@lid';
+
+        const cleanJid = jid.split(':')[0] + suffix;
         
-        // [LÓGICA DO PORTEIRO MELHORADA]
-        // Só ignora (usa cache) SE já estiver em cache E se NÃO estivermos tentando salvar um nome novo.
-        // Se vier um pushName ou savedName, a gente força a ida ao banco para atualizar/enriquecer.
+        // [LÓGICA DO PORTEIRO]
+        // Se já temos no cache E não veio informação nova (nome/foto), ignora o banco
         const hasNewInfo = pushName || savedName || imgUrl;
         if (contactCache.has(cleanJid) && !hasNewInfo) {
             return; 
@@ -118,7 +123,7 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null, saved
         
         if (!error) {
             contactCache.add(cleanJid);
-            // Cache dura 5 min, mas se vier nome novo a lógica acima deixa passar
+            // Remove do cache após 5 minutos para permitir atualizações futuras
             setTimeout(() => contactCache.delete(cleanJid), 5 * 60 * 1000);
         }
     } catch (e) {
