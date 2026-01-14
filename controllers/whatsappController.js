@@ -29,7 +29,6 @@ const contactCache = new Set(); // Cache para evitar SPAM de upsert de contatos
 const leadCreationLock = new Set(); // Mutex para evitar duplicidade de Leads em rajadas
 
 // --- HELPER: Unwrap Message (Desenrola mensagens temporárias/visualização única) ---
-// CORREÇÃO CRÍTICA: Expandido para cobrir documentsWithCaption e V2
 const unwrapMessage = (msg) => {
     if (!msg.message) return msg;
     
@@ -47,7 +46,7 @@ const unwrapMessage = (msg) => {
     if (content.viewOnceMessageV2) {
         content = content.viewOnceMessageV2.message;
     }
-    // Desenrola Documentos com Legenda (Novo formato WhatsApp)
+    // Desenrola Documentos com Legenda
     if (content.documentWithCaptionMessage) {
         content = content.documentWithCaptionMessage.message;
     }
@@ -81,10 +80,8 @@ const uploadMediaToSupabase = async (buffer, type) => {
 };
 
 // --- HELPER: Atualização Inteligente de Nome (Hierarquia) ---
-// Prioridade: 1. Agenda (contacts.name) > 2. Perfil (pushName) > 3. Número
 const smartUpdateLeadName = async (phone, pushName, companyId) => {
     try {
-        // 1. Busca dados atuais do Lead e do Contato
         const { data: lead } = await supabase
             .from('leads')
             .select('id, name')
@@ -94,8 +91,6 @@ const smartUpdateLeadName = async (phone, pushName, companyId) => {
 
         if (!lead) return;
 
-        // Busca se temos um nome salvo na agenda (tabela contacts)
-        // O sufixo do JID é necessário para a busca
         const remoteJid = `${phone}@s.whatsapp.net`;
         const { data: contact } = await supabase
             .from('contacts')
@@ -104,21 +99,16 @@ const smartUpdateLeadName = async (phone, pushName, companyId) => {
             .eq('company_id', companyId)
             .maybeSingle();
 
-        const savedName = contact?.name; // Nome salvo na agenda
-        
-        // Define o "Melhor Nome Disponível"
+        const savedName = contact?.name;
         const bestName = savedName || pushName;
 
-        if (!bestName) return; // Se não tem nome nenhum melhor, aborta
+        if (!bestName) return;
 
-        // Lógica de Proteção: Só atualiza se o nome atual no CRM for "Genérico" (número)
         const currentNameClean = lead.name.replace(/\D/g, '');
         const phoneClean = phone.replace(/\D/g, '');
         
-        // Verifica se o nome atual é basicamente o número de telefone
         const isGenericName = currentNameClean.includes(phoneClean) || lead.name.startsWith('+') || lead.name === phone;
 
-        // Se o nome atual é genérico E temos um nome melhor -> Atualiza
         if (isGenericName && lead.name !== bestName) {
             console.log(`✨ [SMART SYNC] Atualizando Lead ${phone}: "${lead.name}" -> "${bestName}"`);
             await supabase.from('leads').update({ name: bestName }).eq('id', lead.id);
@@ -131,13 +121,11 @@ const smartUpdateLeadName = async (phone, pushName, companyId) => {
 
 // --- HELPER: Anti-Ghost Inteligente (Com Mutex de Criação) ---
 const ensureLeadExists = async (remoteJid, pushName, companyId) => {
-    // 1. Ignora infraestrutura do WhatsApp
     if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us') || remoteJid.includes('@lid')) return null;
     
     const phone = remoteJid.split('@')[0];
     const lockKey = `${companyId}:${phone}`;
 
-    // 2. Verifica se já estamos criando este lead AGORA (Mutex)
     if (leadCreationLock.has(lockKey)) {
         await delay(1000); 
         const { data: lead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
@@ -145,9 +133,8 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
     }
 
     try {
-        leadCreationLock.add(lockKey); // 🔒 TRAVA
+        leadCreationLock.add(lockKey);
 
-        // 3. Verifica Ignore List (Anti-Ghost) e Nome Salvo
         const { data: contact } = await supabase
             .from('contacts')
             .select('is_ignored, name')
@@ -160,17 +147,13 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
             return null;
         }
 
-        // 4. Verifica existência (Double Check)
         const { data: existingLead } = await supabase.from('leads').select('id').eq('phone', phone).eq('company_id', companyId).maybeSingle();
         if (existingLead) return existingLead.id;
 
         console.log(`🆕 [Anti-Ghost] Criando Lead para ${phone}...`);
 
-        // 5. Definição de Nome Inicial (Agenda > PushName > Número)
-        // Aqui usamos o nome do contato se existir, senão o pushname
         const finalName = contact?.name || pushName || `+${phone}`; 
 
-        // 6. Pipeline Padrão
         const { data: firstStage } = await supabase.from('pipeline_stages')
             .select('id')
             .eq('company_id', companyId)
@@ -180,7 +163,6 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
         
         const stageId = firstStage?.id || null;
 
-        // 7. Inserção Atômica
         const { data: newLead } = await supabase.from('leads').insert({
             company_id: companyId,
             name: finalName,
@@ -195,7 +177,7 @@ const ensureLeadExists = async (remoteJid, pushName, companyId) => {
         console.error("Erro ensureLeadExists:", e);
         return null;
     } finally {
-        leadCreationLock.delete(lockKey); // 🔓 DESTRAVA
+        leadCreationLock.delete(lockKey);
     }
 };
 
@@ -209,7 +191,6 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null, saved
         const cleanJid = jid.split(':')[0] + suffix;
         const cacheKey = `${companyId}:${cleanJid}`;
         
-        // Cache Check: Se já processamos recentemente E não há dados novos vitais, pula
         const hasNewInfo = pushName || savedName || imgUrl;
         if (contactCache.has(cacheKey) && !hasNewInfo) return; 
 
@@ -225,22 +206,23 @@ const upsertContact = async (jid, sock, pushName = null, companyId = null, saved
             setTimeout(() => contactCache.delete(cacheKey), 10 * 60 * 1000);
         }
     } catch (e) {
-        // Silencioso para não poluir logs
     }
 };
 
 // --- HELPER: Extração de Conteúdo Robusta ---
 const getMessageContent = (msg) => {
     if (!msg) return "";
-    // Ordem de prioridade importa
     if (msg.conversation) return msg.conversation;
     if (msg.extendedTextMessage?.text) return msg.extendedTextMessage.text;
     if (msg.imageMessage?.caption) return msg.imageMessage.caption;
     if (msg.videoMessage?.caption) return msg.videoMessage.caption;
     if (msg.documentMessage?.caption) return msg.documentMessage.caption;
+    // Suporte a botões legados e novos
     if (msg.templateButtonReplyMessage?.selectedId) return msg.templateButtonReplyMessage.selectedId;
     if (msg.buttonsResponseMessage?.selectedButtonId) return msg.buttonsResponseMessage.selectedButtonId;
     if (msg.listResponseMessage?.singleSelectReply?.selectedRowId) return msg.listResponseMessage.singleSelectReply.selectedRowId;
+    // Suporte a Enquete na extração simples
+    if (msg.pollCreationMessageV3?.name) return msg.pollCreationMessageV3.name;
     return "";
 };
 
@@ -278,13 +260,13 @@ export const startSession = async (sessionId, companyId) => {
         },
         printQRInTerminal: false,
         logger: pino({ level: "silent" }),
-        // FINGERPRINT OTIMIZADO PARA SERVIDOR (Evita banimento e loops)
         browser: ["Wancora CRM", "Ubuntu", "24.04"], 
         syncFullHistory: true, 
         markOnlineOnConnect: true,
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 30000,
         generateHighQualityLinkPreview: true,
+        // VITAL PARA EVITAR CRASH EM QUOTES/RESPOSTAS
         getMessage: async (key) => {
             return { conversation: 'hello' }; 
         }
@@ -300,7 +282,6 @@ export const startSession = async (sessionId, companyId) => {
     sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
         console.log(`📚 [HISTÓRICO] Recebido. Contatos: ${contacts.length}, Msgs Brutas: ${messages.length}`);
 
-        // A. Salvar Contatos
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
             const batch = validContacts.map(c => ({
@@ -313,10 +294,8 @@ export const startSession = async (sessionId, companyId) => {
             await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
         }
 
-        // B. Filtragem e Processamento
         const messagesByChat = new Map();
         messages.forEach(msg => {
-            // Unwrapping aqui é importante para o histórico também
             const unwrapped = unwrapMessage(msg);
             const jid = unwrapped.key.remoteJid;
             if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
@@ -324,23 +303,19 @@ export const startSession = async (sessionId, companyId) => {
         });
 
         const smartMessages = [];
-        const MSG_LIMIT_PER_CHAT = 20; // Aumentado ligeiramente para melhor contexto
+        const MSG_LIMIT_PER_CHAT = 20;
 
         messagesByChat.forEach((chatMsgs, jid) => {
-            // Ordena cronologicamente
             chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-            // Pega as últimas X
             const topMessages = chatMsgs.slice(-MSG_LIMIT_PER_CHAT);
             smartMessages.push(...topMessages);
         });
 
         console.log(`🧠 [SMART SYNC] Processando ${smartMessages.length} mensagens recentes.`);
 
-        // C. Chunk Processing
         const CHUNK_SIZE = 50; 
         for (let i = 0; i < smartMessages.length; i += CHUNK_SIZE) {
             const chunk = smartMessages.slice(i, i + CHUNK_SIZE);
-            // Processa sem baixar mídia antiga para economizar recursos
             await Promise.all(chunk.map(msg => processMessage(msg, sessionId, companyId, sock, false)));
             await delay(50);
         }
@@ -380,7 +355,6 @@ export const startSession = async (sessionId, companyId) => {
         if (qr) {
             const now = Date.now();
             const lastTime = lastQrUpdate.get(sessionId) || 0;
-            // Throttle de atualização do QR Code (800ms)
             if (now - lastTime > 800) {
                 lastQrUpdate.set(sessionId, now);
                 await supabase.from("instances").update({ qrcode_url: qr, status: "qrcode", updated_at: new Date() }).eq('session_id', sessionId);
@@ -401,7 +375,6 @@ export const startSession = async (sessionId, companyId) => {
             if (shouldReconnect && sessions.has(sessionId)) {
                 await supabase.from("instances").update({ status: "disconnected" }).eq("session_id", sessionId);
                 
-                // Exponential Backoff limitado
                 const attempt = (retries.get(sessionId) || 0) + 1;
                 retries.set(sessionId, attempt);
                 const delayMs = Math.min(attempt * 2000, 15000); // Max 15s
@@ -418,7 +391,6 @@ export const startSession = async (sessionId, companyId) => {
         if (connection === "open") {
             retries.set(sessionId, 0);
             await supabase.from("instances").update({ status: "connected", qrcode_url: null, updated_at: new Date() }).eq("session_id", sessionId);
-            // Pequeno delay para buscar a foto do perfil da própria instância
             setTimeout(async () => {
                  const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
                  try { 
@@ -437,8 +409,6 @@ export const startSession = async (sessionId, companyId) => {
 
         if (type === "notify" || type === "append") {
             for (const msg of messages) {
-                // Desenrola mensagens temporárias ANTES de processar
-                // CORREÇÃO: Isso garante que 'content' não seja vazio depois
                 const cleanMsg = unwrapMessage(msg);
                 await processMessage(cleanMsg, sessionId, companyId, sock, true);
             }
@@ -458,55 +428,47 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
         const whatsappId = msg.key.id; 
         const pushName = msg.pushName;
 
-        // Filtros de Ignorados
         if (remoteJid === 'status@broadcast') return; 
         if (remoteJid.includes('@broadcast')) return;
 
-        // CORREÇÃO: Extração de conteúdo da mensagem JÁ DESENROLADA
         let content = getMessageContent(msg.message);
         let msgType = getMessageType(msg.message);
         let mediaUrl = null;
 
-        // Ignora mensagens de protocolo vazias
         if (!content && msgType === 'text') {
             if (!msg.message.stickerMessage) return;
         }
 
         console.log(`⚡ [MSG] ${remoteJid} | Tipo: ${msgType} | FromMe: ${fromMe} | Content: ${content.slice(0, 20)}...`);
 
-        // 1. Atualiza Contato (PushName é atualizado aqui)
         await upsertContact(remoteJid, sock, pushName, companyId);
 
         let leadId = null;
         if (!remoteJid.includes('@g.us')) {
-            // 2. Garante Lead (com Mutex)
             leadId = await ensureLeadExists(remoteJid, pushName, companyId);
             
-            // 3. ATUALIZAÇÃO INTELIGENTE DE NOME (Novo Recurso)
-            // Tenta melhorar o nome do lead se for apenas um número
             if (!fromMe) {
                 const phone = remoteJid.split('@')[0];
                 await smartUpdateLeadName(phone, pushName, companyId);
             }
         }
 
-        // 4. Download de Mídia Seguro
+        // 4. Download de Mídia Seguro (50MB Limit)
         const supportedTypes = ['image', 'video', 'audio', 'document', 'sticker'];
         if (shouldDownloadMedia && supportedTypes.includes(msgType)) {
             try {
-                // Verificação de segurança de tamanho
                 const specificMsg = msg.message[msgType + 'Message'] || msg.message;
                 const fileSize = specificMsg?.fileLength;
                 
                 if (fileSize && Number(fileSize) > 50 * 1024 * 1024) {
                     console.warn(`⚠️ Mídia muito grande (${fileSize} bytes). Ignorando download.`);
                     content = `[Arquivo Grande > 50MB]`;
+                    // Não altera msgType para manter o ícone, mas sem URL
                 } else {
                     console.log(`📥 [MEDIA] Baixando ${msgType}...`);
                     const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                     
                     let mimetype = 'application/octet-stream';
-                    // Correção de Mime Types para compatibilidade HTML5
                     if (msg.message.imageMessage) mimetype = 'image/jpeg';
                     else if (msg.message.audioMessage) mimetype = 'audio/mp4'; 
                     else if (msg.message.videoMessage) mimetype = 'video/mp4';
@@ -519,6 +481,8 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
             } catch (mediaErr) {
                 console.error('❌ [MEDIA] Erro download:', mediaErr.message);
                 content = `[Erro no Download da Mídia]`;
+                // Fallback de segurança: se falhou download, virar texto pra não quebrar frontend
+                msgType = 'text'; 
             }
         }
 
@@ -543,7 +507,7 @@ const processMessage = async (msg, sessionId, companyId, sock, shouldDownloadMed
             remote_jid: remoteJid,
             whatsapp_id: whatsappId,
             from_me: fromMe,
-            content: content || (mediaUrl ? '[Mídia]' : ''), // Garante que não salve string vazia se tiver mídia
+            content: content || (mediaUrl ? '[Mídia]' : ''), 
             message_type: msgType,
             media_url: mediaUrl, 
             status: fromMe ? 'sent' : 'received',
@@ -598,7 +562,7 @@ export const sendMessage = async (sessionId, to, payload) => {
                 const isPtt = payload.ptt === true; 
                 sentMsg = await sock.sendMessage(jid, { 
                     audio: { url: payload.url }, 
-                    mimetype: 'audio/mp4', // WhatsApp requer mp4 para áudio
+                    mimetype: 'audio/mp4', 
                     ptt: isPtt 
                 });
                 break;
