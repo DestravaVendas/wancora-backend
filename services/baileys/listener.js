@@ -13,7 +13,7 @@ import { createClient } from '@supabase/supabase-js';
 import mime from 'mime-types';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const logger = pino({ level: 'silent' }); // Silent para reduzir lixo no terminal
+const logger = pino({ level: 'silent' });
 
 // --- Helpers Internos ---
 
@@ -58,17 +58,33 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         // Avisa o Frontend: "Começou a sincronizar (0%)"
         await updateSyncStatus(sessionId, 'syncing', 0);
 
-        // A. Salva Contatos Primeiro (É rápido)
+        // A. Salva Contatos Individuais (Rápido)
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
+            // Tenta pegar notify, name ou verifiedName para garantir que tenha algum nome
             await Promise.all(validContacts.map(c => 
-                upsertContact(c.id, companyId, c.notify || c.name || null)
+                upsertContact(c.id, companyId, c.notify || c.name || c.verifiedName || null)
             ));
         }
 
-        // B. Aplica os Filtros do Build Arquiteto
-        const MAX_CHATS = 200;           // Limite de conversas
-        const MAX_MSGS_PER_CHAT = 7;     // Limite de mensagens por conversa
+        // B. Salva Nomes de Grupos (ESSENCIAL PARA NOMES DE GRUPOS APARECEREM)
+        // O histórico padrão não traz o 'subject' (nome do grupo), precisamos buscar explicitamente.
+        try {
+            const groups = await sock.groupFetchAllParticipating();
+            const groupList = Object.values(groups);
+            if (groupList.length > 0) {
+                console.log(`👥 [GRUPOS] Salvando nomes de ${groupList.length} grupos...`);
+                await Promise.all(groupList.map(g => 
+                    upsertContact(g.id, companyId, g.subject, null)
+                ));
+            }
+        } catch (e) {
+            console.warn('⚠️ Falha leve ao buscar nomes de grupos (pode tentar de novo depois):', e.message);
+        }
+
+        // C. Filtros de Mensagens
+        const MAX_CHATS = 50;            // Reduzido para 50 para liberar a tela mais rápido
+        const MAX_MSGS_PER_CHAT = 10;    // Aumentado um pouco para dar contexto
         
         // 1. Agrupa mensagens por JID (Chat)
         const messagesByChat = new Map();
@@ -86,7 +102,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             return timeB - timeA; // Decrescente (Mais novo primeiro)
         });
 
-        // 3. Corta apenas os Top 200 chats
+        // 3. Corta apenas os Top chats
         const topChats = sortedChats.slice(0, MAX_CHATS);
         
         // 4. Prepara a lista final "achatada" (Flat)
@@ -95,7 +111,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             // Ordena mensagens dentro do chat (Antiga -> Nova)
             msgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
             
-            // Pega apenas as últimas 7
+            // Pega apenas as últimas mensagens
             const limited = msgs.slice(-MAX_MSGS_PER_CHAT);
             finalMessagesToProcess.push(...limited);
         });
@@ -104,7 +120,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         console.log(`🧠 [FILTRO] ${messagesByChat.size} chats totais -> Reduzido para ${topChats.length} chats. Total Msgs finais: ${totalMsgs}`);
 
         // C. Processamento em Lotes (Chunks) com Log de Progresso
-        const CHUNK_SIZE = 10; // Processa de 10 em 10 para atualizar a barra de progresso suavemente
+        // Reduzimos para 5 para casar com o delay de 300ms do sync.js
+        const CHUNK_SIZE = 5; 
         let processedCount = 0;
 
         for (let i = 0; i < finalMessagesToProcess.length; i += CHUNK_SIZE) {
@@ -121,7 +138,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             // Log no Console
             if (percent % 10 === 0) console.log(`🔄 [SYNC] ${percent}% processado (${processedCount}/${totalMsgs})`);
             
-            // Atualiza Banco para o Frontend ler
+            // Atualiza Banco para o Frontend ler e mostrar o SVG circular
             await updateSyncStatus(sessionId, 'syncing', percent);
         }
 
@@ -130,7 +147,16 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         console.log(`✅ [HISTÓRICO] Sincronização concluída com sucesso.`);
     });
 
-    // --- 2. EVENTO: MENSAGEM EM TEMPO REAL (NOVA MENSAGEM) ---
+    // --- 2. EVENTO: ATUALIZAÇÃO DE GRUPOS (NOME MUDOU) ---
+    sock.ev.on('groups.update', async (groups) => {
+        for (const g of groups) {
+            if (g.subject) {
+                await upsertContact(g.id, companyId, g.subject);
+            }
+        }
+    });
+
+    // --- 3. EVENTO: MENSAGEM EM TEMPO REAL (NOVA MENSAGEM) ---
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type === 'notify' || type === 'append') {
             for (const msg of messages) {
@@ -141,7 +167,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         }
     });
 
-    // --- 3. EVENTO: ATUALIZAÇÃO DE CONTATOS ---
+    // --- 4. EVENTO: ATUALIZAÇÃO DE CONTATOS ---
     sock.ev.on('contacts.upsert', async (contacts) => {
         for (const c of contacts) {
             await upsertContact(c.id, companyId, c.notify || null, c.imgUrl || null);
@@ -166,7 +192,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime)
         const body = getBody(msg.message);
 
         // 1. Garante que o Contato e o Lead existam
-        // A função upsertContact do sync.js agora cuida da prioridade do nome
+        // Prioridade: Tenta salvar o contato com o PushName da mensagem se ele não tiver nome no banco
         await upsertContact(jid, companyId, pushName);
         
         let leadId = null;
@@ -179,11 +205,9 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime)
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
         // Regra: Só baixa mídia se for Tempo Real (Nova) 
-        // Se for histórico, ignoramos para não lotar o servidor, a menos que você queira mudar isso.
         if (isMedia && isRealtime) { 
             try {
-                // Limite de segurança: não baixa arquivos gigantes (>50MB) para não travar RAM
-                // O baileys geralmente lida com stream, mas bufferizamos aqui para upload
+                // Limite de segurança para não travar RAM
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger });
                 
                 let mimeType = 'application/octet-stream';
@@ -195,8 +219,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime)
                 
                 mediaUrl = await uploadMedia(buffer, mimeType);
             } catch (e) {
-                // Falha silenciosa no download de mídia para não perder a mensagem de texto
-                // console.warn('Falha download mídia:', e.message);
+                // Falha silenciosa no download de mídia
             }
         }
 
