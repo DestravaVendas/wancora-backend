@@ -202,6 +202,49 @@ export const saveMessageToDb = async ({
     if (error) console.error(`❌ [DB] Msg Error:`, error.message);
 };
 
+// --- NOVO: Atualiza Votos da Enquete ---
+export const savePollVote = async ({ companyId, msgId, voterJid, optionId }) => {
+    try {
+        // Busca votos atuais
+        const { data: msg } = await supabase
+            .from('messages')
+            .select('poll_votes')
+            .eq('whatsapp_id', msgId)
+            .eq('company_id', companyId)
+            .maybeSingle();
+
+        if (!msg) return;
+
+        let currentVotes = msg.poll_votes || [];
+        
+        // Verifica se já votou nessa opção (Evita duplicidade simples)
+        const exists = currentVotes.some(v => v.voterJid === voterJid && v.optionId === optionId);
+        
+        if (!exists) {
+            currentVotes.push({ voterJid, optionId });
+            
+            await supabase
+                .from('messages')
+                .update({ poll_votes: currentVotes })
+                .eq('whatsapp_id', msgId)
+                .eq('company_id', companyId);
+                
+            console.log(`📊 [POLL] Voto registrado: ${voterJid} -> Opção ${optionId}`);
+        }
+    } catch (e) {
+        console.error("Erro saving poll vote:", e);
+    }
+};
+
+// --- NOVO: Atualiza Status de Sincronização ---
+export const updateSyncStatus = async (sessionId, status, percent) => {
+    await supabase.from("instances").update({ 
+        sync_status: status, 
+        sync_percent: percent,
+        updated_at: new Date() 
+    }).eq('session_id', sessionId);
+};
+
 export const updateInstance = async (sessionId, data) => {
     await supabase.from("instances").update({ ...data, updated_at: new Date() }).eq('session_id', sessionId);
 };
