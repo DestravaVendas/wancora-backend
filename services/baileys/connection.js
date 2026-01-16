@@ -3,7 +3,7 @@ import makeWASocket, { fetchLatestBaileysVersion, makeCacheableSignalKeyStore } 
 import pino from 'pino';
 import { useSupabaseAuthState } from './auth.js';
 import { setupListeners } from './listener.js';
-import { deleteSessionData, updateInstance } from '../crm/sync.js';
+import { deleteSessionData, updateInstance, updateSyncStatus } from '../crm/sync.js'; // Adicionado updateSyncStatus
 
 // Mapa Global de Sessões Ativas (Memória RAM)
 export const sessions = new Map();
