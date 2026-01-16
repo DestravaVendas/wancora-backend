@@ -1,4 +1,4 @@
-import makeWASocket, { fetchLatestBaileysVersion, makeCacheableSignalKeyStore, DisconnectReason } from '@whiskeysockets/baileys';
+import makeWASocket, { fetchLatestBaileysVersion, makeCacheableSignalKeyStore, DisconnectReason, Browsers } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { useSupabaseAuthState } from '../../auth/supabaseAuth.js';
 import { setupListeners } from './listener.js';
@@ -36,7 +36,8 @@ export const startSession = async (sessionId, companyId) => {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
-        browser: ["Wancora CRM", "Chrome", "120.0.0"], 
+        // CORREÇÃO PONTUAL: Usar Ubuntu resolve o Timeout 408 no Render
+        browser: Browsers.ubuntu("Chrome"), 
         syncFullHistory: true, 
         markOnlineOnConnect: true,
         connectTimeoutMs: 60000,
@@ -60,11 +61,16 @@ export const startSession = async (sessionId, companyId) => {
         // 1. SE RECEBER QR CODE, ATUALIZA O BANCO IMEDIATAMENTE
         if (qr) {
             console.log(`[QR CODE] Novo QR gerado para ${sessionId}`);
-            await updateInstance(sessionId, { 
-                qrcode_url: qr, 
-                status: 'qrcode',
-                updated_at: new Date()
-            });
+            // Usamos try/catch para evitar crash se a instância tiver sido deletada
+            try {
+                await updateInstance(sessionId, { 
+                    qrcode_url: qr, 
+                    status: 'qrcode',
+                    updated_at: new Date()
+                });
+            } catch (e) {
+                console.error("Erro ao salvar QR:", e.message);
+            }
         }
 
         // 2. SE CONECTAR, LIMPA O QR CODE
@@ -92,7 +98,11 @@ export const startSession = async (sessionId, companyId) => {
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
             console.log(`[DESCONECTADO] Código: ${statusCode}. Reconectar? ${shouldReconnect}`);
-            await updateInstance(sessionId, { status: "disconnected" });
+            
+            if (!shouldReconnect) {
+                // Logout real -> desconecta banco
+                await updateInstance(sessionId, { status: "disconnected" });
+            }
 
             if (shouldReconnect) {
                 handleReconnect(sessionId, companyId);
@@ -121,8 +131,8 @@ const handleReconnect = (sessionId, companyId) => {
     const attempt = (retries.get(sessionId) || 0) + 1;
     retries.set(sessionId, attempt);
     
-    // Teto de 30s
-    const delayMs = Math.min(attempt * 2000, 30000); 
+    // Teto de 60s para evitar loops rápidos
+    const delayMs = Math.min(attempt * 2000, 60000); 
     console.log(`🔄 [RETRY] ${sessionId} em ${delayMs}ms (Tentativa ${attempt})`);
 
     const timeoutId = setTimeout(() => {
