@@ -53,8 +53,8 @@ export const sendMessage = async ({
 
         // 4. Delay de Produção (Baseado no tamanho do conteúdo)
         let typingTime = 2000; // Mínimo 2s
-        if (type === 'text' && (content || text)) {
-            const textLen = (content || text || "").length;
+        if (type === 'text' && content) {
+            const textLen = content.length;
             // ~100ms por caractere, teto de 10s
             typingTime = Math.min(textLen * 100, 10000); 
         } else if (type === 'audio') {
@@ -72,13 +72,45 @@ export const sendMessage = async ({
 
         switch (type) {
             case 'text':
-                if (content && content.startsWith('Chave Pix:')) {
-                    payload = { text: content };
-                } else {
-                    payload = { text: content || "" };
-                }
+                payload = { text: content || "" };
                 break;
             
+            case 'pix':
+                // IMPLEMENTAÇÃO DO BOTÃO "COPIAR" NATIVO
+                // Usa 'interactiveMessage' com 'native_flow_message' -> 'cta_copy'
+                payload = {
+                    viewOnceMessage: {
+                        message: {
+                            interactiveMessage: {
+                                header: {
+                                    title: "PAGAMENTO VIA PIX",
+                                    subtitle: "Pagamento Instantâneo",
+                                    hasMediaAttachment: false
+                                },
+                                body: {
+                                    text: "Copie a chave abaixo e cole no seu aplicativo bancário para finalizar o pagamento."
+                                },
+                                footer: {
+                                    text: "Wancora Secure Pay"
+                                },
+                                nativeFlowMessage: {
+                                    buttons: [
+                                        {
+                                            name: "cta_copy",
+                                            buttonParamsJson: JSON.stringify({
+                                                display_text: "COPIAR CHAVE PIX",
+                                                id: "copy_pix_key",
+                                                copy_code: content // A chave Pix vem aqui
+                                            })
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                };
+                break;
+
             case 'image':
                 payload = { image: { url }, caption: caption };
                 break;
