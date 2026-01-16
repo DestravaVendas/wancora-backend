@@ -4,7 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 
 // Serviços Modulares
 import { startSession, deleteSession } from "./services/baileys/connection.js";
-import { sendMessage } from "./services/baileys/sender.js";
+import { sendMessage, sendPollVote } from "./controllers/whatsappController.js"; // Atualizado import
 
 // Controller de Campanhas (ATIVO)
 import { createCampaign } from "./controllers/campaignController.js"; 
@@ -104,7 +104,7 @@ router.post("/message/send", async (req, res) => {
     };
 
     // 2. Envio (Baileys)
-    const sentMsg = await sendMessage(payload);
+    const sentMsg = await sendMessage(sessionId, to, payload);
     
     // 3. Salvamento Manual (Log Otimista/Idempotente)
     // Usamos UPSERT aqui. Se o listener do Baileys já tiver salvado, atualizamos. Se não, inserimos.
@@ -151,6 +151,23 @@ router.post("/message/send", async (req, res) => {
     console.error("❌ Erro ao enviar mensagem:", error);
     res.status(500).json({ error: "Falha no envio: " + (error.message || error) });
   }
+});
+
+// --- NOVO: Votar em Enquete ---
+router.post("/message/vote", async (req, res) => {
+    const { companyId, sessionId, remoteJid, pollId, optionId } = req.body;
+    
+    if(!pollId || optionId === undefined) {
+        return res.status(400).json({ error: "PollId e OptionId obrigatórios" });
+    }
+
+    try {
+        await sendPollVote(sessionId, companyId, remoteJid, pollId, optionId);
+        res.json({ success: true });
+    } catch (error) {
+        console.error("Erro ao votar:", error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // ==============================================================================
