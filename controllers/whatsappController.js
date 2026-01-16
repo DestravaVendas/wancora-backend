@@ -1,7 +1,8 @@
 
 import { createClient } from "@supabase/supabase-js";
-import { startSession as startService, deleteSession as deleteService } from '../services/baileys/connection.js';
+import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
 import { sendMessage as sendService } from '../services/baileys/sender.js';
+import { savePollVote } from '../services/crm/sync.js';
 
 // Cliente Supabase para consultas auxiliares (Service Role ou Anon, depende do env, mas para leitura OK)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -46,6 +47,60 @@ export const sendMessage = async (sessionId, to, payload) => {
     } catch (error) {
         console.error(`[Controller] Erro ao enviar mensagem:`, error);
         throw error; 
+    }
+};
+
+// --- NOVO: Votar em Enquete ---
+export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, optionId) => {
+    try {
+        const session = sessions.get(sessionId);
+        if (!session?.sock) throw new Error("Sessão desconectada.");
+
+        // 1. Recuperar a mensagem original do banco para pegar os hashes das opções
+        // PORM, o Baileys exige a chave da mensagem original (pollCreationMessage).
+        const { data: pollMsg } = await supabase
+            .from('messages')
+            .select('whatsapp_id, from_me, content')
+            .eq('id', pollId) // pollId aqui é o ID do Supabase da mensagem
+            .single();
+
+        if (!pollMsg) throw new Error("Enquete não encontrada no banco.");
+
+        // Reconstruir a chave original do Baileys
+        const originalKey = {
+            remoteJid: remoteJid,
+            id: pollMsg.whatsapp_id,
+            fromMe: pollMsg.from_me
+        };
+
+        // Extrair o conteúdo da enquete para saber os metadados
+        const pollContent = JSON.parse(pollMsg.content);
+        
+        // Enviar voto pelo Socket
+        await session.sock.sendMessage(remoteJid, {
+            poll: {
+                key: originalKey,
+                vote: {
+                    singleSelect: pollContent.selectableOptionsCount === 1,
+                    selectedOptions: [optionId] // Baileys moderno lida com index se configurado corretamente ou tentamos hash
+                }
+            }
+        });
+
+        // Salvar voto no banco localmente (Optimistic)
+        const myJid = session.sock.user.id.split(':')[0] + '@s.whatsapp.net';
+        await savePollVote({
+            companyId,
+            msgId: pollMsg.whatsapp_id,
+            voterJid: myJid,
+            optionId
+        });
+
+        return { success: true };
+
+    } catch (error) {
+        console.error(`[Controller] Erro ao votar:`, error);
+        throw error;
     }
 };
 
