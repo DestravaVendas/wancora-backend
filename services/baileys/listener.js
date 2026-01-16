@@ -1,343 +1,221 @@
-
-import { DisconnectReason, downloadMediaMessage, delay, getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 import { 
-    updateInstance, 
     upsertContact, 
+    upsertMessage, 
     ensureLeadExists, 
-    saveMessageToDb, 
-    uploadMediaToSupabase, 
-    smartUpdateLeadName,
-    deleteSessionData,
-    updateSyncStatus, // Importado
-    savePollVote,     // Importado
-    supabase
+    updateSyncStatus 
 } from '../crm/sync.js';
-import { unwrapMessage, getMessageContent, getMessageType } from '../../utils/wppParsers.js';
-import { deleteSession } from './connection.js';
+import { 
+    getContentType, 
+    downloadMediaMessage 
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import { createClient } from '@supabase/supabase-js';
+import mime from 'mime-types';
 
-// Controle de Throttle para QR Code (Memória Local)
-const lastQrUpdate = new Map();
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const logger = pino({ level: 'silent' }); // Silent para reduzir lixo no terminal
 
-/**
- * Configura todos os eventos do Socket
- */
-export const setupListeners = ({ sock, sessionId, companyId, saveCreds, reconnectFn, logger }) => {
-    
-    // 1. CREDENCIAIS
-    sock.ev.on('creds.update', saveCreds);
+// --- Helpers Internos ---
 
-    // 2. CONEXÃO & QR CODE
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+// Desenrola mensagens complexas (ViewOnce, Ephemeral, etc)
+const unwrapMessage = (msg) => {
+    if (!msg.message) return msg;
+    let content = msg.message;
+    if (content.ephemeralMessage) content = content.ephemeralMessage.message;
+    if (content.viewOnceMessage) content = content.viewOnceMessage.message;
+    if (content.viewOnceMessageV2) content = content.viewOnceMessageV2.message;
+    if (content.documentWithCaptionMessage) content = content.documentWithCaptionMessage.message;
+    return { ...msg, message: content };
+};
 
-        if (connection) console.log(`🔌 [CONN] ${sessionId}: ${connection}`);
+// Faz upload de mídia para o bucket do Supabase
+const uploadMedia = async (buffer, type) => {
+    try {
+        const ext = mime.extension(type) || 'bin';
+        const fileName = `hist_${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
+        const { error } = await supabase.storage.from('chat-media').upload(fileName, buffer, { contentType: type });
+        if (error) return null;
+        const { data } = supabase.storage.from('chat-media').getPublicUrl(fileName);
+        return data.publicUrl;
+    } catch { return null; }
+};
 
-        if (qr) {
-            const now = Date.now();
-            const lastTime = lastQrUpdate.get(sessionId) || 0;
-            if (now - lastTime > 800) {
-                lastQrUpdate.set(sessionId, now);
-                console.log(`[${sessionId}] Novo QR Code.`);
-                await updateInstance(sessionId, { 
-                    status: 'qrcode', 
-                    qrcode_url: qr,
-                    company_id: companyId 
-                });
-            }
-        }
+// Extrai texto legível de qualquer tipo de mensagem
+const getBody = (msg) => {
+    if (!msg) return '';
+    return msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || msg.videoMessage?.caption || '';
+};
 
-        if (connection === 'close') {
-            lastQrUpdate.delete(sessionId);
-            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            
-            if (statusCode === 401 || statusCode === 403) {
-                console.log(`[${sessionId}] Logout Detectado. Limpando dados.`);
-                await updateInstance(sessionId, { status: 'disconnected', qrcode_url: null });
-                await deleteSessionData(sessionId);
-                await deleteSession(sessionId); 
-                return;
-            }
+// ==============================================================================
+// CONFIGURAÇÃO DOS LISTENERS (FUNÇÃO PRINCIPAL)
+// ==============================================================================
+export const setupListeners = ({ sock, sessionId, companyId }) => {
 
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) {
-                await updateInstance(sessionId, { status: 'disconnected' });
-                reconnectFn();
-            } else {
-                await deleteSessionData(sessionId);
-                await deleteSession(sessionId);
-            }
-        }
-
-        if (connection === 'open') {
-            console.log(`[${sessionId}] Conectado! 🟢`);
-            
-            // SYNC PROTOCOL: START
-            // Define status inicial para que o Frontend mostre o Loading Overlay
-            await updateInstance(sessionId, { 
-                status: 'connected', 
-                qrcode_url: null,
-                profile_pic_url: null,
-                sync_status: 'importing_contacts', 
-                sync_percent: 5
-            });
-
-            setTimeout(async () => {
-                try {
-                    const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-                    const ppUrl = await sock.profilePictureUrl(userJid, 'image');
-                    if(ppUrl) await updateInstance(sessionId, { profile_pic_url: ppUrl });
-                } catch(e) {}
-            }, 3000);
-        }
-    });
-
-    // 3. HISTÓRICO INTELIGENTE COM SYNC SAFE (Contatos ANTES de Mensagens)
+    // --- 1. EVENTO: HISTÓRICO INTELIGENTE (SYNC INICIAL) ---
     sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
-        console.log(`📚 [HISTÓRICO] Recebendo pacote... Iniciando Protocolo Safe Sync.`);
-
-        // --- PASSO 1: CONTATOS (Sync First) ---
-        await updateSyncStatus(sessionId, 'importing_contacts', 10);
+        console.log(`📚 [HISTÓRICO] Recebido pacote do WhatsApp. Iniciando filtros...`);
         
+        // Avisa o Frontend: "Começou a sincronizar (0%)"
+        await updateSyncStatus(sessionId, 'syncing', 0);
+
+        // A. Salva Contatos Primeiro (É rápido)
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
         if (validContacts.length > 0) {
-            console.log(`[SYNC] Salvando ${validContacts.length} contatos...`);
-            const batch = validContacts.map(c => ({
-                jid: c.id,
-                name: c.name || c.verifiedName || null,
-                push_name: c.notify || null,
-                company_id: companyId,
-                updated_at: new Date()
-            }));
-            await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
+            await Promise.all(validContacts.map(c => 
+                upsertContact(c.id, companyId, c.notify || c.name || null)
+            ));
         }
-        
-        await updateSyncStatus(sessionId, 'importing_messages', 40);
 
-        // --- PASSO 2: FILTRO DE MENSAGENS ---
-        const MAX_CHATS = 100;           
-        const MAX_MSGS_PER_CHAT = 15;    
-        const MONTHS_LIMIT = 3;          
+        // B. Aplica os Filtros do Build Arquiteto
+        const MAX_CHATS = 200;           // Limite de conversas
+        const MAX_MSGS_PER_CHAT = 7;     // Limite de mensagens por conversa
         
-        const cutoffDate = new Date();
-        cutoffDate.setMonth(cutoffDate.getMonth() - MONTHS_LIMIT);
-        const cutoffTimestamp = Math.floor(cutoffDate.getTime() / 1000);
-
+        // 1. Agrupa mensagens por JID (Chat)
         const messagesByChat = new Map();
         messages.forEach(msg => {
             const unwrapped = unwrapMessage(msg);
             const jid = unwrapped.key.remoteJid;
-            
-            const msgTime = unwrapped.messageTimestamp || 0;
-            if (msgTime < cutoffTimestamp) return;
-
             if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
             messagesByChat.get(jid).push(unwrapped);
         });
 
-        // Seleciona Top Chats
-        const chatSortArray = [];
-        messagesByChat.forEach((msgs, jid) => {
-            const lastMsgTime = Math.max(...msgs.map(m => m.messageTimestamp || 0));
-            chatSortArray.push({ jid, time: lastMsgTime });
+        // 2. Ordena os chats pelo timestamp da mensagem mais recente
+        const sortedChats = Array.from(messagesByChat.entries()).sort(([, msgsA], [, msgsB]) => {
+            const timeA = Math.max(...msgsA.map(m => m.messageTimestamp || 0));
+            const timeB = Math.max(...msgsB.map(m => m.messageTimestamp || 0));
+            return timeB - timeA; // Decrescente (Mais novo primeiro)
         });
 
-        chatSortArray.sort((a, b) => b.time - a.time);
-        const topChats = new Set(chatSortArray.slice(0, MAX_CHATS).map(c => c.jid));
-
-        const smartMessages = [];
-        messagesByChat.forEach((chatMsgs, jid) => {
-            if (!topChats.has(jid)) return;
-            chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-            const limitedMsgs = chatMsgs.slice(-MAX_MSGS_PER_CHAT);
-            smartMessages.push(...limitedMsgs);
+        // 3. Corta apenas os Top 200 chats
+        const topChats = sortedChats.slice(0, MAX_CHATS);
+        
+        // 4. Prepara a lista final "achatada" (Flat)
+        let finalMessagesToProcess = [];
+        topChats.forEach(([jid, msgs]) => {
+            // Ordena mensagens dentro do chat (Antiga -> Nova)
+            msgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+            
+            // Pega apenas as últimas 7
+            const limited = msgs.slice(-MAX_MSGS_PER_CHAT);
+            finalMessagesToProcess.push(...limited);
         });
 
-        console.log(`💾 [DB SAVE] Processando ${smartMessages.length} mensagens.`);
-        await updateSyncStatus(sessionId, 'importing_messages', 60);
+        const totalMsgs = finalMessagesToProcess.length;
+        console.log(`🧠 [FILTRO] ${messagesByChat.size} chats totais -> Reduzido para ${topChats.length} chats. Total Msgs finais: ${totalMsgs}`);
 
-        // --- PASSO 3: SALVAMENTO EM LOTE ---
-        const CHUNK_SIZE = 50;
-        let processed = 0;
-        
-        for (let i = 0; i < smartMessages.length; i += CHUNK_SIZE) {
-            const chunk = smartMessages.slice(i, i + CHUNK_SIZE);
-            await Promise.all(chunk.map(msg => processSingleMessage(msg, sessionId, companyId, sock, false))); 
+        // C. Processamento em Lotes (Chunks) com Log de Progresso
+        const CHUNK_SIZE = 10; // Processa de 10 em 10 para atualizar a barra de progresso suavemente
+        let processedCount = 0;
+
+        for (let i = 0; i < finalMessagesToProcess.length; i += CHUNK_SIZE) {
+            const chunk = finalMessagesToProcess.slice(i, i + CHUNK_SIZE);
             
-            processed += chunk.length;
-            const progress = 60 + Math.floor((processed / smartMessages.length) * 35); // Vai até 95%
-            await updateSyncStatus(sessionId, 'importing_messages', progress);
+            // Processa o lote em paralelo. 'false' = Não baixa mídia antiga (economiza espaço)
+            await Promise.all(chunk.map(msg => processSingleMessage(msg, sock, companyId, sessionId, false)));
             
-            await delay(100); 
+            processedCount += chunk.length;
+            
+            // Calcula Porcentagem
+            const percent = Math.round((processedCount / totalMsgs) * 100);
+            
+            // Log no Console
+            if (percent % 10 === 0) console.log(`🔄 [SYNC] ${percent}% processado (${processedCount}/${totalMsgs})`);
+            
+            // Atualiza Banco para o Frontend ler
+            await updateSyncStatus(sessionId, 'syncing', percent);
         }
-        
-        console.log(`✅ [HISTÓRICO] Sync Concluído.`);
-        await updateSyncStatus(sessionId, 'completed', 100);
+
+        // Finaliza: Marca como 100% e Online
+        await updateSyncStatus(sessionId, 'online', 100);
+        console.log(`✅ [HISTÓRICO] Sincronização concluída com sucesso.`);
     });
 
-    // 4. ATUALIZAÇÃO DE CONTATOS
-    sock.ev.on('contacts.upsert', async (contacts) => {
-        const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
-        if (validContacts.length > 0) {
-            const batch = validContacts.map(c => ({
-                jid: c.id,
-                name: c.name || c.verifiedName || null,
-                push_name: c.notify || null,
-                company_id: companyId,
-                updated_at: new Date()
-            }));
-            await supabase.from('contacts').upsert(batch, { onConflict: 'jid' });
-        }
-    });
-
-    // 5. ATUALIZAÇÃO DE GRUPOS
-    sock.ev.on('groups.update', async (groups) => {
-        for (const g of groups) {
-            if (g.subject) {
-                await upsertContact(g.id, sock, null, companyId, g.subject);
-            }
-        }
-    });
-
-    // 6. MENSAGENS EM TEMPO REAL
+    // --- 2. EVENTO: MENSAGEM EM TEMPO REAL (NOVA MENSAGEM) ---
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify' && type !== 'append') return;
-
-        console.log(`📨 [REALTIME] Recebidas: ${messages.length}`);
-
-        for (const msg of messages) {
-            const cleanMsg = unwrapMessage(msg);
-            // Mensagens realtime sempre baixam mídia (true)
-            await processSingleMessage(cleanMsg, sessionId, companyId, sock, true);
+        if (type === 'notify' || type === 'append') {
+            for (const msg of messages) {
+                const clean = unwrapMessage(msg);
+                // 'true' = Baixa mídia automaticamente, pois é mensagem nova
+                await processSingleMessage(clean, sock, companyId, sessionId, true);
+            }
         }
     });
 
-    // 7. LISTENER DE ENQUETES (VOTOS)
-    sock.ev.on('messages.update', async (updates) => {
-        for (const update of updates) {
-            // Verifica se há atualização de enquete
-            if (update.pollUpdates) {
-                // A implementação exata depende de como o Baileys expõe no evento update
-                // Aqui tentamos processar os votos brutos e salvar no banco
-                for (const pollVote of update.pollUpdates) {
-                     if (pollVote.vote) {
-                         const voterJid = pollVote.voteKey?.fromMe 
-                            ? sock.user.id.split(':')[0] + '@s.whatsapp.net' 
-                            : pollVote.voteKey?.remoteJid;
-                         
-                         const selectedOptions = pollVote.vote.selectedOptions || [];
-                         
-                         // Se tiver opções selecionadas, pega a primeira (simplificação para salvar o voto)
-                         // Em produção, seria ideal mapear o hash da opção para o índice
-                         if(selectedOptions.length > 0) {
-                             // Como não temos o hash map aqui fácil sem a mensagem original, 
-                             // vamos salvar apenas se conseguirmos inferir ou se o frontend enviar.
-                             // MAS, o evento messages.update é vital.
-                             // Vamos tentar salvar o update bruto se necessário, ou apenas logar.
-                             console.log(`[POLL UPDATE] Voto recebido de ${voterJid}`);
-                         }
-                     }
-                }
-            }
+    // --- 3. EVENTO: ATUALIZAÇÃO DE CONTATOS ---
+    sock.ev.on('contacts.upsert', async (contacts) => {
+        for (const c of contacts) {
+            await upsertContact(c.id, companyId, c.notify || null, c.imgUrl || null);
         }
     });
 };
 
-// --- Processador Unificado ---
-const processSingleMessage = async (msg, sessionId, companyId, sock, shouldDownloadMedia = false) => {
+// ==============================================================================
+// PROCESSADOR UNITÁRIO DE MENSAGEM (LÓGICA CENTRAL)
+// ==============================================================================
+const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime) => {
     try {
         if (!msg.message) return;
+        const jid = msg.key.remoteJid;
         
-        const remoteJid = msg.key.remoteJid;
+        // Ignora status (stories)
+        if (jid === 'status@broadcast') return;
+
         const fromMe = msg.key.fromMe;
-        const whatsappId = msg.key.id; 
         const pushName = msg.pushName;
+        const type = getContentType(msg.message);
+        const body = getBody(msg.message);
 
-        if (remoteJid === 'status@broadcast') return; 
-        if (remoteJid.includes('@broadcast')) return;
-
-        let content = getMessageContent(msg.message);
-        let msgType = getMessageType(msg.message);
-        let mediaUrl = null;
-
-        if (!content && msgType === 'text') {
-            if (!msg.message.stickerMessage) return;
-        }
-
-        console.log(`⚡ [MSG] ${remoteJid} | Tipo: ${msgType}`);
-
-        await upsertContact(remoteJid, sock, pushName, companyId);
-
+        // 1. Garante que o Contato e o Lead existam
+        // A função upsertContact do sync.js agora cuida da prioridade do nome
+        await upsertContact(jid, companyId, pushName);
+        
         let leadId = null;
-        if (!remoteJid.includes('@g.us')) {
-            leadId = await ensureLeadExists(remoteJid, pushName, companyId);
-            
-            if (!fromMe) {
-                const phone = remoteJid.split('@')[0];
-                await smartUpdateLeadName(phone, pushName, companyId);
-            }
+        if (!jid.includes('@g.us')) {
+            leadId = await ensureLeadExists(jid, companyId, pushName);
         }
 
-        const supportedTypes = ['image', 'video', 'audio', 'document', 'sticker'];
-        if (shouldDownloadMedia && supportedTypes.includes(msgType)) {
+        // 2. Tratamento de Mídia
+        let mediaUrl = null;
+        const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
+        
+        // Regra: Só baixa mídia se for Tempo Real (Nova) 
+        // Se for histórico, ignoramos para não lotar o servidor, a menos que você queira mudar isso.
+        if (isMedia && isRealtime) { 
             try {
-                const specificMsg = msg.message[msgType + 'Message'] || msg.message;
-                const fileSize = specificMsg?.fileLength;
+                // Limite de segurança: não baixa arquivos gigantes (>50MB) para não travar RAM
+                // O baileys geralmente lida com stream, mas bufferizamos aqui para upload
+                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger });
                 
-                if (fileSize && Number(fileSize) > 50 * 1024 * 1024) { 
-                    console.warn(`⚠️ Mídia > 50MB. Ignorando.`);
-                    content = `[Arquivo Grande > 50MB]`;
-                } else {
-                    console.log(`📥 [MEDIA] Baixando...`);
-                    const buffer = await downloadMediaMessage(
-                        msg, 
-                        'buffer', 
-                        {}, 
-                        { logger: { level: 'silent' } }
-                    );
-                    
-                    let mimetype = 'application/octet-stream';
-                    if (msg.message.imageMessage) mimetype = 'image/jpeg';
-                    else if (msg.message.audioMessage) mimetype = 'audio/mp4'; 
-                    else if (msg.message.videoMessage) mimetype = 'video/mp4';
-                    else if (msg.message.documentMessage) mimetype = msg.message.documentMessage.mimetype;
-                    else if (msg.message.stickerMessage) mimetype = 'image/webp';
-
-                    mediaUrl = await uploadMediaToSupabase(buffer, mimetype);
-                }
-            } catch (mediaErr) {
-                console.error('❌ [MEDIA] Erro download:', mediaErr.message);
-                content = `[Erro no Download]`;
-                msgType = 'text'; 
+                let mimeType = 'application/octet-stream';
+                if (msg.message.imageMessage) mimeType = 'image/jpeg';
+                else if (msg.message.audioMessage) mimeType = 'audio/mp4';
+                else if (msg.message.videoMessage) mimeType = 'video/mp4';
+                else if (msg.message.stickerMessage) mimeType = 'image/webp';
+                else if (msg.message.documentMessage) mimeType = msg.message.documentMessage.mimetype;
+                
+                mediaUrl = await uploadMedia(buffer, mimeType);
+            } catch (e) {
+                // Falha silenciosa no download de mídia para não perder a mensagem de texto
+                // console.warn('Falha download mídia:', e.message);
             }
         }
 
-        if (msgType === 'poll') {
-            try {
-                const pollData = msg.message.pollCreationMessage || msg.message.pollCreationMessageV3;
-                if (pollData) {
-                    content = JSON.stringify({
-                        name: pollData.name,
-                        options: pollData.options.map(o => o.optionName),
-                        selectableOptionsCount: pollData.selectableOptionsCount
-                    });
-                }
-            } catch(e) { content = 'Enquete'; }
-        }
-
-        await saveMessageToDb({
-            companyId,
-            sessionId,
-            remoteJid,
-            whatsappId,
-            fromMe,
-            content: content || (mediaUrl ? '[Mídia]' : ''), 
-            messageType: msgType,
-            mediaUrl,
-            leadId,
-            timestamp: msg.messageTimestamp
+        // 3. Salva no Banco de Dados
+        await upsertMessage({
+            company_id: companyId,
+            session_id: sessionId,
+            remote_jid: jid,
+            whatsapp_id: msg.key.id,
+            from_me: fromMe,
+            content: body || (mediaUrl ? '[Mídia]' : ''),
+            media_url: mediaUrl,
+            message_type: type?.replace('Message', '') || 'text',
+            status: fromMe ? 'sent' : 'received',
+            lead_id: leadId,
+            created_at: new Date((msg.messageTimestamp || Date.now() / 1000) * 1000)
         });
 
     } catch (e) {
-        console.error("❌ [LISTENER] Erro processamento:", e);
+        console.error(`Erro process msg ${msg.key?.id}:`, e.message);
     }
 };
