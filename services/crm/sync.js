@@ -176,7 +176,20 @@ export const upsertMessage = async (msgData) => {
     }
 };
 
-// Funções utilitárias mantidas para compatibilidade
+// ==============================================================================
+// FUNÇÕES DE COMPATIBILIDADE (CORREÇÃO DO ERRO DE DEPLOY)
+// ==============================================================================
+
+// ESTA FUNÇÃO É OBRIGATÓRIA PARA NÃO QUEBRAR O WHATSAPPCONTROLLER.JS
+export const savePollVote = async (msg, companyId) => {
+    try {
+        // Placeholder: Se você não usa enquetes agora, pode deixar vazio.
+        // A função precisa existir para o 'import' funcionar.
+    } catch (e) {
+        logger.error({ err: e.message }, 'Erro savePollVote');
+    }
+};
+
 export const deleteSessionData = async (sessionId) => {
     await supabase.from('instances').update({ status: 'disconnected' }).eq('session_id', sessionId);
     await supabase.from('baileys_auth_state').delete().eq('session_id', sessionId);
