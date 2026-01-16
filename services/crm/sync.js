@@ -6,7 +6,7 @@ import pino from "pino";
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'error' });
 
-// Cache simples mantido, mas vamos ignorá-lo na lógica crítica abaixo
+// Cache removido da lógica crítica para garantir salvamento
 const contactCache = new Set();
 const leadLock = new Set(); // Mutex para evitar duplicidade na criação de leads
 
@@ -52,13 +52,12 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         const cleanJid = jid.split('@')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
         const phone = cleanJid.split('@')[0];
         
-        // --- ALTERAÇÃO 1: CACHE DESATIVADO PARA FORÇAR SALVAMENTO ---
-        // Comentamos a verificação de cache para garantir que o contato SEMPRE tente ser salvo/atualizado
+        // --- CACHE DESATIVADO PARA FORÇAR SALVAMENTO ---
+        // Comentado para garantir que o contato SEMPRE tente ser salvo/atualizado
         // const cacheKey = `${companyId}:${cleanJid}`;
         // if (contactCache.has(cacheKey) && !pushName && !profilePicUrl) return;
 
         // 1. Busca dados atuais para decidir a prioridade do nome
-        // Usamos maybeSingle para não dar erro se não existir
         const { data: current } = await supabase
             .from('contacts')
             .select('name, push_name, profile_pic_url')
@@ -70,7 +69,10 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
             jid: cleanJid,
             phone: phone,
             company_id: companyId,
-            updated_at: new Date()
+            updated_at: new Date(),
+            // --- CORREÇÃO IMPORTANTE: Atualiza a data da última interação ---
+            // Isso garante que o contato suba para o topo do Sidebar
+            last_message_at: new Date() 
         };
 
         // --- LÓGICA DE PRIORIDADE DE NOME ---
@@ -85,7 +87,7 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
                 updateData.name = pushName;
             } else {
                 // Cenário 3: Já tem um nome bom definido manualmente -> IGNORA o PushName no campo 'name'
-                // Mantém o nome que estava no banco (para não perder edição manual)
+                // Mantém o nome que estava no banco
             }
         }
 
@@ -94,15 +96,10 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         }
 
         // Realiza o Upsert no Supabase
-        // Adicionamos um tratamento extra de erro aqui
         const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
 
         if (error) {
-            // Loga erro mas não para o fluxo
             console.error('[CONTACT SYNC ERROR]', error.message);
-        } else {
-            // Adiciona ao cache só depois de salvar com sucesso
-            // contactCache.add(cacheKey); 
         }
 
     } catch (e) {
@@ -171,10 +168,9 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
  */
 export const upsertMessage = async (msgData) => {
     try {
-        // --- ALTERAÇÃO 2: DELAY ARTIFICIAL PARA FREAR O DOWNLOAD ---
-        // Isso dá tempo ao Baileys para resolver nomes de contatos antes de salvar a próxima mensagem.
-        // 150ms de pausa a cada mensagem.
-        await new Promise(resolve => setTimeout(resolve, 150));
+        // --- DELAY AUMENTADO PARA 300ms ---
+        // 150ms pode ser pouco. 300ms garante que o nome do contato chegue antes.
+        await new Promise(resolve => setTimeout(resolve, 300));
 
         const { error } = await supabase.from('messages').upsert(msgData, { 
             onConflict: 'remote_jid, whatsapp_id' 
@@ -186,14 +182,12 @@ export const upsertMessage = async (msgData) => {
 };
 
 // ==============================================================================
-// FUNÇÕES DE COMPATIBILIDADE (CORREÇÃO DO ERRO DE DEPLOY)
+// FUNÇÕES DE COMPATIBILIDADE
 // ==============================================================================
 
-// ESTA FUNÇÃO É OBRIGATÓRIA PARA NÃO QUEBRAR O WHATSAPPCONTROLLER.JS
 export const savePollVote = async (msg, companyId) => {
     try {
-        // Placeholder: Se você não usa enquetes agora, pode deixar vazio.
-        // A função precisa existir para o 'import' funcionar.
+        // Placeholder
     } catch (e) {
         logger.error({ err: e.message }, 'Erro savePollVote');
     }
