@@ -6,7 +6,7 @@ import pino from "pino";
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'error' });
 
-// Cache simples para evitar spam de chamadas ao banco
+// Cache simples mantido, mas vamos ignorá-lo na lógica crítica abaixo
 const contactCache = new Set();
 const leadLock = new Set(); // Mutex para evitar duplicidade na criação de leads
 
@@ -52,12 +52,13 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         const cleanJid = jid.split('@')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
         const phone = cleanJid.split('@')[0];
         
-        const cacheKey = `${companyId}:${cleanJid}`;
-        
-        // Otimização: Se já processamos esse contato nos últimos minutos e não tem dados novos, ignora
-        if (contactCache.has(cacheKey) && !pushName && !profilePicUrl) return;
+        // --- ALTERAÇÃO 1: CACHE DESATIVADO PARA FORÇAR SALVAMENTO ---
+        // Comentamos a verificação de cache para garantir que o contato SEMPRE tente ser salvo/atualizado
+        // const cacheKey = `${companyId}:${cleanJid}`;
+        // if (contactCache.has(cacheKey) && !pushName && !profilePicUrl) return;
 
         // 1. Busca dados atuais para decidir a prioridade do nome
+        // Usamos maybeSingle para não dar erro se não existir
         const { data: current } = await supabase
             .from('contacts')
             .select('name, push_name, profile_pic_url')
@@ -84,7 +85,7 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
                 updateData.name = pushName;
             } else {
                 // Cenário 3: Já tem um nome bom definido manualmente -> IGNORA o PushName no campo 'name'
-                // Mantém o nome que estava no banco
+                // Mantém o nome que estava no banco (para não perder edição manual)
             }
         }
 
@@ -93,12 +94,15 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         }
 
         // Realiza o Upsert no Supabase
-        const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'jid' });
+        // Adicionamos um tratamento extra de erro aqui
+        const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
 
-        if (!error) {
-            contactCache.add(cacheKey);
-            // Limpa do cache em 5 minutos para permitir futuras atualizações
-            setTimeout(() => contactCache.delete(cacheKey), 5 * 60 * 1000);
+        if (error) {
+            // Loga erro mas não para o fluxo
+            console.error('[CONTACT SYNC ERROR]', error.message);
+        } else {
+            // Adiciona ao cache só depois de salvar com sucesso
+            // contactCache.add(cacheKey); 
         }
 
     } catch (e) {
@@ -167,6 +171,11 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
  */
 export const upsertMessage = async (msgData) => {
     try {
+        // --- ALTERAÇÃO 2: DELAY ARTIFICIAL PARA FREAR O DOWNLOAD ---
+        // Isso dá tempo ao Baileys para resolver nomes de contatos antes de salvar a próxima mensagem.
+        // 150ms de pausa a cada mensagem.
+        await new Promise(resolve => setTimeout(resolve, 150));
+
         const { error } = await supabase.from('messages').upsert(msgData, { 
             onConflict: 'remote_jid, whatsapp_id' 
         });
