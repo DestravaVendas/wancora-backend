@@ -1,26 +1,32 @@
-import IORedis from 'ioredis';
-import pino from 'pino';
 
-const logger = pino({ level: 'info' });
+import Redis from 'ioredis';
 
-let client;
+let redisClient;
 
-function getRedisClient() {
-    if (!client) {
-        if (!process.env.REDIS_URL) {
-            logger.error('FATAL: REDIS_URL não definida.');
-            process.exit(1); 
-        }
-
-        client = new IORedis(process.env.REDIS_URL, {
+const getRedisClient = () => {
+    if (!redisClient) {
+        const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+        
+        console.log(`🔌 Conectando ao Redis: ${redisUrl.replace(/:[^:]*@/, ':***@')}`); // Oculta senha no log
+        
+        redisClient = new Redis(redisUrl, {
             maxRetriesPerRequest: null, // Obrigatório para BullMQ
-            enableReadyCheck: false
+            enableReadyCheck: false,
+            retryStrategy(times) {
+                const delay = Math.min(times * 50, 2000);
+                return delay;
+            },
         });
 
-        client.on('error', (err) => logger.error({ err }, 'Erro Redis'));
-        client.on('connect', () => logger.info('✅ Redis Conectado (Singleton)'));
+        redisClient.on('error', (err) => {
+            console.error('❌ Erro Redis:', err.message);
+        });
+
+        redisClient.on('connect', () => {
+            console.log('✅ Redis conectado!');
+        });
     }
-    return client;
-}
+    return redisClient;
+};
 
 export default getRedisClient;

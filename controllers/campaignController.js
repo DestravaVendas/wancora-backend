@@ -1,3 +1,4 @@
+
 import { createClient } from "@supabase/supabase-js";
 import { dispatchCampaign } from "../workers/campaignQueue.js";
 
@@ -30,7 +31,7 @@ export const createCampaign = async (req, res) => {
         // 2. Busca Leads (Com filtro de Tags)
         let query = supabase
             .from('leads')
-            .select('id, contact_jid, phone, name, tags')
+            .select('id, phone, name, tags')
             .eq('company_id', companyId);
 
         if (selectedTags && selectedTags.length > 0) {
@@ -43,11 +44,11 @@ export const createCampaign = async (req, res) => {
 
         // 3. Sanitiza Lista
         const validLeads = leads
-            .filter(l => l.contact_jid || l.phone)
+            .filter(l => l.phone && l.phone.length > 8)
             .map(l => ({
                 id: l.id,
                 name: l.name || 'Cliente',
-                phone: (l.contact_jid || l.phone).replace('@s.whatsapp.net', '') 
+                phone: l.phone.replace(/\D/g, '') // Garante apenas números
             }));
 
         if (validLeads.length === 0) {
@@ -66,6 +67,6 @@ export const createCampaign = async (req, res) => {
 
     } catch (error) {
         console.error("Erro campanha:", error);
-        res.status(500).json({ error: "Erro interno." });
+        res.status(500).json({ error: "Erro interno: " + error.message });
     }
 };

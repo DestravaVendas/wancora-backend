@@ -1,11 +1,19 @@
-// routes.js
+
 import express from "express";
-import * as whatsappController from "./controllers/whatsappController.js";
-import { createCampaign } from "./controllers/campaignController.js";
 import { createClient } from "@supabase/supabase-js";
 
+// Serviços Modulares
+import { startSession, deleteSession } from "./services/baileys/connection.js";
+import { sendMessage } from "./services/baileys/sender.js";
+
+// Controller de Campanhas (ATIVO)
+import { createCampaign } from "./controllers/campaignController.js"; 
+
 const router = express.Router();
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+    auth: { persistSession: false }
+});
 
 // ==============================================================================
 // 1. ROTAS DE SESSÃO
@@ -18,7 +26,8 @@ router.post("/session/start", async (req, res) => {
     return res.status(400).json({ error: "Dados incompletos (sessionId/companyId faltando)" });
   }
 
-  whatsappController.startSession(sessionId, companyId).catch(err => {
+  // Fire and forget: Não bloqueia a request esperando o QR Code
+  startSession(sessionId, companyId).catch(err => {
     console.error(`❌ Erro fatal ao iniciar sessão ${sessionId}:`, err);
   });
   
@@ -28,7 +37,13 @@ router.post("/session/start", async (req, res) => {
 router.post("/session/logout", async (req, res) => {
   const { sessionId, companyId } = req.body;
   try {
-    await whatsappController.deleteSession(sessionId, companyId);
+    await deleteSession(sessionId);
+    // Atualiza status no banco para desconectado
+    await supabase.from("instances")
+        .update({ status: 'disconnected', qrcode_url: null })
+        .eq('session_id', sessionId)
+        .eq('company_id', companyId);
+
     res.json({ message: "Sessão desconectada com sucesso." });
   } catch (error) {
     console.error("Erro no logout:", error);
@@ -39,17 +54,18 @@ router.post("/session/logout", async (req, res) => {
 router.get("/session/status/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const { data, error } = await supabase.from("instances").select("*").eq("session_id", sessionId).maybeSingle();
+  
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ status: "not_found" });
+  
   res.json(data);
 });
 
 // ==============================================================================
-// 2. ROTAS DE MENSAGEM (CORRIGIDA E EXPANDIDA)
+// 2. ROTAS DE MENSAGEM
 // ==============================================================================
 
 router.post("/message/send", async (req, res) => {
-  // Desestrutura TODOS os campos possíveis vindos do Frontend moderno
   const { 
       sessionId, 
       to, 
@@ -57,26 +73,26 @@ router.post("/message/send", async (req, res) => {
       type, 
       url, 
       caption, 
-      poll,      // Objeto JSON: { name, options, selectableOptionsCount }
-      location,  // Objeto JSON: { latitude, longitude }
-      contact,   // Objeto JSON: { displayName, vcard }
-      ptt,       // Boolean (para áudio)
-      mimetype,  // String (para doc/audio)
-      fileName,  // String (para doc)
+      poll,      
+      location,  
+      contact,   
+      ptt,       
+      mimetype,  
+      fileName,  
       companyId 
   } = req.body;
   
-  // Validação básica
   if (!sessionId || !to) {
       return res.status(400).json({ error: "SessionId e Destinatário (to) são obrigatórios" });
   }
 
   try {
-    // 1. Monta o Payload Unificado para o Controller
+    // 1. Payload Unificado
     const payload = {
+        sessionId,
+        to,
         type: type || 'text',
-        content: text,
-        text: text, // Fallback
+        content: text, // Service espera 'content'
         url: url,
         caption: caption,
         poll: poll,
@@ -87,39 +103,45 @@ router.post("/message/send", async (req, res) => {
         fileName: fileName
     };
 
-    // 2. Envia via Controller (Baileys)
-    const sentMsg = await whatsappController.sendMessage(sessionId, to, payload);
+    // 2. Envio (Baileys)
+    const sentMsg = await sendMessage(payload);
     
-    // 3. Salva no Banco (Para manter histórico de saída)
-    if (companyId) {
-        const remoteJid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-        const phone = to.split('@')[0];
+    // 3. Salvamento Manual (Log Otimista/Idempotente)
+    // Usamos UPSERT aqui. Se o listener do Baileys já tiver salvado, atualizamos. Se não, inserimos.
+    // Isso evita o erro "duplicate key value violates unique constraint" em condições de corrida.
+    if (companyId && sentMsg?.key) {
+        const remoteJid = to.includes('@') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`;
+        const phone = remoteJid.split('@')[0];
         
+        // Tenta vincular ao Lead se existir (mas não cria lead aqui, deixa o sync cuidar disso)
         let leadId = null;
         const { data: lead } = await supabase.from("leads").select("id").eq("phone", phone).eq("company_id", companyId).maybeSingle();
         if (lead) leadId = lead.id;
 
-        // Formata o conteúdo visual para o banco
+        // Formatação visual do conteúdo para o banco
         let displayContent = text || caption || `[${payload.type}]`;
         
-        // Garante a serialização correta para tipos complexos
         if (payload.type === 'poll' && poll) displayContent = JSON.stringify(poll);
         else if (payload.type === 'location' && location) displayContent = JSON.stringify(location);
         else if (payload.type === 'contact' && contact) displayContent = JSON.stringify(contact);
-        else if (payload.type === 'pix') displayContent = text; // Pix é tratado como texto no front
+        else if (payload.type === 'pix') displayContent = text; 
 
-        await supabase.from("messages").insert({
+        // CRÍTICO: Upsert baseado na constraint (remote_jid, whatsapp_id)
+        await supabase.from("messages").upsert({
             company_id: companyId,
             lead_id: leadId,
             session_id: sessionId,
             remote_jid: remoteJid,
-            whatsapp_id: sentMsg?.key?.id || `sent-${Date.now()}`,
+            whatsapp_id: sentMsg.key.id,
             from_me: true,
-            message_type: payload.type, // Salva o tipo correto no banco
+            message_type: payload.type,
             content: displayContent,
-            media_url: url, // Salva URL se houver
-            status: "sent",
+            media_url: url,
+            status: "sent", // Assume sent, listener atualiza para delivered/read depois
             created_at: new Date()
+        }, { 
+            onConflict: 'remote_jid, whatsapp_id',
+            ignoreDuplicates: false // Atualiza se existir
         });
     }
 
@@ -127,9 +149,13 @@ router.post("/message/send", async (req, res) => {
 
   } catch (error) {
     console.error("❌ Erro ao enviar mensagem:", error);
-    res.status(500).json({ error: "Falha no envio: " + error.message });
+    res.status(500).json({ error: "Falha no envio: " + (error.message || error) });
   }
 });
+
+// ==============================================================================
+// 3. ROTAS DE CAMPANHA
+// ==============================================================================
 
 router.post("/campaigns/send", createCampaign);
 
