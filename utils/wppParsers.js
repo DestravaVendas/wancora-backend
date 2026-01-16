@@ -78,3 +78,25 @@ export const getMessageType = (msg) => {
 
     return 'text';
 };
+
+// --- NOVO: Extrai Votos de Enquete (Poll Update) ---
+export const parsePollUpdate = (update) => {
+    try {
+        const { vote } = update;
+        if (!vote) return null;
+        
+        const voterJid = update.key.participant || update.key.remoteJid;
+        
+        // Baileys retorna os hashes das opções selecionadas.
+        const selectedOptions = vote.selectedOptions || [];
+        
+        return {
+            pollId: update.key.id,
+            voterJid: voterJid,
+            selectedHashes: selectedOptions.map(opt => opt.toString('hex'))
+        };
+    } catch (e) {
+        console.error("Erro parsePollUpdate:", e);
+        return null;
+    }
+};
