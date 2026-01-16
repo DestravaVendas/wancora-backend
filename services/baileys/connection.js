@@ -1,7 +1,7 @@
 
 import makeWASocket, { fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import pino from 'pino';
-import { useSupabaseAuthState } from './auth.js';
+import { useSupabaseAuthState } from '../../auth/supabaseAuth.js';
 import { setupListeners } from './listener.js';
 import { deleteSessionData, updateInstance, updateSyncStatus } from '../crm/sync.js'; // Adicionado updateSyncStatus
 
