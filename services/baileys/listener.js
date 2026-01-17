@@ -16,6 +16,13 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const logger = pino({ level: 'silent' });
 
 // --- Helpers Internos ---
+
+// [CORREÇÃO] Remove sufixos de dispositivo (ex: :2@s.whatsapp.net -> @s.whatsapp.net)
+const cleanJid = (jid) => {
+    if (!jid) return null;
+    return jid.split(':')[0].split('@')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
+};
+
 const unwrapMessage = (msg) => {
     if (!msg.message) return msg;
     let content = msg.message;
@@ -47,46 +54,42 @@ const getBody = (msg) => {
 // ==============================================================================
 export const setupListeners = ({ sock, sessionId, companyId }) => {
 
-    // --- 1. EVENTO: HISTÓRICO INTELIGENTE (SYNC INICIAL) ---
+    // --- 1. HISTÓRICO INTELIGENTE ---
     sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
-        console.log(`📚 [HISTÓRICO] Pacote recebido. Iniciando processamento LENTO para garantir nomes...`);
+        console.log(`📚 [HISTÓRICO] Recebido. Processando ${contacts.length} contatos e ${messages.length} msgs.`);
         
         await updateSyncStatus(sessionId, 'syncing', 0);
 
-        // --- MAPA DE NOMES (O SEGREDO PARA RECUPERAR NOMES PERDIDOS) ---
-        // Cria um dicionário rápido: ID -> Nome
+        // --- MAPA DE NOMES (NAME MAP) ---
+        // Prepara um dicionário robusto para buscar nomes perdidos
         const contactsMap = new Map();
         if (contacts) {
             contacts.forEach(c => {
-                // Tenta pegar qualquer nome disponível no objeto bruto
-                const bestName = c.notify || c.name || c.verifiedName;
-                if (bestName) contactsMap.set(c.id, bestName);
+                const bestName = c.notify || c.name || c.verifiedName || c.short;
+                if (bestName) {
+                    // Mapeia o ID original E o ID limpo
+                    contactsMap.set(c.id, bestName);
+                    contactsMap.set(cleanJid(c.id), bestName);
+                }
             });
         }
 
-        // A. Salva Contatos Individuais (Baseado na lista inicial)
+        // A. Salva Contatos da Lista (Iteração Lenta)
         const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
-        if (validContacts.length > 0) {
-            for (const c of validContacts) {
-                // Se achou no mapa, usa. Se não, tenta salvar null para garantir que o contato exista.
-                const nameToSave = contactsMap.get(c.id) || null;
-                await upsertContact(c.id, companyId, nameToSave);
-            }
+        for (const c of validContacts) {
+            // Tenta achar o nome no próprio objeto ou no mapa
+            const nameToSave = c.notify || c.name || contactsMap.get(c.id) || contactsMap.get(cleanJid(c.id));
+            await upsertContact(c.id, companyId, nameToSave || null);
         }
 
-        // B. Salva Nomes de Grupos (ESSENCIAL)
+        // B. Grupos
         try {
             const groups = await sock.groupFetchAllParticipating();
             const groupList = Object.values(groups);
-            if (groupList.length > 0) {
-                console.log(`👥 [GRUPOS] Buscando nomes de ${groupList.length} grupos...`);
-                for (const g of groupList) {
-                    await upsertContact(g.id, companyId, g.subject, null);
-                }
+            for (const g of groupList) {
+                await upsertContact(g.id, companyId, g.subject, null);
             }
-        } catch (e) {
-            console.warn('⚠️ Falha ao buscar grupos:', e.message);
-        }
+        } catch (e) {}
 
         // C. Filtros de Mensagens
         const MAX_CHATS = 50;            
@@ -107,7 +110,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         });
 
         const topChats = sortedChats.slice(0, MAX_CHATS);
-        
         let finalMessagesToProcess = [];
         topChats.forEach(([jid, msgs]) => {
             msgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
@@ -116,35 +118,31 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         });
 
         const totalMsgs = finalMessagesToProcess.length;
-        console.log(`🧠 [FILTRO] ${totalMsgs} mensagens selecionadas para importação sequencial.`);
+        console.log(`🧠 [FILTRO] ${totalMsgs} mensagens selecionadas para Sync Sequencial.`);
 
-        // D. PROCESSAMENTO SEQUENCIAL (MODO LENTO)
-        // Removemos o Promise.all para obrigar o sistema a esperar o delay de cada mensagem
+        // D. PROCESSAMENTO SEQUENCIAL (LENTO + NAME HUNTER)
         let processedCount = 0;
         
         for (const msg of finalMessagesToProcess) {
-            // Passamos o contactsMap para ajudar a achar o nome se a mensagem não tiver
+            // Passamos o contactsMap para o processador tentar achar nomes perdidos
             await processSingleMessage(msg, sock, companyId, sessionId, false, contactsMap);
             
             processedCount++;
             
-            // Atualiza status a cada 5 mensagens
             if (processedCount % 5 === 0) {
                 const percent = Math.round((processedCount / totalMsgs) * 100);
-                console.log(`🔄 [SYNC LENTO] ${percent}% (${processedCount}/${totalMsgs})`);
+                // Esse update no banco DEVE disparar o Realtime no frontend (se o SQL estiver rodado)
                 await updateSyncStatus(sessionId, 'syncing', percent);
             }
         }
 
         await updateSyncStatus(sessionId, 'online', 100);
-        console.log(`✅ [HISTÓRICO] Sincronização concluída.`);
+        console.log(`✅ [HISTÓRICO] Concluído.`);
     });
 
-    // --- 2. EVENTOS EM TEMPO REAL ---
+    // --- Eventos Realtime ---
     sock.ev.on('groups.update', async (groups) => {
-        for (const g of groups) {
-            if (g.subject) await upsertContact(g.id, companyId, g.subject);
-        }
+        for (const g of groups) if (g.subject) await upsertContact(g.id, companyId, g.subject);
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -158,15 +156,14 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
     sock.ev.on('contacts.upsert', async (contacts) => {
         for (const c of contacts) {
-            const bestName = c.notify || c.name || c.verifiedName || null;
-            // Só salva se tiver nome novo, ou se for imagem
-            await upsertContact(c.id, companyId, bestName, c.imgUrl || null);
+            const bestName = c.notify || c.name || c.verifiedName;
+            await upsertContact(c.id, companyId, bestName || null, c.imgUrl || null);
         }
     });
 };
 
 // ==============================================================================
-// PROCESSADOR UNITÁRIO (NAME HUNTER ATIVADO)
+// PROCESSADOR UNITÁRIO COM BUSCA INTELIGENTE DE NOMES
 // ==============================================================================
 const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime, contactsMap = null) => {
     try {
@@ -176,16 +173,20 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
         const fromMe = msg.key.fromMe;
         
-        // --- LÓGICA DE CAÇA AO NOME (PRIORIDADES) ---
-        // 1. Tenta pegar da própria mensagem (PushName - o mais confiável para não salvos)
-        // 2. Se não tiver, tenta pegar do contactsMap (Dicionário inicial)
+        // --- NAME HUNTER ---
         let finalName = msg.pushName;
 
-        if (!finalName && contactsMap && contactsMap.has(jid)) {
-            finalName = contactsMap.get(jid);
+        // Se a mensagem não tem pushName, tentamos o Mapa usando IDs limpos
+        if (!finalName && contactsMap) {
+            const clean = cleanJid(jid);
+            if (contactsMap.has(jid)) {
+                finalName = contactsMap.get(jid);
+            } else if (contactsMap.has(clean)) {
+                finalName = contactsMap.get(clean);
+            }
         }
 
-        // Se achou um nome, salva com prioridade. Se não, salva null (só o número)
+        // Tenta salvar com o melhor nome que achamos
         await upsertContact(jid, companyId, finalName);
         
         const type = getContentType(msg.message);
@@ -209,12 +210,10 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
                 else if (msg.message.videoMessage) mimeType = 'video/mp4';
                 else if (msg.message.stickerMessage) mimeType = 'image/webp';
                 else if (msg.message.documentMessage) mimeType = msg.message.documentMessage.mimetype;
-                
                 mediaUrl = await uploadMedia(buffer, mimeType);
             } catch (e) {}
         }
 
-        // Salva a mensagem (O delay do sync.js acontece aqui dentro)
         await upsertMessage({
             company_id: companyId,
             session_id: sessionId,
