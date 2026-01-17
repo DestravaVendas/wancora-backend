@@ -30,19 +30,28 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
 
 /**
  * Verifica se um nome parece ser apenas um número de telefone ou genérico
- * Retorna TRUE se for um nome "ruim" (que podemos substituir)
+ * Retorna TRUE se for um nome "ruim" (que DEVEMOS substituir)
  */
 const isGenericName = (name, phone) => {
-    if (!name) return true;
-    const cleanName = name.replace(/\D/g, ''); // Remove tudo que não é número
+    if (!name) return true; // Se não tem nome, é ruim.
+    
+    // Limpeza para comparação
+    const cleanName = name.replace(/\D/g, ''); 
     const cleanPhone = phone.replace(/\D/g, '');
     
-    // Se o nome for igual ao telefone, ou conter o telefone, é genérico
-    return cleanName.includes(cleanPhone) || name === phone || name.startsWith('+');
+    // Critérios de nome ruim (Agressivo):
+    // 1. O nome contém o número de telefone
+    // 2. O nome é igual ao telefone formatado
+    // 3. O nome começa com '+' (indicativo de número internacional salvo sem nome)
+    // 4. O nome tem mais de 6 dígitos numéricos (provavelmente é um ID ou número solto)
+    return cleanName.includes(cleanPhone) || 
+           name === phone || 
+           name.startsWith('+') || 
+           (cleanName.length > 6 && /[0-9]{5,}/.test(name));
 };
 
 /**
- * Upsert Inteligente de Contato (Com Proteção de Nome - Build Arquiteto)
+ * Upsert Inteligente de Contato (MODO AGRESSIVO)
  */
 export const upsertContact = async (jid, companyId, pushName = null, profilePicUrl = null) => {
     try {
@@ -52,11 +61,6 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         const cleanJid = jid.split('@')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
         const phone = cleanJid.split('@')[0];
         
-        // --- CACHE DESATIVADO PARA FORÇAR SALVAMENTO ---
-        // Comentado para garantir que o contato SEMPRE tente ser salvo/atualizado
-        // const cacheKey = `${companyId}:${cleanJid}`;
-        // if (contactCache.has(cacheKey) && !pushName && !profilePicUrl) return;
-
         // 1. Busca dados atuais para decidir a prioridade do nome
         const { data: current } = await supabase
             .from('contacts')
@@ -70,25 +74,30 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
             phone: phone,
             company_id: companyId,
             updated_at: new Date(),
-            // --- CORREÇÃO IMPORTANTE: Atualiza a data da última interação ---
-            // Isso garante que o contato suba para o topo do Sidebar
-            last_message_at: new Date() 
+            last_message_at: new Date() // Garante topo do sidebar
         };
 
-        // --- LÓGICA DE PRIORIDADE DE NOME ---
-        if (pushName) {
+        // --- LÓGICA DE PRIORIDADE DE NOME (AGRESSIVA) ---
+        if (pushName && pushName.trim().length > 0) {
+            // Sempre atualiza o push_name no banco para termos o dado bruto
             updateData.push_name = pushName;
             
-            if (!current || !current.name) {
-                // Cenário 1: Contato novo ou sem nome -> Aceita o PushName
+            const currentName = current?.name;
+            
+            // Decisão: Devemos sobrescrever o nome principal 'name'?
+            // Sim, SE:
+            // 1. Não existe registro (current é null)
+            // 2. O nome atual é vazio
+            // 3. O nome atual é "genérico" (parece número)
+            const isCurrentBad = !current || !currentName || isGenericName(currentName, phone);
+
+            if (isCurrentBad) {
                 updateData.name = pushName;
-            } else if (isGenericName(current.name, phone)) {
-                // Cenário 2: Nome atual é ruim (é o número) -> Aceita o PushName melhor
-                updateData.name = pushName;
-            } else {
-                // Cenário 3: Já tem um nome bom definido manualmente -> IGNORA o PushName no campo 'name'
-                // Mantém o nome que estava no banco
+                // console.log(`[NOMES] Atualizando: ${phone} -> ${pushName}`); // Log opcional
             }
+        } else if (!current) {
+            // Se é contato novo e não veio nome nenhum, usa o número formatado como fallback
+            updateData.name = `+${phone}`;
         }
 
         if (profilePicUrl) {
@@ -169,7 +178,7 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
 export const upsertMessage = async (msgData) => {
     try {
         // --- DELAY AUMENTADO PARA 300ms ---
-        // 150ms pode ser pouco. 300ms garante que o nome do contato chegue antes.
+        // Essencial para dar tempo do upsertContact rodar antes da mensagem ser salva
         await new Promise(resolve => setTimeout(resolve, 300));
 
         const { error } = await supabase.from('messages').upsert(msgData, { 
