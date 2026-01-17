@@ -6,7 +6,7 @@ import pino from "pino";
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'error' });
 
-// Cache removido da lógica crítica para garantir salvamento
+// Cache removido da lógica crítica para garantir salvamento agressivo
 const contactCache = new Set();
 const leadLock = new Set(); // Mutex para evitar duplicidade na criação de leads
 
@@ -29,8 +29,8 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
 };
 
 /**
- * Verifica se um nome parece ser apenas um número de telefone ou genérico
- * Retorna TRUE se for um nome "ruim" (que DEVEMOS substituir)
+ * Verifica se um nome parece ser apenas um número de telefone ou genérico.
+ * Retorna TRUE se for um nome "ruim" (que DEVEMOS substituir).
  */
 const isGenericName = (name, phone) => {
     if (!name) return true; // Se não tem nome, é ruim.
@@ -40,18 +40,18 @@ const isGenericName = (name, phone) => {
     const cleanPhone = phone.replace(/\D/g, '');
     
     // Critérios de nome ruim (Agressivo):
-    // 1. O nome contém o número de telefone
+    // 1. O nome contém o número de telefone (ex: "551199..." contém "1199...")
     // 2. O nome é igual ao telefone formatado
     // 3. O nome começa com '+' (indicativo de número internacional salvo sem nome)
-    // 4. O nome tem mais de 6 dígitos numéricos (provavelmente é um ID ou número solto)
+    // 4. O nome tem mais de 7 dígitos numéricos consecutivos (provavelmente é um ID ou número solto)
     return cleanName.includes(cleanPhone) || 
            name === phone || 
            name.startsWith('+') || 
-           (cleanName.length > 6 && /[0-9]{5,}/.test(name));
+           (cleanName.length > 7 && /[0-9]{5,}/.test(name));
 };
 
 /**
- * Upsert Inteligente de Contato (MODO AGRESSIVO)
+ * Upsert Inteligente de Contato (MODO AGRESSIVO DE NOMES)
  */
 export const upsertContact = async (jid, companyId, pushName = null, profilePicUrl = null) => {
     try {
@@ -78,8 +78,9 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         };
 
         // --- LÓGICA DE PRIORIDADE DE NOME (AGRESSIVA) ---
+        // Se temos um PushName válido (não vazio)...
         if (pushName && pushName.trim().length > 0) {
-            // Sempre atualiza o push_name no banco para termos o dado bruto
+            // Sempre salvamos o push_name bruto para referência
             updateData.push_name = pushName;
             
             const currentName = current?.name;
@@ -87,13 +88,13 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
             // Decisão: Devemos sobrescrever o nome principal 'name'?
             // Sim, SE:
             // 1. Não existe registro (current é null)
-            // 2. O nome atual é vazio
-            // 3. O nome atual é "genérico" (parece número)
+            // 2. O nome atual é vazio/nulo
+            // 3. O nome atual é "genérico" (parece número, começa com +, etc)
             const isCurrentBad = !current || !currentName || isGenericName(currentName, phone);
 
             if (isCurrentBad) {
                 updateData.name = pushName;
-                // console.log(`[NOMES] Atualizando: ${phone} -> ${pushName}`); // Log opcional
+                // console.log(`[NOMES] Atualizando agressivamente: ${phone} -> ${pushName}`); 
             }
         } else if (!current) {
             // Se é contato novo e não veio nome nenhum, usa o número formatado como fallback
