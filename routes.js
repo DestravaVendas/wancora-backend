@@ -1,6 +1,7 @@
 
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
+import { sendAppointmentConfirmation } from './controllers/appointmentController.js';
 
 // Serviços Modulares
 import { startSession, deleteSession } from "./services/baileys/connection.js";
@@ -175,5 +176,8 @@ router.post("/message/vote", async (req, res) => {
 // ==============================================================================
 
 router.post("/campaigns/send", createCampaign);
+
+// --- MÓDULO AGENDAMENTO ---
+router.post('/appointments/confirm', sendAppointmentConfirmation);
 
 export default router;
