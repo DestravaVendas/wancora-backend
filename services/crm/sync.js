@@ -40,10 +40,6 @@ const isGenericName = (name, phone) => {
     const cleanPhone = phone.replace(/\D/g, '');
     
     // Critérios de nome ruim (Agressivo):
-    // 1. O nome contém o número de telefone (ex: "551199..." contém "1199...")
-    // 2. O nome é igual ao telefone formatado
-    // 3. O nome começa com '+' (indicativo de número internacional salvo sem nome)
-    // 4. O nome tem mais de 7 dígitos numéricos consecutivos (provavelmente é um ID ou número solto)
     return cleanName.includes(cleanPhone) || 
            name === phone || 
            name.startsWith('+') || 
@@ -51,7 +47,7 @@ const isGenericName = (name, phone) => {
 };
 
 /**
- * Upsert Inteligente de Contato (MODO AGRESSIVO DE NOMES)
+ * Upsert Inteligente de Contato (MODO AGRESSIVO + PROPAGAÇÃO PARA LEADS)
  */
 export const upsertContact = async (jid, companyId, pushName = null, profilePicUrl = null) => {
     try {
@@ -77,39 +73,45 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
             last_message_at: new Date() // Garante topo do sidebar
         };
 
+        let finalName = current?.name;
+        let shouldUpdateLead = false;
+
         // --- LÓGICA DE PRIORIDADE DE NOME (AGRESSIVA) ---
-        // Se temos um PushName válido (não vazio)...
         if (pushName && pushName.trim().length > 0) {
-            // Sempre salvamos o push_name bruto para referência
             updateData.push_name = pushName;
             
             const currentName = current?.name;
-            
-            // Decisão: Devemos sobrescrever o nome principal 'name'?
-            // Sim, SE:
-            // 1. Não existe registro (current é null)
-            // 2. O nome atual é vazio/nulo
-            // 3. O nome atual é "genérico" (parece número, começa com +, etc)
             const isCurrentBad = !current || !currentName || isGenericName(currentName, phone);
 
             if (isCurrentBad) {
                 updateData.name = pushName;
-                // console.log(`[NOMES] Atualizando agressivamente: ${phone} -> ${pushName}`); 
+                finalName = pushName;    // Capturamos o nome novo
+                shouldUpdateLead = true; // Sinalizamos para atualizar o lead também
             }
         } else if (!current) {
             // Se é contato novo e não veio nome nenhum, usa o número formatado como fallback
             updateData.name = `+${phone}`;
+            finalName = `+${phone}`;
         }
 
         if (profilePicUrl) {
             updateData.profile_pic_url = profilePicUrl;
         }
 
-        // Realiza o Upsert no Supabase
+        // 2. Realiza o Upsert no Contato
         const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
 
         if (error) {
             console.error('[CONTACT SYNC ERROR]', error.message);
+        } else if (shouldUpdateLead && finalName && !isGroup) {
+            // --- 3. PROPAGAÇÃO PARA LEADS (A PEÇA QUE FALTAVA) ---
+            // Se descobrimos um nome novo e não é grupo, atualizamos o Lead correspondente
+            // para que o Kanban e o Chat mostrem o nome real, não o número.
+            await supabase.from('leads')
+                .update({ name: finalName })
+                .eq('company_id', companyId)
+                .eq('phone', phone)
+                .neq('name', finalName); // Só atualiza se for diferente para economizar banco
         }
 
     } catch (e) {
@@ -136,12 +138,20 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         // Verifica se já existe
         const { data: existing } = await supabase
             .from('leads')
-            .select('id')
+            .select('id, name')
             .eq('phone', phone)
             .eq('company_id', companyId)
             .maybeSingle();
 
-        if (existing) return existing.id;
+        if (existing) {
+            // FIX: Se o lead já existe, mas o nome é genérico e agora temos um bom, atualiza!
+            if (pushName && isGenericName(existing.name, phone)) {
+                await supabase.from('leads')
+                    .update({ name: pushName })
+                    .eq('id', existing.id);
+            }
+            return existing.id;
+        }
 
         // Se não existe, cria
         const nameToUse = pushName || `+${phone}`;
