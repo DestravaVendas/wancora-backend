@@ -119,27 +119,22 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         const totalMsgs = finalMessagesToProcess.length;
         console.log(`🧠 [FILTRO] ${messagesByChat.size} chats totais -> Reduzido para ${topChats.length} chats. Total Msgs finais: ${totalMsgs}`);
 
-        // C. Processamento em Lotes (Chunks) com Log de Progresso
-        // Reduzimos para 5 para casar com o delay de 300ms do sync.js
-        const CHUNK_SIZE = 5; 
+// D. PROCESSAMENTO SEQUENCIAL (MODO LENTO - CRUCIAL PARA NOMES)
+        // Processamos uma mensagem de cada vez para o delay do sync.js funcionar
         let processedCount = 0;
-
-        for (let i = 0; i < finalMessagesToProcess.length; i += CHUNK_SIZE) {
-            const chunk = finalMessagesToProcess.slice(i, i + CHUNK_SIZE);
+        
+        for (const msg of finalMessagesToProcess) {
+            // O await aqui garante que esperamos os 300ms do sync.js ANTES de ir para a próxima
+            await processSingleMessage(msg, sock, companyId, sessionId, false);
             
-            // Processa o lote em paralelo. 'false' = Não baixa mídia antiga (economiza espaço)
-            await Promise.all(chunk.map(msg => processSingleMessage(msg, sock, companyId, sessionId, false)));
+            processedCount++;
             
-            processedCount += chunk.length;
-            
-            // Calcula Porcentagem
-            const percent = Math.round((processedCount / totalMsgs) * 100);
-            
-            // Log no Console
-            if (percent % 10 === 0) console.log(`🔄 [SYNC] ${percent}% processado (${processedCount}/${totalMsgs})`);
-            
-            // Atualiza Banco para o Frontend ler e mostrar o SVG circular
-            await updateSyncStatus(sessionId, 'syncing', percent);
+            // Atualiza status a cada 5 mensagens (para não travar o banco com updates excessivos)
+            if (processedCount % 5 === 0) {
+                const percent = Math.round((processedCount / totalMsgs) * 100);
+                console.log(`🔄 [SYNC LENTO] ${percent}% (${processedCount}/${totalMsgs}) - Extraindo nomes...`);
+                await updateSyncStatus(sessionId, 'syncing', percent);
+            }
         }
 
         // Finaliza: Marca como 100% e Online
