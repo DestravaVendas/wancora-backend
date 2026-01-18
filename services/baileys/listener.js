@@ -72,23 +72,21 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             // Força o frontend a mostrar a barra imediatamente
             await updateSyncStatus(sessionId, 'syncing', 1);
 
-            // --- MAPA DE NOMES (NAME HUNTER V3) ---
-            const contactsMap = new Map();
-            let namesCount = 0;
+           // --- MAPA DE NOMES (NAME HUNTER V3) ---
+           const contactsMap = new Map();
 
             if (contacts) {
-                contacts.forEach(c => {
-                    // Tenta achar nome em qualquer lugar
-                    // FILTRO: Só aceita se não for puramente numérico
-                    const bestName = c.notify || c.name || c.verifiedName || c.short;
-                    if (bestName && !/^\d+$/.test(bestName.replace(/\D/g, ''))) {
-                        // Mapeia ID original E ID limpo
-                        contactsMap.set(c.id, bestName);
-                        contactsMap.set(cleanJid(c.id), bestName);
-                        namesCount++;
-                    }
-                });
-            }
+            contacts.forEach(c => {
+           // Tenta achar nome em qualquer campo possível
+           const bestName = c.notify || c.name || c.verifiedName || c.short;
+        
+           // Só salva se NÃO for apenas números
+           if (bestName && !/^\d+$/.test(bestName.replace(/\D/g, ''))) {
+            contactsMap.set(c.id, bestName);
+            contactsMap.set(cleanJid(c.id), bestName); // Mapeia versão limpa também
+           }
+        });
+       }
             console.log(`🗺️ [MAPA] ${namesCount} nomes reais identificados na memória.`);
 
             // A. Salva Contatos da Lista (Garante que os nomes existam antes das msgs)
@@ -201,19 +199,17 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
         const fromMe = msg.key.fromMe;
         
-        // --- NAME HUNTER V3 (CORRIGIDO) ---
-        let finalName = msg.pushName;
+      // --- NAME HUNTER V3 (CORRIGIDO) ---
+      let finalName = msg.pushName;
 
-        // Se não veio na mensagem, tenta o mapa (usando ID limpo)
-        if (!finalName && contactsMap) {
-            const clean = cleanJid(jid);
-            // Tenta ID exato e ID limpo
-            finalName = contactsMap.get(jid) || contactsMap.get(clean);
-        }
+      // Se não veio na mensagem, tenta buscar no mapa de memória
+      if (!finalName && contactsMap) {
+       const clean = cleanJid(jid);
+       finalName = contactsMap.get(jid) || contactsMap.get(clean);
+      }
 
-        // Salva Contato (sync.js propaga para Leads)
-        // Se finalName ainda for nulo, upsertContact salvará NULL no nome, não o telefone.
-        await upsertContact(jid, companyId, finalName);
+      // Manda salvar no banco
+      await upsertContact(jid, companyId, finalName);
         
         // Fallback seguro para getContentType
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
