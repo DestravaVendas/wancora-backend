@@ -80,8 +80,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     // Tenta achar nome em qualquer campo possível
                     const bestName = c.notify || c.name || c.verifiedName || c.short;
                     
-                    // Só salva se NÃO for apenas números
-                    if (bestName && !/^\d+$/.test(bestName.replace(/\D/g, ''))) {
+                    // CORREÇÃO: Regex menos agressiva. 
+                    // Só ignora se o nome for ESTRITAMENTE números e símbolos (igual ao sync.js)
+                    // Antes: !/^\d+$/.test(bestName.replace(/\D/g, '')) -> Matava "Lanchonete 24h"
+                    if (bestName && !/^[\d\+\-\(\)\s]+$/.test(bestName)) {
                         // Mapeia ID original E ID limpo
                         contactsMap.set(c.id, bestName);
                         contactsMap.set(cleanJid(c.id), bestName); 
@@ -89,6 +91,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     }
                 });
             }
+            
             console.log(`🗺️ [MAPA] ${namesCount} nomes reais identificados na memória.`);
 
             // A. Salva Contatos da Lista (Garante que os nomes existam antes das msgs)
