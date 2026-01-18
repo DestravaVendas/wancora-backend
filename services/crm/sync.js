@@ -69,18 +69,15 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
             const currentName = current?.name;
             const isCurrentBad = !currentName || isGenericName(currentName, phone);
 
-            // Se o nome atual no banco for ruim, sobrescreve!
             if (isCurrentBad) {
                 updateData.name = pushName;
                 finalName = pushName;    
                 shouldUpdateLead = true; 
             }
         } else if (!current) {
-            // Contato novo sem nome? Manda NULL (Trigger do banco resolve).
             updateData.name = null; 
             finalName = null; 
         } else if (current && isGenericName(current.name, phone)) {
-            // Se já existe mas é número, limpa para NULL
             updateData.name = null;
         }
 
@@ -92,17 +89,14 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
 
         if (error) {
             console.error('[CONTACT SYNC ERROR]', error.message);
-           
         } else if (shouldUpdateLead && finalName && !isGroup) {
-        // CHAMA A FUNÇÃO BLINDADA DO SQL
-        // Ela só vai atualizar se o Lead estiver sem nome ou com nome de número.
-        // Se você renomeou o Lead manualmente, ela vai ignorar e manter o seu nome.
-        await supabase.rpc('update_lead_name_safely', {
-           p_company_id: companyId,
-           p_phone: phone,
-           p_new_name: finalName
-        });
-      }
+            // [ATUALIZAÇÃO SEGURA - CHAMADA RPC]
+            await supabase.rpc('update_lead_name_safely', {
+                p_company_id: companyId,
+                p_phone: phone,
+                p_new_name: finalName
+            });
+        }
     } catch (e) {
         logger.error({ err: e.message }, 'Erro upsertContact');
     }
