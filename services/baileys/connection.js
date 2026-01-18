@@ -92,28 +92,32 @@ export const startSession = async (sessionId, companyId) => {
             } catch(e) {}
         }
 
-        // 3. SE DESCONECTAR, TRATA RECONEXÃO
+      // 3. SE DESCONECTAR, TRATA RECONEXÃO
         if (connection === "close") {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+            // --- CORREÇÃO AQUI ---
+            // Adicionamos '&& statusCode !== 440' para reconhecer que 440 também é fatal
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 440 && statusCode !== 403;
             
             console.log(`[DESCONECTADO] Código: ${statusCode}. Reconectar? ${shouldReconnect}`);
             
             if (!shouldReconnect) {
-                // Logout real -> desconecta banco
+                // Se cair aqui (erros 401, 403 ou 440), entra no fluxo de limpeza
+                console.log(`⛔ Sessão invalidada definitivamente. Limpando dados...`);
+                
                 await updateInstance(sessionId, { status: "disconnected" });
-            }
 
-            if (shouldReconnect) {
-                handleReconnect(sessionId, companyId);
-            } else {
-                // Logout real (pelo celular) -> Limpa tudo
+                // Logout real -> Limpa tudo para permitir novo QR Code
                 await deleteSession(sessionId);
                 await deleteSessionData(sessionId);
+            } else {
+                // Se for queda de internet ou erro 500, tenta voltar
+                handleReconnect(sessionId, companyId);
             }
         }
     });
-
+    
     // Inicia os listeners de mensagens (listener.js)
     setupListeners({
         sock,
