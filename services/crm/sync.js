@@ -173,9 +173,8 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         }
 
         // Se não existe, cria
-        // Se não temos um nome real (pushName), usamos o número formatado APENAS aqui para o CRM não ficar vazio
-        // Mas a preferência é esperar um nome real.
-        const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : `Lead ${phone.slice(-4)}`;
+        // CORREÇÃO SOLICITADA: Nunca usar "Lead 9999". Prioriza PushName ou usa número formatado.
+        const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : `+${phone}`;
         
         // Busca a primeira etapa do funil (Pipeline) para colocar o lead novo
         const { data: stage } = await supabase
