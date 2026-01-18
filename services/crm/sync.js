@@ -2,7 +2,6 @@ import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
 // Inicializa o cliente Supabase
-// Garante que usa as variáveis de ambiente carregadas no server.js
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'error' });
 
@@ -12,10 +11,9 @@ const leadLock = new Set(); // Mutex para evitar duplicidade na criação de lea
 
 // --- FUNÇÃO AUXILIAR NECESSÁRIA PARA A LÓGICA ---
 // Verifica se um nome parece ser apenas um número de telefone ou genérico.
-// Helper que decide se o nome é bom ou ruim
 const isGenericName = (name, phone) => {
     if (!name) return true;
-    const cleanName = name.replace(/[^a-zA-Z0-9]/g, ''); 
+    const cleanName = name.replace(/[^a-zA-Z0-9]/g, '');
     const cleanPhone = phone.replace(/\D/g, '');
     
     // Regra: Se o nome só tem números e símbolos, ou contém o próprio telefone, é genérico.
@@ -27,10 +25,8 @@ const isGenericName = (name, phone) => {
            isJustNumbersAndSymbols ||
            (cleanName.length > 7 && /[0-9]{5,}/.test(name));
 };
-    
 
 // Atualiza o status da sincronização na tabela 'instances'
-// Isso permite que o Frontend mostre "Sincronizando 45%..."
 export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     try {
         await supabase.from('instances')
@@ -41,7 +37,7 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
             })
             .eq('session_id', sessionId);
     } catch (e) {
-        // Ignora erros de log para não travar o fluxo principal
+        // Ignora erros de log
     }
 };
 
@@ -74,23 +70,20 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         let shouldUpdateLead = false;
 
         // --- LÓGICA DE PRIORIDADE DE NOME (AGRESSIVA v2) ---
-      // --- LÓGICA DE PRIORIDADE DE NOME (AGRESSIVA v2) ---
         if (pushName && pushName.trim().length > 0 && !isGenericName(pushName, phone)) {
-              updateData.push_name = pushName;
-    
-        const currentName = current?.name;
-        // Se o nome atual for nulo ou for genérico (numero), substituímos pelo PushName
-        const isCurrentBad = !currentName || isGenericName(currentName, phone);
+            updateData.push_name = pushName;
+            
+            const currentName = current?.name;
+            // Se o nome atual for nulo ou for genérico (numero), substituímos pelo PushName
+            const isCurrentBad = !currentName || isGenericName(currentName, phone);
 
-         if (isCurrentBad) {
-          updateData.name = pushName; // <--- AQUI ELE SALVA O NOME REAL
-          finalName = pushName;    
-          shouldUpdateLead = true; 
-       }
-     }
+            if (isCurrentBad) {
+                updateData.name = pushName; // <--- AQUI ELE SALVA O NOME REAL
+                finalName = pushName;    
+                shouldUpdateLead = true; 
+            }
         } else if (!current) {
-            // CORREÇÃO CRÍTICA: Se é contato novo e não veio nome, NÃO usamos o telefone.
-            // Deixamos NULL. O Frontend tratará a exibição.
+            // Se é contato novo e não veio nome, deixa NULL.
             updateData.name = null; 
             finalName = null; 
         } else if (current && isGenericName(current.name, phone)) {
@@ -108,13 +101,12 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         if (error) {
             console.error('[CONTACT SYNC ERROR]', error.message);
         } else if (shouldUpdateLead && finalName && !isGroup) {
-            // --- 3. PROPAGAÇÃO PARA LEADS (A PEÇA QUE FALTAVA) ---
-            // Se descobrimos um nome novo e não é grupo, atualizamos o Lead correspondente
+            // 3. Propagação para Leads
             await supabase.from('leads')
                 .update({ name: finalName })
                 .eq('company_id', companyId)
                 .eq('phone', phone)
-                .neq('name', finalName); // Só atualiza se for diferente para economizar banco
+                .neq('name', finalName); 
         }
     } catch (e) {
         logger.error({ err: e.message }, 'Erro upsertContact');
@@ -126,11 +118,11 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
     // Verifica e Bloqueia: Grupos, Status, Canais e IDs Ocultos
     if (
         !jid || 
-        jid.endsWith('@g.us') ||            // Grupos Modernos
-        jid.includes('-') ||                // Grupos Antigos (Legado)
-        jid.includes('status@broadcast') || // Status/Stories
-        jid.endsWith('@newsletter') ||      // Canais (Channels)
-        jid.endsWith('@lid')                // IDs Técnicos (não é telefone)
+        jid.endsWith('@g.us') ||            
+        jid.includes('-') ||                
+        jid.includes('status@broadcast') || 
+        jid.endsWith('@newsletter') ||      
+        jid.endsWith('@lid')                
     ) {
         return null; 
     }
@@ -141,7 +133,7 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
     
     const lockKey = `${companyId}:${phone}`;
     
-    // Mutex: Se já estamos criando este lead agora, retorna null para evitar duplicidade
+    // Mutex
     if (leadLock.has(lockKey)) return null;
     
     try {
@@ -165,12 +157,12 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
             return existing.id;
         }
 
-        // Se não existe, cria
-        // Se não temos um nome real (pushName), usamos o número formatado APENAS aqui para o CRM não ficar vazio
-        // NOVA LINHA (Se tiver nome usa, se não, salva o próprio número)
+        // Se não existe, cria.
+        // Se tiver nome (pushName), usa. Se não, usa o PRÓPRIO TELEFONE (sem "Lead 1234").
+        // O Frontend tratará isso mostrando "Desconhecido" ou buscando o nome depois.
         const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : phone;
         
-        // Busca a primeira etapa do funil (Pipeline) para colocar o lead novo
+        // Busca a primeira etapa do funil
         const { data: stage } = await supabase
             .from('pipeline_stages')
             .select('id')
@@ -199,8 +191,7 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
 // Salva a Mensagem no Banco
 export const upsertMessage = async (msgData) => {
     try {
-        // --- DELAY AUMENTADO PARA 250ms ---
-        // Essencial para dar tempo do upsertContact rodar antes da mensagem ser salva
+        // Delay para dar tempo do upsertContact rodar
         await new Promise(resolve => setTimeout(resolve, 250));
 
         const { error } = await supabase.from('messages').upsert(msgData, { 
