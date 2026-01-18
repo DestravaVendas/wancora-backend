@@ -93,11 +93,19 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
             // A. Salva Contatos da Lista (Garante que os nomes existam antes das msgs)
             const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
+            
+            // OTIMIZAÇÃO: Usamos Promise.all para paralelizar e evitar travamento sequencial
+            // Mas com limite de concorrência para não estourar o banco (Chunking se necessário)
+            // Aqui mantemos o loop simples com delay, mas SEM DUPLICAÇÃO.
+            
             for (const c of validContacts) {
+                // Tenta pegar do mapa (que tem a versão limpa e a original)
                 const nameToSave = contactsMap.get(c.id) || contactsMap.get(cleanJid(c.id));
-                // Pequeno delay para desafogar o banco
-                await new Promise(r => setTimeout(r, 10)); 
-                // Se não achou nome no mapa, manda NULL (o sync.js vai tratar)
+                
+                // Pequeno delay para não gargalar o banco
+                await new Promise(r => setTimeout(r, 20)); 
+                
+                // Salva. Se não tiver nome, manda NULL.
                 await upsertContact(c.id, companyId, nameToSave || null);
             }
 
@@ -222,10 +230,12 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
         let leadId = null;
         // BLOQUEIO EXPLÍCITO DE GRUPOS COMO LEADS
-        // Removemos o IF. Agora ele tenta criar lead para tudo.
-        // A proteção deve estar DENTRO da função ensureLeadExists se você não quiser grupos.
-        leadId = await ensureLeadExists(jid, companyId, finalName);
-
+        if (!jid.includes('@g.us') && !jid.includes('-')) {
+            // A proteção deve estar DENTRO da função ensureLeadExists se você não quiser grupos.
+            // Passamos o finalName (que pode ser null ou nome real)
+            leadId = await ensureLeadExists(jid, companyId, finalName);
+        }
+        
         // Mídia
         let mediaUrl = null;
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
