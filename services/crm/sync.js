@@ -13,7 +13,8 @@ const leadLock = new Set(); // Mutex para evitar duplicidade na criação de lea
 // Verifica se um nome parece ser apenas um número de telefone ou genérico.
 const isGenericName = (name, phone) => {
     if (!name) return true;
-    const cleanName = name.replace(/[^a-zA-Z0-9]/g, '');
+    // PONTO CRUCIAL 3: Regex Agressiva (Limpa tudo para comparar apenas dígitos)
+    const cleanName = name.replace(/\D/g, '');
     const cleanPhone = phone.replace(/\D/g, '');
     
     // Regra: Se o nome só tem números e símbolos, ou contém o próprio telefone, é genérico.
@@ -83,11 +84,12 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
                 shouldUpdateLead = true; 
             }
         } else if (!current) {
-            // Se é contato novo e não veio nome, deixa NULL.
+            // PONTO CRUCIAL 2: Se é novo e sem nome, salva NULL.
+            // JAMAIS salvar o telefone na coluna 'name' aqui.
             updateData.name = null; 
             finalName = null; 
         } else if (current && isGenericName(current.name, phone)) {
-            // Se já existe mas o nome salvo é um número, forçamos a limpeza
+            // Se já existe mas o nome salvo é um número, limpamos para NULL
             updateData.name = null;
         }
 
@@ -158,8 +160,7 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         }
 
         // Se não existe, cria.
-        // Se tiver nome (pushName), usa. Se não, usa o PRÓPRIO TELEFONE (sem "Lead 1234").
-        // O Frontend tratará isso mostrando "Desconhecido" ou buscando o nome depois.
+        // PONTO CRUCIAL (REMOÇÃO LEAD 1234): Usa o nome ou o próprio telefone.
         const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : phone;
         
         // Busca a primeira etapa do funil
