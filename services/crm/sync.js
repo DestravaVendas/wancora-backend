@@ -121,11 +121,18 @@ logger.error({ err: e.message }, 'Erro upsertContact');
 
 //Garante que o Lead existe na tabela 'leads' (Anti-Ghost)
 export const ensureLeadExists = async (jid, companyId, pushName) => {
-// BLINDAGEM CONTRA GRUPOS
-// Verifica @g.us E status@broadcast
-if (!jid || jid.endsWith('@g.us') || jid.includes('-') || jid.includes('status@broadcast')) {
-return null;
+// Verifica e Bloqueia: Grupos, Status, Canais e IDs Ocultos
+if (
+    !jid || 
+    jid.endsWith('@g.us') ||           // Grupos Modernos
+    jid.includes('-') ||               // Grupos Antigos (Legado)
+    jid.includes('status@broadcast') || // Status/Stories
+    jid.endsWith('@newsletter') ||     // Canais (Channels)
+    jid.endsWith('@lid')               // IDs Técnicos (não é telefone)
+) {
+    return null; 
 }
+
 const phone = jid.split('@')[0];
 // Validação extra: Se o "phone" não parecer um número, aborta
 if (!/^\d+$/.test(phone)) return null;
