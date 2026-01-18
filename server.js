@@ -5,6 +5,9 @@ import cors from 'cors';
 import routes from './routes.js';
 import { createClient } from "@supabase/supabase-js";
 import { startSession } from './services/baileys/connection.js';
+import { startSentinel } from './services/scheduler/sentinel.js';
+
+
 
 // 🔥 INICIALIZAÇÃO DO WORKER DE CAMPANHAS 🔥
 import './workers/campaignWorker.js';
@@ -76,6 +79,7 @@ app.listen(PORT, () => {
     
     // Inicia restauração
     restoreSessions();
+    startSentinel();
 });
 
 export default app;
