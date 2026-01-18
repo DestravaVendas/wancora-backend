@@ -127,15 +127,17 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
             return existing.id;
         }
 
-        // Se tem nome, usa. Se não, null (limpo).
-        const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : null;
+        // [VOLTANDO AO PADRÃO QUE FUNCIONAVA]
+        // Se tem nome, usa. Se não tem, usa o TELEFONE (phone).
+        // Isso garante que o lead apareça na lista, mesmo sem nome.
+        const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : phone;
         
         const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
 
         const { data: newLead } = await supabase.from('leads').insert({
             company_id: companyId,
             phone: phone,
-            name: nameToUse,
+            name: nameToUse, // Aqui volta a ser 'phone' no fallback
             status: 'new',
             pipeline_stage_id: stage?.id
         }).select('id').single();
@@ -147,7 +149,7 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
     } finally {
         leadLock.delete(lockKey);
     }
-};
+};;
 
 export const upsertMessage = async (msgData) => {
     try {
