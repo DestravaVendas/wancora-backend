@@ -12,26 +12,22 @@ const leadLock = new Set(); // Mutex para evitar duplicidade na criação de lea
 
 // --- FUNÇÃO AUXILIAR NECESSÁRIA PARA A LÓGICA ---
 // Verifica se um nome parece ser apenas um número de telefone ou genérico.
-// Retorna TRUE se for um nome "ruim" (que DEVEMOS substituir ou ignorar).
+// Helper que decide se o nome é bom ou ruim
 const isGenericName = (name, phone) => {
-    if (!name) return true; // Se não tem nome, é ruim.
-    // Limpeza para comparação (remove tudo que não é letra ou número)
-    const cleanName = name.replace(/[^a-zA-Z0-9]/g, '');
+    if (!name) return true;
+    const cleanName = name.replace(/[^a-zA-Z0-9]/g, ''); 
     const cleanPhone = phone.replace(/\D/g, '');
     
-    // Critérios de nome ruim (Agressivo):
-    // 1. O nome contém o número de telefone
-    // 2. O nome é igual ao número
-    // 3. O nome começa com + (indicativo de DDI)
-    // 4. O nome contém apenas números, espaços e caracteres de formatação de telefone
-    const isJustNumbersAndSymbols = /^[\d+\-()\s]+$/.test(name);
-    
-    return cleanName.includes(cleanPhone) ||
-           name === phone ||
-           name.startsWith('+') ||
+    // Regra: Se o nome só tem números e símbolos, ou contém o próprio telefone, é genérico.
+    const isJustNumbersAndSymbols = /^[\d\+\-\(\)\s]+$/.test(name);
+
+    return cleanName.includes(cleanPhone) || 
+           name === phone || 
+           name.startsWith('+') || 
            isJustNumbersAndSymbols ||
            (cleanName.length > 7 && /[0-9]{5,}/.test(name));
 };
+    
 
 // Atualiza o status da sincronização na tabela 'instances'
 // Isso permite que o Frontend mostre "Sincronizando 45%..."
