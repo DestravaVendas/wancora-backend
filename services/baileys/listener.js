@@ -94,11 +94,19 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
             // A. Salva Contatos da Lista (Garante que os nomes existam antes das msgs)
             const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
+            
+            // OTIMIZAÇÃO: Processa contatos com delay para evitar "fetch failed"
+            // Introduzimos uma pequena pausa a cada iteração para não saturar a rede
+            let cCount = 0;
             for (const c of validContacts) {
                 const nameToSave = contactsMap.get(c.id) || contactsMap.get(cleanJid(c.id));
-                // Pequeno delay para desafogar o banco
-                await new Promise(r => setTimeout(r, 10)); 
+                // Delay de 50ms por contato (Throttling)
+                await new Promise(r => setTimeout(r, 50)); 
                 await upsertContact(c.id, companyId, nameToSave || null);
+                
+                cCount++;
+                // Pausa maior a cada 50 contatos para "respirar"
+                if (cCount % 50 === 0) await new Promise(r => setTimeout(r, 1000));
             }
 
             // B. Grupos (Salva o Subject como Nome)
@@ -107,16 +115,23 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 const groupList = Object.values(groups);
                 console.log(`👥 [GRUPOS] ${groupList.length} grupos.`);
                 for (const g of groupList) {
+                    await new Promise(r => setTimeout(r, 50)); // Delay em grupos também
                     await upsertContact(g.id, companyId, g.subject, null);
                 }
             } catch (e) {}
 
-            // C. Filtros de Mensagens
-            const MAX_CHATS = 50;            
-            const MAX_MSGS_PER_CHAT = 15;
+            // C. Filtros de Mensagens (AJUSTE DOS LIMITES SOLICITADOS)
+            const MAX_CHATS = 200;            
+            const MAX_MSGS_PER_CHAT = 7;
+            // Cálculo de 8 meses atrás
+            const EIGHT_MONTHS_AGO = Math.floor(Date.now() / 1000) - (8 * 30 * 24 * 60 * 60);
             
             const messagesByChat = new Map();
             messages.forEach(msg => {
+                // Filtro de Tempo (8 Meses)
+                const ts = msg.messageTimestamp || 0;
+                if (ts < EIGHT_MONTHS_AGO) return; // Ignora mensagens muito antigas
+
                 const unwrapped = unwrapMessage(msg);
                 const jid = unwrapped.key.remoteJid;
                 if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
@@ -138,9 +153,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             });
 
             const totalMsgs = finalMessagesToProcess.length;
-            console.log(`🧠 [FILTRO] ${totalMsgs} mensagens prontas para Sync Sequencial.`);
+            console.log(`🧠 [FILTRO] ${totalMsgs} mensagens prontas para Sync Sequencial (8 meses / 200 chats / 7 msgs).`);
 
-            // D. PROCESSAMENTO SEQUENCIAL (AQUI A BARRA DEVE ANDAR)
+            // D. PROCESSAMENTO SEQUENCIAL COM THROTTLE (SOLUÇÃO FETCH FAILED)
             let processedCount = 0;
             
             for (const msg of finalMessagesToProcess) {
@@ -149,10 +164,13 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 
                 processedCount++;
                 
-                // Atualiza a cada 3 mensagens (Feedback rápido)
-                if (processedCount % 3 === 0) {
+                // THROTTLE CRÍTICO: Pausa de 150ms a cada mensagem para garantir que o BD e Redis respondam
+                // Isso evita o "TypeError: fetch failed" causado por congestionamento de sockets no Render
+                await new Promise(r => setTimeout(r, 150));
+
+                // Atualiza a cada 5 mensagens (Feedback mais espaçado para não spammar logs)
+                if (processedCount % 5 === 0) {
                     const percent = Math.round((processedCount / totalMsgs) * 100);
-                    // LOG OBRIGATÓRIO PARA DEBUG
                     console.log(`🔄 [SYNC] ${percent}% (${processedCount}/${totalMsgs})`);
                     await updateSyncStatus(sessionId, 'syncing', percent);
                 }
