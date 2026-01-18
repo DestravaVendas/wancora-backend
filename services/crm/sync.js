@@ -132,8 +132,9 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         }
 
         // [SEM LEAD 1234]
-        // Se tem nome, usa. Se não, usa o telefone puro.
-        const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : phone;
+        // Se tem nome, usa. Se não, usa NULL (banco limpo).
+        // 👇 AQUI FOI A ÚNICA ALTERAÇÃO (phone -> null) 👇
+        const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : null;
         
         const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
 
