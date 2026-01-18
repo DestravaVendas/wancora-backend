@@ -214,10 +214,9 @@ const fromMe = msg.key.fromMe;
 
     let leadId = null;
     // BLOQUEIO EXPLÍCITO DE GRUPOS COMO LEADS
-    if (!jid.includes('@g.us') && !jid.includes('-')) {
-        // Garante lead (Se não tiver nome, usa "Lead Final 1234" ou similar definido no sync.js)
-        leadId = await ensureLeadExists(jid, companyId, finalName);
-    }
+// Removemos o IF. Agora ele tenta criar lead para tudo.
+// A proteção deve estar DENTRO da função ensureLeadExists se você não quiser grupos.
+leadId = await ensureLeadExists(jid, companyId, finalName);
 
     // Mídia
     let mediaUrl = null;
