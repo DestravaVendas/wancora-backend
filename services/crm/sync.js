@@ -106,9 +106,7 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
              console.log(`💾 [DEBUG] Contato salvo com sucesso no Supabase.`);
           }
         // 👆 ------------------ 👆
-        if (error) {
-            console.error('[CONTACT SYNC ERROR]', error.message);
-        } else if (shouldUpdateLead && finalName && !isGroup) {
+        if (shouldUpdateLead && finalName && !isGroup) {
             // Atualiza Lead apenas se descobrimos um nome REAL
             await supabase.from('leads')
                 .update({ name: finalName })
