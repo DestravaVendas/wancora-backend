@@ -130,8 +130,8 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
             return existing.id;
         }
 
-        // Se tem nome, usa. Se não, usa o telefone puro.
-        const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : phone;
+        // Se tem nome, usa. Se não, null (limpo).
+        const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : null;
         
         const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
 
