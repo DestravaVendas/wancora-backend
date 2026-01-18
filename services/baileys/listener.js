@@ -1,3 +1,4 @@
+
 import { 
     upsertContact, 
     upsertMessage, 
@@ -79,8 +80,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             if (contacts) {
                 contacts.forEach(c => {
                     // Tenta achar nome em qualquer lugar
+                    // FILTRO: Só aceita se não for puramente numérico
                     const bestName = c.notify || c.name || c.verifiedName || c.short;
-                    if (bestName) {
+                    if (bestName && !/^\d+$/.test(bestName.replace(/\D/g, ''))) {
                         // Mapeia ID original E ID limpo
                         contactsMap.set(c.id, bestName);
                         contactsMap.set(cleanJid(c.id), bestName);
@@ -88,7 +90,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     }
                 });
             }
-            console.log(`🗺️ [MAPA] ${namesCount} nomes identificados na memória.`);
+            console.log(`🗺️ [MAPA] ${namesCount} nomes reais identificados na memória.`);
 
             // A. Salva Contatos da Lista (Garante que os nomes existam antes das msgs)
             const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
@@ -99,7 +101,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 await upsertContact(c.id, companyId, nameToSave || null);
             }
 
-            // B. Grupos
+            // B. Grupos (Salva o Subject como Nome)
             try {
                 const groups = await sock.groupFetchAllParticipating();
                 const groupList = Object.values(groups);
@@ -211,14 +213,16 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         }
 
         // Salva Contato (sync.js propaga para Leads)
+        // Se finalName ainda for nulo, upsertContact salvará NULL no nome, não o telefone.
         await upsertContact(jid, companyId, finalName);
         
         const type = getContentType(msg.message);
         const body = getBody(msg.message);
 
         let leadId = null;
-        if (!jid.includes('@g.us')) {
-            // Garante lead
+        // BLOQUEIO EXPLÍCITO DE GRUPOS COMO LEADS
+        if (!jid.includes('@g.us') && !jid.includes('-')) {
+            // Garante lead (Se não tiver nome, usa "Lead Final 1234" ou similar definido no sync.js)
             leadId = await ensureLeadExists(jid, companyId, finalName);
         }
 
