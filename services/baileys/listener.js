@@ -76,13 +76,20 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             let namesCount = 0;
 
             if (contacts) {
+                // 👇 LOGS DE DIAGNÓSTICO (SHERLOCK) 👇
+                // Isso vai nos dizer se o WhatsApp está mandando nomes ou se está "de castigo"
+                console.log(`🕵️ [SHERLOCK] Analisando ${contacts.length} contatos brutos recebidos...`);
+                if (contacts.length > 0) {
+                     console.log('🕵️ [AMOSTRA]:', JSON.stringify(contacts[0], null, 2));
+                }
+                // 👆 ------------------------------- 👆
+
                 contacts.forEach(c => {
                     // Tenta achar nome em qualquer campo possível
                     const bestName = c.notify || c.name || c.verifiedName || c.short;
                     
-                    // CORREÇÃO: Regex menos agressiva. 
-                    // Só ignora se o nome for ESTRITAMENTE números e símbolos (igual ao sync.js)
-                    // Antes: !/^\d+$/.test(bestName.replace(/\D/g, '')) -> Matava "Lanchonete 24h"
+                    // CORREÇÃO: Regex ajustada para NÃO matar nomes mistos (ex: "Loja 10")
+                    // Só descarta se a string inteira for APENAS números e símbolos
                     if (bestName && !/^[\d\+\-\(\)\s]+$/.test(bestName)) {
                         // Mapeia ID original E ID limpo
                         contactsMap.set(c.id, bestName);
@@ -91,15 +98,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     }
                 });
             }
-            
             console.log(`🗺️ [MAPA] ${namesCount} nomes reais identificados na memória.`);
 
             // A. Salva Contatos da Lista (Garante que os nomes existam antes das msgs)
             const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
-            
-            // OTIMIZAÇÃO: Usamos Promise.all para paralelizar e evitar travamento sequencial
-            // Mas com limite de concorrência para não estourar o banco (Chunking se necessário)
-            // Aqui mantemos o loop simples com delay, mas SEM DUPLICAÇÃO.
             
             for (const c of validContacts) {
                 // Tenta pegar do mapa (que tem a versão limpa e a original)
