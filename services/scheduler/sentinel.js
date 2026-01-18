@@ -5,9 +5,10 @@ import { sendMessage } from '../baileys/sender.js';
 const CHECK_INTERVAL = 60 * 1000; // Roda a cada 1 minuto
 const REMINDER_WINDOW_HOURS = 24; // Avisar 24h antes
 
-// Função para limpar JID
+// Função para limpar JID (Garante apenas números antes do sufixo)
 const formatJid = (phone) => {
-  const clean = phone.replace(/\D/g, '');
+  if (!phone) return null;
+  const clean = phone.replace(/\D/g, ''); // Remove tudo que não é número
   return `${clean}@s.whatsapp.net`;
 };
 
@@ -25,22 +26,21 @@ async function runSentinelCycle() {
     
     // Definindo a Janela de Tempo:
     // Queremos agendamentos que ocorrem entre AGORA e (AGORA + 24h)
-    // E que ainda não enviamos lembrete.
     const windowEnd = new Date(now.getTime() + (REMINDER_WINDOW_HOURS * 60 * 60 * 1000));
 
     // Busca agendamentos pendentes de lembrete
-    // NOTA: Trazemos apenas o necessário.
+    // CORREÇÃO: Removemos 'profiles:user_id (name)' pois não estava sendo usado e causava erro de relação
     const { data: appointments, error } = await supabase
       .from('appointments')
       .select(`
         id, start_time, company_id,
-        leads (name, phone),
-        profiles:user_id (name)
+        leads (name, phone)
       `)
       .gte('start_time', now.toISOString()) // Apenas futuros
       .lte('start_time', windowEnd.toISOString()) // Dentro da janela
       .eq('reminder_sent', false)
-      .eq('status', 'confirmed'); // Apenas confirmados (opcional: ou 'pending')
+      .eq('status', 'confirmed') // Apenas confirmados. Se quiser todos, remova esta linha ou mude para 'pending'
+      .not('leads', 'is', null); // Garante que o lead existe para não quebrar o código
 
     if (error) throw error;
 
@@ -64,6 +64,12 @@ async function processReminder(appt, sessionCache) {
   try {
     const { company_id, leads, start_time } = appt;
 
+    // Validação de Segurança
+    if (!leads || !leads.phone) {
+      console.warn(`[SENTINELA] Agendamento ${appt.id} sem telefone vinculado. Ignorando.`);
+      return;
+    }
+
     // 1. Resolver Sessão (Com Cache Local)
     let sessionId = sessionCache[company_id];
 
@@ -72,7 +78,7 @@ async function processReminder(appt, sessionCache) {
         .from('instances')
         .select('session_id')
         .eq('company_id', company_id)
-        .eq('status', 'connected')
+        .eq('status', 'connected') // Apenas sessões ativas
         .limit(1)
         .maybeSingle();
 
@@ -80,13 +86,13 @@ async function processReminder(appt, sessionCache) {
         sessionId = instance.session_id;
         sessionCache[company_id] = sessionId;
       } else {
-        console.warn(`[SENTINELA] ⚠️ Sem conexão ativa para empresa ${company_id}. Lembrete pulado.`);
+        // Log silencioso para evitar spam no console se a empresa desconectou
         return;
       }
     }
 
     // 2. Preparar Dados
-    const clientName = leads.name.split(' ')[0];
+    const clientName = leads.name ? leads.name.split(' ')[0] : 'Cliente';
     const dateObj = new Date(start_time);
     const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
     const remoteJid = formatJid(leads.phone);
