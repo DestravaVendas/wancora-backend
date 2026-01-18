@@ -41,6 +41,9 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         const isGroup = jid.includes('@g.us');
         const cleanJid = jid.split('@')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
         const phone = cleanJid.split('@')[0];
+        // 👇 COLAR ISSO AQUI 👇
+        console.log(`🔍 [DEBUG] Upsert JID: ${cleanJid} | PushName Chegou: "${pushName}"`);
+        // 👆 ------------------ 👆
         
         const { data: current } = await supabase
             .from('contacts')
@@ -70,11 +73,17 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
 
             // Se o nome atual no banco for ruim, sobrescreve!
             if (isCurrentBad) {
+                // 👇 COLAR ISSO AQUI 👇
+                console.log(`✅ [DEBUG] Nome VÁLIDO detectado! Atualizando banco para: ${pushName}`);
+                // 👆 ------------------ 👆
                 updateData.name = pushName;
                 finalName = pushName;    
                 shouldUpdateLead = true; 
             }
         } else if (!current) {
+            // 👇 COLAR ISSO AQUI 👇
+            console.log(`⚠️ [DEBUG] Contato NOVO sem nome válido. Forçando NULL.`);
+            // 👆 ------------------ 👆
             // [ESTRATÉGIA DO ARQUITETO]
             // Contato novo sem nome? Manda NULL.
             // O Trigger do Banco vai tentar preencher com push_name ou o frontend trata.
@@ -90,7 +99,13 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         }
 
         const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
-
+         // 👇 COLAR ISSO AQUI 👇
+          if (error) {
+             console.error(`❌ [CRITICAL ERROR] Supabase recusou salvar contato: ${error.message}`);
+              } else {
+             console.log(`💾 [DEBUG] Contato salvo com sucesso no Supabase.`);
+          }
+        // 👆 ------------------ 👆
         if (error) {
             console.error('[CONTACT SYNC ERROR]', error.message);
         } else if (shouldUpdateLead && finalName && !isGroup) {
