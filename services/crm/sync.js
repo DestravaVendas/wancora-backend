@@ -92,14 +92,17 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
 
         if (error) {
             console.error('[CONTACT SYNC ERROR]', error.message);
+           
         } else if (shouldUpdateLead && finalName && !isGroup) {
-            // Atualiza Lead apenas se descobrimos um nome REAL
-            await supabase.from('leads')
-                .update({ name: finalName })
-                .eq('company_id', companyId)
-                .eq('phone', phone)
-                .neq('name', finalName); 
-        }
+        // CHAMA A FUNÇÃO BLINDADA DO SQL
+        // Ela só vai atualizar se o Lead estiver sem nome ou com nome de número.
+        // Se você renomeou o Lead manualmente, ela vai ignorar e manter o seu nome.
+        await supabase.rpc('update_lead_name_safely', {
+           p_company_id: companyId,
+           p_phone: phone,
+           p_new_name: finalName
+        });
+      }
     } catch (e) {
         logger.error({ err: e.message }, 'Erro upsertContact');
     }
