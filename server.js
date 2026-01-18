@@ -25,6 +25,10 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // Rotas da API
 app.use('/api/v1', routes);
 
+// Rota de Health Check para o Render não ficar perdido
+app.get('/', (req, res) => {
+  res.status(200).send({ status: 'online', uptime: process.uptime() });
+});
 // Rota de Health Check
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'online', timestamp: new Date() });
