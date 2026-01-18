@@ -1,11 +1,9 @@
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
-// Inicializa o cliente Supabase
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'error' });
 
-// Cache removido da lógica crítica para garantir salvamento agressivo
 const contactCache = new Set();
 const leadLock = new Set(); 
 
@@ -43,7 +41,7 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         const isGroup = jid.includes('@g.us');
         const cleanJid = jid.split('@')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
         const phone = cleanJid.split('@')[0];
-        
+                
         const { data: current } = await supabase
             .from('contacts')
             .select('name, push_name, profile_pic_url')
@@ -63,21 +61,29 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         let shouldUpdateLead = false;
 
         // --- LÓGICA DE PRIORIDADE (NAME HUNTER) ---
+        // Se veio pushName válido (que não é telefone)
         if (pushName && pushName.trim().length > 0 && !isGenericName(pushName, phone)) {
             updateData.push_name = pushName;
             
             const currentName = current?.name;
             const isCurrentBad = !currentName || isGenericName(currentName, phone);
 
+            // Se o nome atual no banco for ruim, sobrescreve!
             if (isCurrentBad) {
+                
                 updateData.name = pushName;
                 finalName = pushName;    
                 shouldUpdateLead = true; 
             }
         } else if (!current) {
+            
+            // [ESTRATÉGIA DO ARQUITETO]
+            // Contato novo sem nome? Manda NULL.
+            // O Trigger do Banco vai tentar preencher com push_name ou o frontend trata.
             updateData.name = null; 
             finalName = null; 
         } else if (current && isGenericName(current.name, phone)) {
+            // Se já existe mas é número, limpa para NULL
             updateData.name = null;
         }
 
@@ -86,16 +92,14 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         }
 
         const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
-
-        if (error) {
-            console.error('[CONTACT SYNC ERROR]', error.message);
-        } else if (shouldUpdateLead && finalName && !isGroup) {
-            // [ATUALIZAÇÃO SEGURA - CHAMADA RPC]
-            await supabase.rpc('update_lead_name_safely', {
-                p_company_id: companyId,
-                p_phone: phone,
-                p_new_name: finalName
-            });
+         
+        if (shouldUpdateLead && finalName && !isGroup) {
+            // Atualiza Lead apenas se descobrimos um nome REAL
+            await supabase.from('leads')
+                .update({ name: finalName })
+                .eq('company_id', companyId)
+                .eq('phone', phone)
+                .neq('name', finalName); 
         }
     } catch (e) {
         logger.error({ err: e.message }, 'Erro upsertContact');
@@ -127,9 +131,8 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
             return existing.id;
         }
 
-        // [VOLTANDO AO PADRÃO QUE FUNCIONAVA]
-        // Se tem nome, usa. Se não tem, usa o TELEFONE (phone).
-        // Isso garante que o lead apareça na lista, mesmo sem nome.
+        // [SEM LEAD 1234]
+        // Se tem nome, usa. Se não, usa o telefone puro.
         const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : phone;
         
         const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
@@ -137,7 +140,7 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         const { data: newLead } = await supabase.from('leads').insert({
             company_id: companyId,
             phone: phone,
-            name: nameToUse, // Aqui volta a ser 'phone' no fallback
+            name: nameToUse,
             status: 'new',
             pipeline_stage_id: stage?.id
         }).select('id').single();
@@ -149,13 +152,11 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
     } finally {
         leadLock.delete(lockKey);
     }
-};;
+};
 
 export const upsertMessage = async (msgData) => {
     try {
-        // Delay de 250ms mantido para UX do Frontend
         await new Promise(resolve => setTimeout(resolve, 250));
-        
         const { error } = await supabase.from('messages').upsert(msgData, { onConflict: 'remote_jid, whatsapp_id' });
         if (error) throw error;
     } catch (e) {
