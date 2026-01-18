@@ -74,18 +74,20 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         let shouldUpdateLead = false;
 
         // --- LÓGICA DE PRIORIDADE DE NOME (AGRESSIVA v2) ---
+      // --- LÓGICA DE PRIORIDADE DE NOME (AGRESSIVA v2) ---
         if (pushName && pushName.trim().length > 0 && !isGenericName(pushName, phone)) {
-            updateData.push_name = pushName;
-            
-            const currentName = current?.name;
-            // Se o nome atual for nulo ou for genérico (numero), substituímos pelo PushName
-            const isCurrentBad = !currentName || isGenericName(currentName, phone);
+              updateData.push_name = pushName;
+    
+        const currentName = current?.name;
+        // Se o nome atual for nulo ou for genérico (numero), substituímos pelo PushName
+        const isCurrentBad = !currentName || isGenericName(currentName, phone);
 
-            if (isCurrentBad) {
-                updateData.name = pushName;
-                finalName = pushName;    // Capturamos o nome novo
-                shouldUpdateLead = true; // Sinalizamos para atualizar o lead também
-            }
+         if (isCurrentBad) {
+          updateData.name = pushName; // <--- AQUI ELE SALVA O NOME REAL
+          finalName = pushName;    
+          shouldUpdateLead = true; 
+       }
+     }
         } else if (!current) {
             // CORREÇÃO CRÍTICA: Se é contato novo e não veio nome, NÃO usamos o telefone.
             // Deixamos NULL. O Frontend tratará a exibição.
