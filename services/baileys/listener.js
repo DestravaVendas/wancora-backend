@@ -37,7 +37,6 @@ const unwrapMessage = (msg) => {
 const uploadMedia = async (buffer, type) => {
     try {
         const ext = mime.extension(type) || 'bin';
-        // CORREÇÃO: Template string corrigida
         const fileName = `hist_${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
         const { error } = await supabase.storage.from('chat-media').upload(fileName, buffer, { contentType: type });
         if (error) return null;
@@ -72,21 +71,23 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             // Força o frontend a mostrar a barra imediatamente
             await updateSyncStatus(sessionId, 'syncing', 1);
 
-           // --- MAPA DE NOMES (NAME HUNTER V3) ---
-           const contactsMap = new Map();
+            // --- MAPA DE NOMES (NAME HUNTER V3) ---
+            const contactsMap = new Map();
+            let namesCount = 0; // Variável movida para escopo seguro
 
             if (contacts) {
-            contacts.forEach(c => {
-           // Tenta achar nome em qualquer campo possível
-           const bestName = c.notify || c.name || c.verifiedName || c.short;
-        
-           // Só salva se NÃO for apenas números
-           if (bestName && !/^\d+$/.test(bestName.replace(/\D/g, ''))) {
-            contactsMap.set(c.id, bestName);
-            contactsMap.set(cleanJid(c.id), bestName); // Mapeia versão limpa também
-           }
-        });
-       }
+                contacts.forEach(c => {
+                    // Tenta achar nome em qualquer campo possível
+                    const bestName = c.notify || c.name || c.verifiedName || c.short;
+                    
+                    // Só salva se NÃO for apenas números
+                    if (bestName && !/^\d+$/.test(bestName.replace(/\D/g, ''))) {
+                        contactsMap.set(c.id, bestName);
+                        contactsMap.set(cleanJid(c.id), bestName); // Mapeia versão limpa também
+                        namesCount++;
+                    }
+                });
+            }
             console.log(`🗺️ [MAPA] ${namesCount} nomes reais identificados na memória.`);
 
             // A. Salva Contatos da Lista (Garante que os nomes existam antes das msgs)
@@ -199,17 +200,18 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
         const fromMe = msg.key.fromMe;
         
-      // --- NAME HUNTER V3 (CORRIGIDO) ---
-      let finalName = msg.pushName;
+        // --- NAME HUNTER V3 (CORRIGIDO) ---
+        let finalName = msg.pushName;
 
-      // Se não veio na mensagem, tenta buscar no mapa de memória
-      if (!finalName && contactsMap) {
-       const clean = cleanJid(jid);
-       finalName = contactsMap.get(jid) || contactsMap.get(clean);
-      }
+        // Se não veio na mensagem, tenta buscar no mapa de memória
+        if (!finalName && contactsMap) {
+            const clean = cleanJid(jid);
+            // Tenta ID exato e ID limpo
+            finalName = contactsMap.get(jid) || contactsMap.get(clean);
+        }
 
-      // Manda salvar no banco
-      await upsertContact(jid, companyId, finalName);
+        // Manda salvar no banco
+        await upsertContact(jid, companyId, finalName);
         
         // Fallback seguro para getContentType
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
