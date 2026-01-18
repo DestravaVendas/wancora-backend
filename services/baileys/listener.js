@@ -71,9 +71,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             // Força o frontend a mostrar a barra imediatamente
             await updateSyncStatus(sessionId, 'syncing', 1);
 
-            // --- MAPA DE NOMES (NAME HUNTER V3) ---
+            // --- PONTO CRUCIAL 1: MAPA DE NOMES (NAME HUNTER V3) ---
             const contactsMap = new Map();
-            let namesCount = 0; // Variável movida para escopo seguro
+            let namesCount = 0;
 
             if (contacts) {
                 contacts.forEach(c => {
@@ -82,8 +82,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     
                     // Só salva se NÃO for apenas números
                     if (bestName && !/^\d+$/.test(bestName.replace(/\D/g, ''))) {
+                        // Mapeia ID original E ID limpo
                         contactsMap.set(c.id, bestName);
-                        contactsMap.set(cleanJid(c.id), bestName); // Mapeia versão limpa também
+                        contactsMap.set(cleanJid(c.id), bestName); 
                         namesCount++;
                     }
                 });
@@ -96,6 +97,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 const nameToSave = contactsMap.get(c.id) || contactsMap.get(cleanJid(c.id));
                 // Pequeno delay para desafogar o banco
                 await new Promise(r => setTimeout(r, 10)); 
+                // Se não achou nome no mapa, manda NULL (o sync.js vai tratar)
                 await upsertContact(c.id, companyId, nameToSave || null);
             }
 
@@ -203,14 +205,15 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         // --- NAME HUNTER V3 (CORRIGIDO) ---
         let finalName = msg.pushName;
 
-        // Se não veio na mensagem, tenta buscar no mapa de memória
+        // Se não veio na mensagem, tenta o mapa (usando ID limpo)
         if (!finalName && contactsMap) {
             const clean = cleanJid(jid);
             // Tenta ID exato e ID limpo
             finalName = contactsMap.get(jid) || contactsMap.get(clean);
         }
 
-        // Manda salvar no banco
+        // Salva Contato (sync.js propaga para Leads)
+        // Se finalName ainda for nulo, upsertContact salvará NULL no nome, não o telefone.
         await upsertContact(jid, companyId, finalName);
         
         // Fallback seguro para getContentType
