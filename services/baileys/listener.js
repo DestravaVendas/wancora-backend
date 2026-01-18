@@ -73,16 +73,17 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             // Força o frontend a mostrar a barra imediatamente
             await updateSyncStatus(sessionId, 'syncing', 1);
 
-            // --- MAPA DE NOMES (NAME HUNTER V3) ---
+            // --- MAPA DE NOMES (NAME HUNTER V3 - RESTAURADO) ---
             const contactsMap = new Map();
             let namesCount = 0;
 
             if (contacts) {
                 contacts.forEach(c => {
-                    // Tenta achar nome em qualquer lugar
-                    // FILTRO: Só aceita se não for puramente numérico
-                    const bestName = c.notify || c.name || c.verifiedName || c.short;
-                    if (bestName && !/^\d+$/.test(bestName.replace(/\D/g, ''))) {
+                    // RESTAURAÇÃO: Aceita qualquer nome que vier do Baileys.
+                    // A filtragem fina será feita no sync.js, mas aqui garantimos que o dado CHEGA lá.
+                    const bestName = c.name || c.notify || c.verifiedName || c.short;
+                    
+                    if (bestName) {
                         // Mapeia ID original E ID limpo
                         contactsMap.set(c.id, bestName);
                         contactsMap.set(cleanJid(c.id), bestName);
@@ -90,23 +91,22 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     }
                 });
             }
-            console.log(`🗺️ [MAPA] ${namesCount} nomes reais identificados na memória.`);
+            console.log(`🗺️ [MAPA] ${namesCount} nomes identificados na memória.`);
 
             // A. Salva Contatos da Lista (Garante que os nomes existam antes das msgs)
             const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
             
             // OTIMIZAÇÃO: Processa contatos com delay para evitar "fetch failed"
-            // Introduzimos uma pequena pausa a cada iteração para não saturar a rede
             let cCount = 0;
             for (const c of validContacts) {
                 const nameToSave = contactsMap.get(c.id) || contactsMap.get(cleanJid(c.id));
-                // Delay de 50ms por contato (Throttling)
-                await new Promise(r => setTimeout(r, 50)); 
+                
+                // Delay de 20ms por contato (Leve Throttling para não travar inserção de contatos)
+                await new Promise(r => setTimeout(r, 20)); 
                 await upsertContact(c.id, companyId, nameToSave || null);
                 
                 cCount++;
-                // Pausa maior a cada 50 contatos para "respirar"
-                if (cCount % 50 === 0) await new Promise(r => setTimeout(r, 1000));
+                if (cCount % 100 === 0) await new Promise(r => setTimeout(r, 500));
             }
 
             // B. Grupos (Salva o Subject como Nome)
@@ -115,22 +115,20 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 const groupList = Object.values(groups);
                 console.log(`👥 [GRUPOS] ${groupList.length} grupos.`);
                 for (const g of groupList) {
-                    await new Promise(r => setTimeout(r, 50)); // Delay em grupos também
+                    await new Promise(r => setTimeout(r, 20)); 
                     await upsertContact(g.id, companyId, g.subject, null);
                 }
             } catch (e) {}
 
-            // C. Filtros de Mensagens (AJUSTE DOS LIMITES SOLICITADOS)
+            // C. Filtros de Mensagens (8 MESES / 200 CHATS / 7 MSGS)
             const MAX_CHATS = 200;            
             const MAX_MSGS_PER_CHAT = 7;
-            // Cálculo de 8 meses atrás
             const EIGHT_MONTHS_AGO = Math.floor(Date.now() / 1000) - (8 * 30 * 24 * 60 * 60);
             
             const messagesByChat = new Map();
             messages.forEach(msg => {
-                // Filtro de Tempo (8 Meses)
                 const ts = msg.messageTimestamp || 0;
-                if (ts < EIGHT_MONTHS_AGO) return; // Ignora mensagens muito antigas
+                if (ts < EIGHT_MONTHS_AGO) return; 
 
                 const unwrapped = unwrapMessage(msg);
                 const jid = unwrapped.key.remoteJid;
@@ -153,22 +151,19 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             });
 
             const totalMsgs = finalMessagesToProcess.length;
-            console.log(`🧠 [FILTRO] ${totalMsgs} mensagens prontas para Sync Sequencial (8 meses / 200 chats / 7 msgs).`);
+            console.log(`🧠 [FILTRO] ${totalMsgs} mensagens prontas para Sync Sequencial.`);
 
-            // D. PROCESSAMENTO SEQUENCIAL COM THROTTLE (SOLUÇÃO FETCH FAILED)
+            // D. PROCESSAMENTO SEQUENCIAL COM THROTTLE
             let processedCount = 0;
             
             for (const msg of finalMessagesToProcess) {
-                // Passa o contactsMap para tentar achar o nome se não vier na msg
                 await processSingleMessage(msg, sock, companyId, sessionId, false, contactsMap);
                 
                 processedCount++;
                 
-                // THROTTLE CRÍTICO: Pausa de 150ms a cada mensagem para garantir que o BD e Redis respondam
-                // Isso evita o "TypeError: fetch failed" causado por congestionamento de sockets no Render
+                // THROTTLE: Pausa de 150ms a cada mensagem
                 await new Promise(r => setTimeout(r, 150));
 
-                // Atualiza a cada 5 mensagens (Feedback mais espaçado para não spammar logs)
                 if (processedCount % 5 === 0) {
                     const percent = Math.round((processedCount / totalMsgs) * 100);
                     console.log(`🔄 [SYNC] ${percent}% (${processedCount}/${totalMsgs})`);
@@ -182,7 +177,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         } catch (e) {
             console.error(`❌ [ERRO HISTÓRICO]`, e);
         } finally {
-            // Libera a trava após 15 segundos (segurança)
             setTimeout(() => { isProcessingHistory = false; }, 15000);
         }
     });
@@ -226,12 +220,10 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         // Se não veio na mensagem, tenta o mapa (usando ID limpo)
         if (!finalName && contactsMap) {
             const clean = cleanJid(jid);
-            // Tenta ID exato e ID limpo
             finalName = contactsMap.get(jid) || contactsMap.get(clean);
         }
 
-        // Salva Contato (sync.js propaga para Leads)
-        // Se finalName ainda for nulo, upsertContact salvará NULL no nome, não o telefone.
+        // Salva Contato
         await upsertContact(jid, companyId, finalName);
         
         const type = getContentType(msg.message);
@@ -240,7 +232,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         let leadId = null;
         // BLOQUEIO EXPLÍCITO DE GRUPOS COMO LEADS
         if (!jid.includes('@g.us') && !jid.includes('-')) {
-            // Garante lead (Se não tiver nome, usa "Lead Final 1234" ou similar definido no sync.js)
+            // Garante lead (Usa +55 se não tiver nome)
             leadId = await ensureLeadExists(jid, companyId, finalName);
         }
 
