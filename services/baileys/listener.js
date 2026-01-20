@@ -78,8 +78,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
             if (contacts && contacts.length > 0) {
                 contacts.forEach(c => {
-                    // Prioridade: Agenda (name) > Push (notify) > Verificado (verifiedName)
-                    const bestName = c.name || c.notify || c.verifiedName || c.short;
+                    // ORDEM RIGOROSA: Agenda (name) > Verificado (verifiedName) > Perfil (notify)
+                    const bestName = c.name || c.verifiedName || c.notify || c.short;
                     
                     if (bestName) {
                         const jidKey = cleanJid(c.id);
@@ -103,8 +103,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 const batch = validContacts.slice(i, i + batchSize);
                 await Promise.all(batch.map(async (c) => {
                     const jidKey = cleanJid(c.id);
-                    // Pega do mapa ou tenta propriedades diretas de novo
-                    const nameToSave = contactsMap.get(jidKey) || c.name || c.notify;
+                    
+                    // Aplica a mesma ordem de prioridade aqui para salvar no banco
+                    const nameToSave = contactsMap.get(jidKey) || c.name || c.verifiedName || c.notify;
                     
                     // CHECK: Se veio c.name, é da Agenda!
                     // Isso ativa o modo de sobrescrita no sync.js
@@ -172,7 +173,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 const msgPushName = msg.pushName;
                 const mapName = contactsMap.get(jidKey);
                 
-                // Prioridade: Mapa (Agenda) > Msg (PushName)
+                // Prioridade: Mapa (Agenda/Verified) > Msg (PushName)
                 const finalName = mapName || msgPushName; 
 
                 // Mensagens históricas nunca sobrescrevem agenda explicitamente (isFromBook=false)
@@ -199,8 +200,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // --- Eventos Realtime ---
     sock.ev.on('contacts.upsert', async (contacts) => {
         for (const c of contacts) {
-            // Prioridade Agenda > Perfil
-            const bestName = c.name || c.notify || c.verifiedName || null;
+            // ORDEM RIGOROSA: Agenda > Verificado > Perfil
+            const bestName = c.name || c.verifiedName || c.notify || null;
+            
             if (bestName) {
                 const jid = cleanJid(c.id);
                 
