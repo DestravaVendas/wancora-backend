@@ -1,3 +1,4 @@
+
 import {
     upsertContact,
     upsertMessage,
@@ -65,31 +66,29 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
         try {
             console.log(`📚 [HISTÓRICO] Iniciando Processamento Único...`);
-            console.log(`   - Contatos: ${contacts.length}`);
-            console.log(`   - Mensagens: ${messages.length}`);
+            console.log(`   - Contatos recebidos: ${contacts.length}`);
+            console.log(`   - Mensagens recebidas: ${messages.length}`);
             
             // Força o frontend a mostrar a barra imediatamente
             await updateSyncStatus(sessionId, 'syncing', 1);
 
-            // --- PONTO CRUCIAL 1: MAPA DE NOMES (NAME HUNTER V3) ---
+            // --- PONTO CRUCIAL 1: MAPA DE NOMES (NAME HUNTER V3.5) ---
             const contactsMap = new Map();
             let namesCount = 0;
 
             if (contacts) {
                 // 👇 LOGS DE DIAGNÓSTICO (SHERLOCK) 👇
-                // Isso vai nos dizer se o WhatsApp está mandando nomes ou se está "de castigo"
-                console.log(`🕵️ [SHERLOCK] Analisando ${contacts.length} contatos brutos recebidos...`);
-                if (contacts.length > 0) {
-                     console.log('🕵️ [AMOSTRA]:', JSON.stringify(contacts[0], null, 2));
-                }
-                // 👆 ------------------------------- 👆
+                console.log(`🕵️ [SHERLOCK] Analisando amostra de contatos...`);
+                // if (contacts.length > 0) console.log('Amostra:', JSON.stringify(contacts[0]));
 
                 contacts.forEach(c => {
-                    // Tenta achar nome em qualquer campo possível
+                    // PRIORIDADE DE NOMES:
+                    // 1. notify (PushName definido pelo usuário - MAIS CONFIÁVEL PARA B2B)
+                    // 2. name (Nome salvo na agenda do celular que conectou)
+                    // 3. verifiedName (WhatsApp Business API)
                     const bestName = c.notify || c.name || c.verifiedName || c.short;
                     
-                    // CORREÇÃO: Regex ajustada para NÃO matar nomes mistos (ex: "Loja 10")
-                    // Só descarta se a string inteira for APENAS números e símbolos
+                    // Regex: Se não for apenas números/símbolos, considera válido
                     if (bestName && !/^[\d\+\-\(\)\s]+$/.test(bestName)) {
                         // Mapeia ID original E ID limpo
                         contactsMap.set(c.id, bestName);
@@ -103,18 +102,19 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             // A. Salva Contatos da Lista (Garante que os nomes existam antes das msgs)
             const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
             
-            for (const c of validContacts) {
-                // Tenta pegar do mapa (que tem a versão limpa e a original)
-                const nameToSave = contactsMap.get(c.id) || contactsMap.get(cleanJid(c.id));
-                
-                // Pequeno delay para não gargalar o banco
-                await new Promise(r => setTimeout(r, 20)); 
-                
-                // Salva. Se não tiver nome, manda NULL.
-                await upsertContact(c.id, companyId, nameToSave || null);
+            // Processamento em lote para evitar gargalo
+            const batchSize = 50;
+            for (let i = 0; i < validContacts.length; i += batchSize) {
+                const batch = validContacts.slice(i, i + batchSize);
+                await Promise.all(batch.map(async (c) => {
+                    // Tenta pegar do mapa (prioridade total ao mapa)
+                    const nameToSave = contactsMap.get(c.id) || contactsMap.get(cleanJid(c.id));
+                    // Upsert inteligente (só substitui se for null/ruim)
+                    await upsertContact(c.id, companyId, nameToSave || null, c.imgUrl || null);
+                }));
             }
 
-            // B. Grupos (Salva o Subject como Nome)
+            // B. Grupos
             try {
                 const groups = await sock.groupFetchAllParticipating();
                 const groupList = Object.values(groups);
@@ -131,6 +131,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const messagesByChat = new Map();
             messages.forEach(msg => {
                 const unwrapped = unwrapMessage(msg);
+                if(!unwrapped.key || !unwrapped.key.remoteJid) return;
+                
                 const jid = unwrapped.key.remoteJid;
                 if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
                 messagesByChat.get(jid).push(unwrapped);
@@ -153,20 +155,13 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const totalMsgs = finalMessagesToProcess.length;
             console.log(`🧠 [FILTRO] ${totalMsgs} mensagens prontas para Sync Sequencial.`);
 
-            // D. PROCESSAMENTO SEQUENCIAL (AQUI A BARRA DEVE ANDAR)
+            // D. PROCESSAMENTO SEQUENCIAL
             let processedCount = 0;
-            
             for (const msg of finalMessagesToProcess) {
-                // Passa o contactsMap para tentar achar o nome se não vier na msg
                 await processSingleMessage(msg, sock, companyId, sessionId, false, contactsMap);
-                
                 processedCount++;
-                
-                // Atualiza a cada 3 mensagens (Feedback rápido)
-                if (processedCount % 3 === 0) {
+                if (processedCount % 5 === 0) {
                     const percent = Math.round((processedCount / totalMsgs) * 100);
-                    // LOG OBRIGATÓRIO PARA DEBUG
-                    console.log(`🔄 [SYNC] ${percent}% (${processedCount}/${totalMsgs})`);
                     await updateSyncStatus(sessionId, 'syncing', percent);
                 }
             }
@@ -177,7 +172,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         } catch (e) {
             console.error(`❌ [ERRO HISTÓRICO]`, e);
         } finally {
-            // Libera a trava após 15 segundos (segurança)
             setTimeout(() => { isProcessingHistory = false; }, 15000);
         }
     });
@@ -191,7 +185,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         if (type === 'notify' || type === 'append') {
             for (const msg of messages) {
                 const clean = unwrapMessage(msg);
-                await processSingleMessage(clean, sock, companyId, sessionId, true);
+                // No realtime, não passamos mapa estático, confiamos no pushName da mensagem
+                await processSingleMessage(clean, sock, companyId, sessionId, true, null);
             }
         }
     });
@@ -215,33 +210,30 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
         const fromMe = msg.key.fromMe;
         
-        // --- NAME HUNTER V3 (CORRIGIDO) ---
+        // --- NAME HUNTER V3.5 (REALTIME + MAPA) ---
+        // 1. Tenta pegar o pushName que vem JUNTO com a mensagem (Geralmente é o mais fresco)
         let finalName = msg.pushName;
 
-        // Se não veio na mensagem, tenta o mapa (usando ID limpo)
+        // 2. Se não veio na mensagem, tenta o mapa (para histórico)
         if (!finalName && contactsMap) {
             const clean = cleanJid(jid);
-            // Tenta ID exato e ID limpo
             finalName = contactsMap.get(jid) || contactsMap.get(clean);
         }
 
-        // Salva Contato (sync.js propaga para Leads)
-        // Se finalName ainda for nulo, upsertContact salvará NULL no nome, não o telefone.
+        // Salva Contato (sync.js decide se atualiza ou não baseado na regra de NULL)
         await upsertContact(jid, companyId, finalName);
         
-        // Fallback seguro para getContentType
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
         const body = getBody(msg.message);
 
         let leadId = null;
         // BLOQUEIO EXPLÍCITO DE GRUPOS COMO LEADS
         if (!jid.includes('@g.us') && !jid.includes('-')) {
-            // A proteção deve estar DENTRO da função ensureLeadExists se você não quiser grupos.
-            // Passamos o finalName (que pode ser null ou nome real)
+            // Passamos o finalName para o Lead também
             leadId = await ensureLeadExists(jid, companyId, finalName);
         }
         
-        // Mídia
+        // Mídia (Upload apenas em Realtime para performance)
         let mediaUrl = null;
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
