@@ -8,20 +8,23 @@ const logger = pino({ level: 'error' });
 
 const leadLock = new Set(); 
 
-// --- NAME SANITIZER ---
-// Retorna TRUE se for lixo (número puro, undefined, null)
+// --- NAME SANITIZER BLINDADO V5 ---
+// Retorna TRUE se o nome for lixo (número puro, undefined, null, só símbolos)
 const isGenericName = (name, phone) => {
     if (!name) return true;
-    const cleanName = name.trim();
+    const cleanName = name.toString().trim();
     if (cleanName.length === 0) return true;
     
-    // Se o nome for igual ao telefone (com ou sem DDI)
+    // Se o nome for apenas caracteres não alfabéticos (ex: "+55 11...", "---", "1234")
+    // Permite letras, acentos e emojis. Rejeita se só tiver números e pontuação.
+    if (/^[\d\s\+\-\(\)\.]+$/.test(cleanName)) return true;
+    
+    // Comparação direta com o telefone
     const cleanPhone = phone.replace(/\D/g, '');
     const cleanNameDigits = cleanName.replace(/\D/g, '');
     
     if (cleanNameDigits === cleanPhone) return true; // É o próprio número
-    if (cleanName.startsWith('+') && cleanNameDigits.length >= 10) return true; // Formato +55...
-
+    
     return false;
 };
 
@@ -38,10 +41,11 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         if (!jid || !companyId) return;
 
         const isGroup = jid.includes('@g.us');
-        const cleanJid = jid.split('@')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
+        // Normaliza JID (remove dispositivo :2, etc)
+        const cleanJid = jid.split('@')[0].split(':')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
         const phone = cleanJid.split('@')[0];
         
-        // 1. Busca dados atuais
+        // 1. Busca dados atuais (Leitura leve)
         const { data: current } = await supabase
             .from('contacts')
             .select('name, push_name, profile_pic_url')
@@ -54,10 +58,10 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             phone: phone,
             company_id: companyId,
             updated_at: new Date(),
-            last_message_at: new Date()
+            last_message_at: new Date() // Mantém o contato "vivo"
         };
 
-        // --- LÓGICA DE ATUALIZAÇÃO DE NOME (AGRESSIVA) ---
+        // --- LÓGICA DE ATUALIZAÇÃO DE NOME (AGRESSIVA V5) ---
         let finalName = null;
         let shouldUpdateLead = false;
         
@@ -65,19 +69,22 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         const currentIsGood = current && !isGenericName(current.name, phone);
 
         if (incomingIsGood) {
-            // Se chegou um nome bom...
-            updateData.push_name = incomingName; // Sempre salva no push_name para histórico
+            // Sempre salvamos o push_name se vier algo bom para histórico
+            updateData.push_name = incomingName; 
 
-            // Se o banco está vazio, nulo ou tem nome genérico -> SOBRESCREVE
+            // Se não temos um nome bom no banco, aceitamos o novo imediatamente
+            // OU se é a primeira vez (current é null)
             if (!currentIsGood) {
                 updateData.name = incomingName;
                 finalName = incomingName;
                 shouldUpdateLead = true;
-                // console.log(`[SYNC] Salvando nome novo: ${incomingName} para ${phone}`);
             } 
-            // Se o banco JÁ tem nome bom, e o novo é diferente, NÃO sobrescreve (preserva a agenda manual)
-            // A menos que seja a primeira importação (current.name pode ser antigo de outra sessão?)
-            // Por segurança: Agenda do celular (listener passa como incoming) deve ganhar.
+        } else {
+            // Se o que chegou é ruim (null ou número), mas não temos nada no banco
+            // Forçamos NULL para evitar salvar o número como nome (regra do sanitizer)
+            if (!current && !currentIsGood) {
+                updateData.name = null;
+            }
         }
 
         if (profilePicUrl) {
@@ -93,12 +100,22 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             // [PROPAGAÇÃO PARA LEADS]
             // Se descobrimos um nome novo para o contato, atualiza o Lead
             // MAS APENAS se o Lead estiver sem nome ou com nome genérico
-            await supabase
+            
+            // 1. Busca Lead Existente
+            const { data: lead } = await supabase
                 .from('leads')
-                .update({ name: finalName })
+                .select('id, name')
                 .eq('company_id', companyId)
                 .ilike('phone', `%${phone}%`)
-                .or(`name.is.null,name.eq.${phone},name.eq.+${phone}`); // Critério de segurança
+                .limit(1)
+                .maybeSingle();
+
+            // 2. Se existir e o nome for ruim (ou igual ao telefone), atualiza
+            if (lead) {
+                if (isGenericName(lead.name, phone)) {
+                    await supabase.from('leads').update({ name: finalName }).eq('id', lead.id);
+                }
+            }
         }
     } catch (e) {
         logger.error({ err: e.message }, 'Erro upsertContact');
@@ -108,7 +125,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 export const ensureLeadExists = async (jid, companyId, pushName) => {
     if (!jid || jid.endsWith('@g.us') || jid.includes('status@broadcast')) return null; 
 
-    const phone = jid.split('@')[0];
+    const phone = jid.split('@')[0].split(':')[0]; // Clean phone
     if (!/^\d+$/.test(phone)) return null;
     
     const lockKey = `${companyId}:${phone}`;
@@ -120,7 +137,7 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         const { data: existing } = await supabase.from('leads').select('id, name').eq('phone', phone).eq('company_id', companyId).maybeSingle();
 
         if (existing) {
-            // Atualiza nome do lead existente se ele não tiver nome
+            // Atualiza nome do lead existente se ele não tiver nome bom e o novo for bom
             if (pushName && !isGenericName(pushName, phone) && isGenericName(existing.name, phone)) {
                 await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
             }
@@ -152,11 +169,11 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
 export const upsertMessage = async (msgData) => {
     try {
         // Pequeno delay para garantir que o contato foi criado antes da mensagem
-        await new Promise(resolve => setTimeout(resolve, 300));
+        await new Promise(resolve => setTimeout(resolve, 150));
         const { error } = await supabase.from('messages').upsert(msgData, { onConflict: 'remote_jid, whatsapp_id' });
         if (error) throw error;
     } catch (e) {
-        logger.error({ err: e.message }, 'Erro upsertMessage');
+        // logger.error({ err: e.message }, 'Erro upsertMessage');
     }
 };
 
