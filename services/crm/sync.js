@@ -6,27 +6,25 @@ import pino from "pino";
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'error' });
 
-// Cache removido da lógica crítica para garantir salvamento agressivo
-const contactCache = new Set();
 const leadLock = new Set(); 
 
-// --- FUNÇÃO AUXILIAR BLINDADA (NAME HUNTER) ---
-// Retorna TRUE se o nome for apenas um número, símbolo ou genérico
+// --- NAME SANITIZER ---
+// Retorna TRUE se for lixo (número puro, undefined, null)
 const isGenericName = (name, phone) => {
     if (!name) return true;
+    const cleanName = name.toString().trim();
+    if (cleanName.length === 0) return true;
     
-    // Limpa tudo que não é dígito para comparação bruta
-    const cleanName = name.replace(/\D/g, ''); 
+    // Se o nome for igual ao telefone (com ou sem DDI)
     const cleanPhone = phone.replace(/\D/g, '');
+    const cleanNameDigits = cleanName.replace(/\D/g, '');
     
-    // Regra: Se o nome só tem números e símbolos
-    const isJustNumbersAndSymbols = /^[\d\+\-\(\)\s]+$/.test(name);
-
-    return cleanName.includes(cleanPhone) || 
-           name === phone || 
-           name.startsWith('+') || 
-           isJustNumbersAndSymbols ||
-           (cleanName.length > 7 && /[0-9]{5,}/.test(name));
+    // Regra: Se o nome for só números, é genérico.
+    if (/^[\d\s\+\-\(\)]+$/.test(cleanName)) return true;
+    
+    if (cleanNameDigits === cleanPhone) return true; // É o próprio número
+    
+    return false;
 };
 
 export const updateSyncStatus = async (sessionId, status, percent = 0) => {
@@ -37,15 +35,16 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     } catch (e) {}
 };
 
-export const upsertContact = async (jid, companyId, pushName = null, profilePicUrl = null) => {
+export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null) => {
     try {
         if (!jid || !companyId) return;
 
         const isGroup = jid.includes('@g.us');
-        const cleanJid = jid.split('@')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
+        // Normaliza JID (remove dispositivo :2, etc)
+        const cleanJid = jid.split('@')[0].split(':')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
         const phone = cleanJid.split('@')[0];
         
-        // 1. Busca dados atuais
+        // 1. Busca dados atuais (Leitura leve)
         const { data: current } = await supabase
             .from('contacts')
             .select('name, push_name, profile_pic_url')
@@ -58,39 +57,32 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
             phone: phone,
             company_id: companyId,
             updated_at: new Date(),
-            last_message_at: new Date()
+            last_message_at: new Date() // Mantém o contato "vivo"
         };
 
-        // --- LÓGICA DE OURO: NAME HUNTER ---
+        // --- LÓGICA DE ATUALIZAÇÃO DE NOME (AGRESSIVA v2) ---
         let finalName = null;
         let shouldUpdateLead = false;
         
-        const incomingNameValid = pushName && pushName.trim().length > 0 && !isGenericName(pushName, phone);
-        const currentNameValid = current?.name && !isGenericName(current.name, phone);
+        const incomingIsGood = !isGenericName(incomingName, phone);
+        const currentIsGood = current && !isGenericName(current.name, phone);
 
-        // LOG DE DIAGNÓSTICO
-        // console.log(`[NAME_HUNTER] JID: ${phone} | Incoming: "${pushName}" | Current DB: "${current?.name}"`);
+        if (incomingIsGood) {
+            // Sempre salvamos o push_name se vier algo bom
+            updateData.push_name = incomingName; 
 
-        if (incomingNameValid) {
-            // Se chegou um nome bom...
-            updateData.push_name = pushName; // Sempre atualiza o push_name com o mais recente
-
-            if (!currentNameValid) {
-                // ...e o banco está vazio ou com número -> SALVA O NOME NOVO
-                updateData.name = pushName;
-                finalName = pushName;
+            // Se não temos um nome bom no banco, aceitamos o novo imediatamente
+            if (!currentIsGood) {
+                updateData.name = incomingName;
+                finalName = incomingName;
                 shouldUpdateLead = true;
-                // console.log(`[NAME_HUNTER] Atualizando Nome: ${pushName}`);
-            } else {
-                // ...mas o banco já tem um nome bom -> MANTÉM O DO BANCO (Ignora)
-                // console.log(`[NAME_HUNTER] Mantendo existente: ${current.name}`);
-            }
+                // console.log(`[NAME HUNTER] Salvando novo nome: ${incomingName} para ${phone}`);
+            } 
         } else {
-            // Se chegou nome ruim (ou null)...
-            if (!currentNameValid && !current) {
-                // ...e não existe nada no banco -> FORÇA NULL (Nunca salve número como nome)
+            // Se o que chegou é ruim (null ou número), mas não temos nada no banco
+            // Forçamos NULL para evitar salvar o número como nome (regra do sanitizer)
+            if (!current && !currentIsGood) {
                 updateData.name = null;
-                // console.log(`[NAME_HUNTER] Salvando NULL (Nome genérico/vazio)`);
             }
         }
 
@@ -98,21 +90,32 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
             updateData.profile_pic_url = profilePicUrl;
         }
 
+        // Executa UPSERT
         const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
 
         if (error) {
              console.error('[CONTACT SYNC ERROR]', error.message);
         } else if (shouldUpdateLead && finalName && !isGroup) {
             // [PROPAGAÇÃO PARA LEADS]
-            // Se descobrimos um nome novo para o contato, atualiza o Lead também
-            const { error: leadError } = await supabase
-                .from('leads')
-                .update({ name: finalName })
-                .eq('company_id', companyId)
-                .ilike('phone', `%${phone}%`) // Match flexível pelo telefone
-                .is('name', null); // SÓ ATUALIZA SE O LEAD ESTIVER SEM NOME (Regra de Ouro)
+            // Se descobrimos um nome novo para o contato, atualiza o Lead
+            // MAS APENAS se o Lead estiver sem nome ou com nome genérico
             
-            if (leadError) console.error('[LEAD SYNC ERROR]', leadError.message);
+            // 1. Busca Lead Existente
+            const { data: lead } = await supabase
+                .from('leads')
+                .select('id, name')
+                .eq('company_id', companyId)
+                .ilike('phone', `%${phone}%`)
+                .limit(1)
+                .maybeSingle();
+
+            // 2. Se existir e o nome for ruim, atualiza
+            if (lead) {
+                if (isGenericName(lead.name, phone)) {
+                    await supabase.from('leads').update({ name: finalName }).eq('id', lead.id);
+                    // console.log(`[LEAD SYNC] Nome do lead atualizado: ${finalName}`);
+                }
+            }
         }
     } catch (e) {
         logger.error({ err: e.message }, 'Erro upsertContact');
@@ -120,12 +123,9 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
 };
 
 export const ensureLeadExists = async (jid, companyId, pushName) => {
-    // Bloqueios de segurança
-    if (!jid || jid.endsWith('@g.us') || jid.includes('-') || jid.includes('status@broadcast') || jid.endsWith('@newsletter') || jid.endsWith('@lid')) {
-        return null; 
-    }
+    if (!jid || jid.endsWith('@g.us') || jid.includes('status@broadcast')) return null; 
 
-    const phone = jid.split('@')[0];
+    const phone = jid.split('@')[0].split(':')[0]; // Clean phone
     if (!/^\d+$/.test(phone)) return null;
     
     const lockKey = `${companyId}:${phone}`;
@@ -137,17 +137,15 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         const { data: existing } = await supabase.from('leads').select('id, name').eq('phone', phone).eq('company_id', companyId).maybeSingle();
 
         if (existing) {
-            // Se achou nome melhor agora e o lead atual tem nome ruim/null, atualiza
-            if (pushName && !isGenericName(pushName, phone)) {
-                 if (!existing.name || isGenericName(existing.name, phone)) {
-                    await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
-                 }
+            // Atualiza nome do lead existente se ele não tiver nome bom e o novo for bom
+            if (pushName && !isGenericName(pushName, phone) && isGenericName(existing.name, phone)) {
+                await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
             }
             return existing.id;
         }
 
-        // [SEM LEAD]
-        // Se tem nome válido, usa. Se não, usa NULL (Regra: Nunca salvar número como nome)
+        // [NOVO LEAD]
+        // Se tem nome válido, usa. Se não, usa NULL (deixa o frontend lidar ou futura atualização)
         const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : null;
         
         const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
@@ -162,7 +160,6 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
 
         return newLead?.id;
     } catch (e) {
-        logger.error({ err: e.message }, 'Erro ensureLeadExists');
         return null;
     } finally {
         leadLock.delete(lockKey);
@@ -171,12 +168,12 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
 
 export const upsertMessage = async (msgData) => {
     try {
-        // Delay UX mantido
-        await new Promise(resolve => setTimeout(resolve, 250));
+        // Pequeno delay para garantir que o contato foi criado antes da mensagem
+        await new Promise(resolve => setTimeout(resolve, 150));
         const { error } = await supabase.from('messages').upsert(msgData, { onConflict: 'remote_jid, whatsapp_id' });
         if (error) throw error;
     } catch (e) {
-        logger.error({ err: e.message }, 'Erro upsertMessage');
+        // logger.error({ err: e.message }, 'Erro upsertMessage');
     }
 };
 
