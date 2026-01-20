@@ -20,9 +20,12 @@ const logger = pino({ level: 'silent' });
 let isProcessingHistory = false;
 
 // --- Helpers Internos ---
+// JID Cleaner V2: Remove sufixos de dispositivo (:2, :44) para garantir match no banco
 const cleanJid = (jid) => {
     if (!jid) return null;
-    return jid.split(':')[0].split('@')[0] + (jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net');
+    const temp = jid.split('@')[0].split(':')[0]; // Remove device part
+    const suffix = jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net';
+    return temp + suffix;
 };
 
 const unwrapMessage = (msg) => {
@@ -55,89 +58,87 @@ const getBody = (msg) => {
 // CONFIGURAÇÃO DOS LISTENERS
 // ==============================================================================
 export const setupListeners = ({ sock, sessionId, companyId }) => {
+    
     // --- 1. HISTÓRICO INTELIGENTE (COM TRAVA) ---
     sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
-        // [TRAVA] Se já estamos processando, ignora o segundo disparo
         if (isProcessingHistory) {
-            console.warn(`⚠️ [HISTÓRICO] Disparo duplicado ignorado para evitar erro.`);
+            console.warn(`⚠️ [HISTÓRICO] Ignorando duplicação de evento.`);
             return;
         }
         isProcessingHistory = true;
 
         try {
-            console.log(`📚 [HISTÓRICO] Iniciando Processamento Único...`);
-            console.log(`   - Contatos recebidos: ${contacts.length}`);
-            console.log(`   - Mensagens recebidas: ${messages.length}`);
-            
-            // Força o frontend a mostrar a barra imediatamente
-            await updateSyncStatus(sessionId, 'syncing', 1);
+            console.log(`📚 [HISTÓRICO] Iniciando Sync... Sessão: ${sessionId}`);
+            await updateSyncStatus(sessionId, 'importing_contacts', 5);
 
-            // --- PONTO CRUCIAL 1: MAPA DE NOMES (NAME HUNTER V3.5) ---
+            // --- MAPA DE NOMES (NAME HUNTER V5.0) ---
+            // Usa Map para O(1) lookup. Chave = cleanJid
             const contactsMap = new Map();
-            let namesCount = 0;
+            let namesFound = 0;
 
-            if (contacts) {
-                // 👇 LOGS DE DIAGNÓSTICO (SHERLOCK) 👇
-                console.log(`🕵️ [SHERLOCK] Analisando amostra de contatos...`);
-                // if (contacts.length > 0) console.log('Amostra:', JSON.stringify(contacts[0]));
-
+            if (contacts && contacts.length > 0) {
                 contacts.forEach(c => {
-                    // PRIORIDADE DE NOMES:
-                    // 1. notify (PushName definido pelo usuário - MAIS CONFIÁVEL PARA B2B)
-                    // 2. name (Nome salvo na agenda do celular que conectou)
-                    // 3. verifiedName (WhatsApp Business API)
-                    const bestName = c.notify || c.name || c.verifiedName || c.short;
+                    // Prioridade: Agenda (name) > Push (notify) > Verificado (verifiedName)
+                    const bestName = c.name || c.notify || c.verifiedName || c.short;
                     
-                    // Regex: Se não for apenas números/símbolos, considera válido
-                    if (bestName && !/^[\d\+\-\(\)\s]+$/.test(bestName)) {
-                        // Mapeia ID original E ID limpo
-                        contactsMap.set(c.id, bestName);
-                        contactsMap.set(cleanJid(c.id), bestName); 
-                        namesCount++;
+                    if (bestName) {
+                        const jidKey = cleanJid(c.id);
+                        if(jidKey) {
+                            contactsMap.set(jidKey, bestName);
+                            namesFound++;
+                        }
                     }
                 });
             }
-            console.log(`🗺️ [MAPA] ${namesCount} nomes reais identificados na memória.`);
+            console.log(`🗺️ [MAPA] ${namesFound} nomes reais mapeados.`);
 
-            // A. Salva Contatos da Lista (Garante que os nomes existam antes das msgs)
-            const validContacts = contacts.filter(c => c.id.endsWith('@s.whatsapp.net'));
+            // A. Salva Contatos (Lote)
+            await updateSyncStatus(sessionId, 'importing_messages', 20);
             
-            // Processamento em lote para evitar gargalo
-            const batchSize = 50;
+            // Filtra JIDs válidos
+            const validContacts = contacts.filter(c => c.id && (c.id.endsWith('@s.whatsapp.net') || c.id.endsWith('@g.us')));
+            
+            const batchSize = 100;
             for (let i = 0; i < validContacts.length; i += batchSize) {
                 const batch = validContacts.slice(i, i + batchSize);
                 await Promise.all(batch.map(async (c) => {
-                    // Tenta pegar do mapa (prioridade total ao mapa)
-                    const nameToSave = contactsMap.get(c.id) || contactsMap.get(cleanJid(c.id));
-                    // Upsert inteligente (só substitui se for null/ruim)
-                    await upsertContact(c.id, companyId, nameToSave || null, c.imgUrl || null);
+                    const jidKey = cleanJid(c.id);
+                    // Pega do mapa ou tenta propriedades diretas de novo
+                    const nameToSave = contactsMap.get(jidKey) || c.name || c.notify;
+                    // Manda para o Sync.js decidir (ele tem a lógica de isGenericName)
+                    await upsertContact(jidKey, companyId, nameToSave || null, c.imgUrl || null);
                 }));
             }
-
-            // B. Grupos
+            
+            // B. Grupos (Refresh Forçado)
             try {
                 const groups = await sock.groupFetchAllParticipating();
                 const groupList = Object.values(groups);
-                console.log(`👥 [GRUPOS] ${groupList.length} grupos.`);
+                console.log(`👥 [GRUPOS] Sincronizando ${groupList.length} grupos...`);
                 for (const g of groupList) {
                     await upsertContact(g.id, companyId, g.subject, null);
+                    contactsMap.set(g.id, g.subject); // Atualiza mapa para as mensagens usarem
                 }
             } catch (e) {}
 
-            // C. Filtros de Mensagens
-            const MAX_CHATS = 50;            
-            const MAX_MSGS_PER_CHAT = 15;
+            // C. Mensagens (Processamento)
+            await updateSyncStatus(sessionId, 'processing_history', 50);
+            const MAX_CHATS = 60;            
+            const MAX_MSGS_PER_CHAT = 25;
             
             const messagesByChat = new Map();
             messages.forEach(msg => {
                 const unwrapped = unwrapMessage(msg);
                 if(!unwrapped.key || !unwrapped.key.remoteJid) return;
                 
-                const jid = unwrapped.key.remoteJid;
+                const jid = cleanJid(unwrapped.key.remoteJid); // Normaliza chave
+                if (jid === 'status@broadcast') return;
+
                 if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
                 messagesByChat.get(jid).push(unwrapped);
             });
 
+            // Ordena chats por atividade recente
             const sortedChats = Array.from(messagesByChat.entries()).sort(([, msgsA], [, msgsB]) => {
                 const timeA = Math.max(...msgsA.map(m => m.messageTimestamp || 0));
                 const timeB = Math.max(...msgsB.map(m => m.messageTimestamp || 0));
@@ -146,55 +147,67 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
             const topChats = sortedChats.slice(0, MAX_CHATS);
             let finalMessagesToProcess = [];
+            
             topChats.forEach(([jid, msgs]) => {
+                // Ordena mensagens (Antigas -> Novas)
                 msgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                 const limited = msgs.slice(-MAX_MSGS_PER_CHAT);
                 finalMessagesToProcess.push(...limited);
             });
 
             const totalMsgs = finalMessagesToProcess.length;
-            console.log(`🧠 [FILTRO] ${totalMsgs} mensagens prontas para Sync Sequencial.`);
+            console.log(`🧠 [FILTRO] ${totalMsgs} mensagens selecionadas.`);
 
-            // D. PROCESSAMENTO SEQUENCIAL
+            // D. Sync Sequencial
             let processedCount = 0;
             for (const msg of finalMessagesToProcess) {
-                await processSingleMessage(msg, sock, companyId, sessionId, false, contactsMap);
+                const jidKey = cleanJid(msg.key.remoteJid);
+                
+                // Tenta nome da mensagem (pushName) OU do mapa construído (Agenda)
+                const msgPushName = msg.pushName;
+                const mapName = contactsMap.get(jidKey);
+                
+                // Prioridade: Mapa (Agenda) > Msg (PushName)
+                const finalName = mapName || msgPushName; 
+
+                await processSingleMessage(msg, sock, companyId, sessionId, false, finalName);
+                
                 processedCount++;
-                if (processedCount % 5 === 0) {
-                    const percent = Math.round((processedCount / totalMsgs) * 100);
-                    await updateSyncStatus(sessionId, 'syncing', percent);
+                if (processedCount % 20 === 0) {
+                    const percent = 50 + Math.round((processedCount / totalMsgs) * 50);
+                    await updateSyncStatus(sessionId, 'processing_history', percent);
                 }
             }
 
-            await updateSyncStatus(sessionId, 'online', 100);
-            console.log(`✅ [HISTÓRICO] Concluído com sucesso.`);
+            await updateSyncStatus(sessionId, 'completed', 100);
+            console.log(`✅ [HISTÓRICO] Importação finalizada.`);
 
         } catch (e) {
             console.error(`❌ [ERRO HISTÓRICO]`, e);
         } finally {
-            setTimeout(() => { isProcessingHistory = false; }, 15000);
+            setTimeout(() => { isProcessingHistory = false; }, 10000);
         }
     });
 
     // --- Eventos Realtime ---
-    sock.ev.on('groups.update', async (groups) => {
-        for (const g of groups) if (g.subject) await upsertContact(g.id, companyId, g.subject);
+    sock.ev.on('contacts.upsert', async (contacts) => {
+        for (const c of contacts) {
+            // Prioridade Agenda > Perfil
+            const bestName = c.name || c.notify || c.verifiedName || null;
+            if (bestName) {
+                const jid = cleanJid(c.id);
+                await upsertContact(jid, companyId, bestName, c.imgUrl || null);
+            }
+        }
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type === 'notify' || type === 'append') {
             for (const msg of messages) {
                 const clean = unwrapMessage(msg);
-                // No realtime, não passamos mapa estático, confiamos no pushName da mensagem
-                await processSingleMessage(clean, sock, companyId, sessionId, true, null);
+                // No realtime, usamos o pushName da mensagem como fallback imediato
+                await processSingleMessage(clean, sock, companyId, sessionId, true, clean.pushName);
             }
-        }
-    });
-
-    sock.ev.on('contacts.upsert', async (contacts) => {
-        for (const c of contacts) {
-            const bestName = c.notify || c.name || c.verifiedName || null;
-            await upsertContact(c.id, companyId, bestName, c.imgUrl || null);
         }
     });
 };
@@ -202,38 +215,32 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 // ==============================================================================
 // PROCESSADOR UNITÁRIO
 // ==============================================================================
-const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime, contactsMap = null) => {
+const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime, forcedName = null) => {
     try {
         if (!msg.message) return;
-        const jid = msg.key.remoteJid;
+        const jid = cleanJid(msg.key.remoteJid);
         if (jid === 'status@broadcast') return;
 
         const fromMe = msg.key.fromMe;
         
-        // --- NAME HUNTER V3.5 (REALTIME + MAPA) ---
-        // 1. Tenta pegar o pushName que vem JUNTO com a mensagem (Geralmente é o mais fresco)
-        let finalName = msg.pushName;
-
-        // 2. Se não veio na mensagem, tenta o mapa (para histórico)
-        if (!finalName && contactsMap) {
-            const clean = cleanJid(jid);
-            finalName = contactsMap.get(jid) || contactsMap.get(clean);
+        // --- NAME HUNTER V5.0 (RESOLUÇÃO FINAL) ---
+        // Se recebemos um nome forçado (do mapa ou pushName), usamos.
+        if (forcedName) {
+            // upsertContact já tem a inteligência de não sobrescrever se for ruim
+            await upsertContact(jid, companyId, forcedName);
         }
-
-        // Salva Contato (sync.js decide se atualiza ou não baseado na regra de NULL)
-        await upsertContact(jid, companyId, finalName);
         
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
         const body = getBody(msg.message);
 
         let leadId = null;
         // BLOQUEIO EXPLÍCITO DE GRUPOS COMO LEADS
-        if (!jid.includes('@g.us') && !jid.includes('-')) {
-            // Passamos o finalName para o Lead também
-            leadId = await ensureLeadExists(jid, companyId, finalName);
+        if (jid && !jid.includes('@g.us')) {
+            // Se tiver nome, passamos para criar/atualizar o lead
+            leadId = await ensureLeadExists(jid, companyId, forcedName);
         }
         
-        // Mídia (Upload apenas em Realtime para performance)
+        // Mídia (Apenas Realtime)
         let mediaUrl = null;
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
@@ -265,6 +272,6 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         });
 
     } catch (e) {
-        console.error(`Erro process msg:`, e.message);
+        // console.error(`Erro process msg:`, e.message);
     }
 };
