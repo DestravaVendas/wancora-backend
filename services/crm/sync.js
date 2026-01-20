@@ -1,3 +1,4 @@
+
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
@@ -44,6 +45,7 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         const cleanJid = jid.split('@')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
         const phone = cleanJid.split('@')[0];
         
+        // 1. Busca dados atuais
         const { data: current } = await supabase
             .from('contacts')
             .select('name, push_name, profile_pic_url')
@@ -59,30 +61,37 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
             last_message_at: new Date()
         };
 
-        let finalName = current?.name;
+        // --- LÓGICA DE OURO: NAME HUNTER ---
+        let finalName = null;
         let shouldUpdateLead = false;
+        
+        const incomingNameValid = pushName && pushName.trim().length > 0 && !isGenericName(pushName, phone);
+        const currentNameValid = current?.name && !isGenericName(current.name, phone);
 
-        // --- LÓGICA DE PRIORIDADE (NAME HUNTER) ---
-        if (pushName && pushName.trim().length > 0 && !isGenericName(pushName, phone)) {
-            updateData.push_name = pushName;
-            
-            const currentName = current?.name;
-            const isCurrentBad = !currentName || isGenericName(currentName, phone);
+        // LOG DE DIAGNÓSTICO
+        // console.log(`[NAME_HUNTER] JID: ${phone} | Incoming: "${pushName}" | Current DB: "${current?.name}"`);
 
-            // Se o nome atual no banco for ruim (NULL ou Número), sobrescreve!
-            // Se já tiver um nome bom (Ex: "Cliente VIP"), ISSO AQUI DÁ FALSE e mantém o seu nome.
-            if (isCurrentBad) {
+        if (incomingNameValid) {
+            // Se chegou um nome bom...
+            updateData.push_name = pushName; // Sempre atualiza o push_name com o mais recente
+
+            if (!currentNameValid) {
+                // ...e o banco está vazio ou com número -> SALVA O NOME NOVO
                 updateData.name = pushName;
-                finalName = pushName;    
-                shouldUpdateLead = true; 
+                finalName = pushName;
+                shouldUpdateLead = true;
+                // console.log(`[NAME_HUNTER] Atualizando Nome: ${pushName}`);
+            } else {
+                // ...mas o banco já tem um nome bom -> MANTÉM O DO BANCO (Ignora)
+                // console.log(`[NAME_HUNTER] Mantendo existente: ${current.name}`);
             }
-        } else if (!current) {
-            // Contato novo sem nome? Manda NULL.
-            updateData.name = null; 
-            finalName = null; 
-        } else if (current && isGenericName(current.name, phone)) {
-            // Se já existe mas é número, limpa para NULL
-            updateData.name = null;
+        } else {
+            // Se chegou nome ruim (ou null)...
+            if (!currentNameValid && !current) {
+                // ...e não existe nada no banco -> FORÇA NULL (Nunca salve número como nome)
+                updateData.name = null;
+                // console.log(`[NAME_HUNTER] Salvando NULL (Nome genérico/vazio)`);
+            }
         }
 
         if (profilePicUrl) {
@@ -94,13 +103,16 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         if (error) {
              console.error('[CONTACT SYNC ERROR]', error.message);
         } else if (shouldUpdateLead && finalName && !isGroup) {
-            // [ATUALIZAÇÃO SEGURA]
-            // Chama a RPC para garantir que nomes manuais não sejam sobrescritos
-            await supabase.rpc('update_lead_name_safely', {
-                p_company_id: companyId,
-                p_phone: phone,
-                p_new_name: finalName
-            });
+            // [PROPAGAÇÃO PARA LEADS]
+            // Se descobrimos um nome novo para o contato, atualiza o Lead também
+            const { error: leadError } = await supabase
+                .from('leads')
+                .update({ name: finalName })
+                .eq('company_id', companyId)
+                .ilike('phone', `%${phone}%`) // Match flexível pelo telefone
+                .is('name', null); // SÓ ATUALIZA SE O LEAD ESTIVER SEM NOME (Regra de Ouro)
+            
+            if (leadError) console.error('[LEAD SYNC ERROR]', leadError.message);
         }
     } catch (e) {
         logger.error({ err: e.message }, 'Erro upsertContact');
@@ -125,16 +137,17 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         const { data: existing } = await supabase.from('leads').select('id, name').eq('phone', phone).eq('company_id', companyId).maybeSingle();
 
         if (existing) {
-            // Se achou nome melhor agora, atualiza
-            // AQUI TAMBÉM: Só atualiza se o nome atual for ruim.
-            if (pushName && !isGenericName(pushName, phone) && isGenericName(existing.name, phone)) {
-                await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
+            // Se achou nome melhor agora e o lead atual tem nome ruim/null, atualiza
+            if (pushName && !isGenericName(pushName, phone)) {
+                 if (!existing.name || isGenericName(existing.name, phone)) {
+                    await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
+                 }
             }
             return existing.id;
         }
 
-        // [SEM LEAD 1234]
-        // Se tem nome válido, usa. Se não, usa NULL.
+        // [SEM LEAD]
+        // Se tem nome válido, usa. Se não, usa NULL (Regra: Nunca salvar número como nome)
         const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : null;
         
         const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
