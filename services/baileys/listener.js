@@ -105,8 +105,12 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     const jidKey = cleanJid(c.id);
                     // Pega do mapa ou tenta propriedades diretas de novo
                     const nameToSave = contactsMap.get(jidKey) || c.name || c.notify;
-                    // Manda para o Sync.js decidir (ele tem a lógica de isGenericName)
-                    await upsertContact(jidKey, companyId, nameToSave || null, c.imgUrl || null);
+                    
+                    // CHECK: Se veio c.name, é da Agenda!
+                    // Isso ativa o modo de sobrescrita no sync.js
+                    const isFromBook = !!c.name; 
+
+                    await upsertContact(jidKey, companyId, nameToSave || null, c.imgUrl || null, isFromBook);
                 }));
             }
             
@@ -116,8 +120,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 const groupList = Object.values(groups);
                 console.log(`👥 [GRUPOS] Sincronizando ${groupList.length} grupos...`);
                 for (const g of groupList) {
-                    await upsertContact(g.id, companyId, g.subject, null);
-                    contactsMap.set(g.id, g.subject); // Atualiza mapa para as mensagens usarem
+                    // Grupos sempre são "isFromBook=true" pois o nome do grupo é absoluto
+                    await upsertContact(g.id, companyId, g.subject, null, true);
+                    contactsMap.set(g.id, g.subject); 
                 }
             } catch (e) {}
 
@@ -170,6 +175,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 // Prioridade: Mapa (Agenda) > Msg (PushName)
                 const finalName = mapName || msgPushName; 
 
+                // Mensagens históricas nunca sobrescrevem agenda explicitamente (isFromBook=false)
+                // Isso protege contra pushNames antigos sujando o banco
                 await processSingleMessage(msg, sock, companyId, sessionId, false, finalName);
                 
                 processedCount++;
@@ -196,7 +203,11 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const bestName = c.name || c.notify || c.verifiedName || null;
             if (bestName) {
                 const jid = cleanJid(c.id);
-                await upsertContact(jid, companyId, bestName, c.imgUrl || null);
+                
+                // DETECÇÃO CRÍTICA: Se 'c.name' existe, é atualização da agenda!
+                const isFromBook = !!c.name;
+                
+                await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook);
             }
         }
     });
@@ -205,7 +216,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         if (type === 'notify' || type === 'append') {
             for (const msg of messages) {
                 const clean = unwrapMessage(msg);
-                // No realtime, usamos o pushName da mensagem como fallback imediato
+                // Mensagens novas podem trazer nomes, mas NÃO são "da agenda" (isFromBook=false).
+                // Isso impede que um cliente mudando o nome no perfil sobrescreva o nome que você salvou.
                 await processSingleMessage(clean, sock, companyId, sessionId, true, clean.pushName);
             }
         }
@@ -224,9 +236,8 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         const fromMe = msg.key.fromMe;
         
         // --- NAME HUNTER V5.0 (RESOLUÇÃO FINAL) ---
-        // Se recebemos um nome forçado (do mapa ou pushName), usamos.
         if (forcedName) {
-            // upsertContact já tem a inteligência de não sobrescrever se for ruim
+            // upsertContact tem isFromBook=false por padrão aqui
             await upsertContact(jid, companyId, forcedName);
         }
         
