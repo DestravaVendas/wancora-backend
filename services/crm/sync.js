@@ -36,7 +36,8 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     } catch (e) {}
 };
 
-export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null) => {
+// PATCH: Adicionado parâmetro `isFromBook` (Prioridade Alta)
+export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false) => {
     try {
         if (!jid || !companyId) return;
 
@@ -61,23 +62,33 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             last_message_at: new Date() // Mantém o contato "vivo"
         };
 
-        // --- LÓGICA DE ATUALIZAÇÃO DE NOME (AGRESSIVA V5) ---
+        // --- LÓGICA DE PRIORIDADE (NAME HUNTER V5 + AUTHORITY) ---
         let finalName = null;
         let shouldUpdateLead = false;
         
+        // O nome que chegou é válido?
         const incomingIsGood = !isGenericName(incomingName, phone);
+        // O nome que já temos no banco é válido?
         const currentIsGood = current && !isGenericName(current.name, phone);
 
         if (incomingIsGood) {
-            // Sempre salvamos o push_name se vier algo bom para histórico
+            // Sempre salvamos o push_name se vier algo bom para histórico/debug
             updateData.push_name = incomingName; 
 
-            // Se não temos um nome bom no banco, aceitamos o novo imediatamente
-            // OU se é a primeira vez (current é null)
-            if (!currentIsGood) {
-                updateData.name = incomingName;
-                finalName = incomingName;
-                shouldUpdateLead = true;
+            // DECISÃO DE ATUALIZAÇÃO DO NOME PRINCIPAL (Display Name)
+            // 1. Se o banco está vazio ou tem nome ruim -> ATUALIZA SEMPRE.
+            // 2. Se a origem é a AGENDA (isFromBook) -> FORCE UPDATE (O usuário mandou).
+            // 3. Se não é da agenda (PushName), SÓ atualiza se o banco estiver ruim.
+            
+            const shouldOverwrite = !currentIsGood || isFromBook;
+
+            if (shouldOverwrite) {
+                // Só dispara update se o nome for realmente diferente
+                if (!current || current.name !== incomingName) {
+                    updateData.name = incomingName;
+                    finalName = incomingName;
+                    shouldUpdateLead = true;
+                }
             } 
         } else {
             // Se o que chegou é ruim (null ou número), mas não temos nada no banco
@@ -98,8 +109,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
              console.error('[CONTACT SYNC ERROR]', error.message);
         } else if (shouldUpdateLead && finalName && !isGroup) {
             // [PROPAGAÇÃO PARA LEADS]
-            // Se descobrimos um nome novo para o contato, atualiza o Lead
-            // MAS APENAS se o Lead estiver sem nome ou com nome genérico
+            // Atualiza o Lead se o contato mudou de nome
             
             // 1. Busca Lead Existente
             const { data: lead } = await supabase
@@ -110,9 +120,11 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
                 .limit(1)
                 .maybeSingle();
 
-            // 2. Se existir e o nome for ruim (ou igual ao telefone), atualiza
+            // 2. Regra de Atualização do Lead:
+            // - Se o Lead tem nome ruim (Número) -> Atualiza.
+            // - Se veio da Agenda (isFromBook) -> Atualiza (Sincronia total Agenda -> CRM).
             if (lead) {
-                if (isGenericName(lead.name, phone)) {
+                if (isGenericName(lead.name, phone) || isFromBook) {
                     await supabase.from('leads').update({ name: finalName }).eq('id', lead.id);
                 }
             }
