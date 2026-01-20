@@ -1,290 +1,199 @@
 
-import {
-    upsertContact,
-    upsertMessage,
-    ensureLeadExists,
-    updateSyncStatus
-} from '../crm/sync.js';
-import {
-    downloadMediaMessage,
-    getContentType
-} from '@whiskeysockets/baileys';
-import pino from 'pino';
-import { createClient } from '@supabase/supabase-js';
-import mime from 'mime-types';
+import { createClient } from "@supabase/supabase-js";
+import pino from "pino";
 
+// Inicializa o cliente Supabase
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const logger = pino({ level: 'silent' });
+const logger = pino({ level: 'error' });
 
-// --- TRAVA DE SEGURANÇA (EVITA ATROPELAMENTO) ---
-let isProcessingHistory = false;
+const leadLock = new Set(); 
 
-// --- Helpers Internos ---
-// JID Cleaner V2: Remove sufixos de dispositivo (:2, :44) para garantir match no banco e no mapa
-const cleanJid = (jid) => {
-    if (!jid) return null;
-    const temp = jid.split('@')[0].split(':')[0]; // Remove device part
-    const suffix = jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net';
-    return temp + suffix;
-};
-
-const unwrapMessage = (msg) => {
-    if (!msg.message) return msg;
-    let content = msg.message;
-    if (content.ephemeralMessage) content = content.ephemeralMessage.message;
-    if (content.viewOnceMessage) content = content.viewOnceMessage.message;
-    if (content.viewOnceMessageV2) content = content.viewOnceMessageV2.message;
-    if (content.documentWithCaptionMessage) content = content.documentWithCaptionMessage.message;
-    return { ...msg, message: content };
-};
-
-const uploadMedia = async (buffer, type) => {
-    try {
-        const ext = mime.extension(type) || 'bin';
-        const fileName = `hist_${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
-        const { error } = await supabase.storage.from('chat-media').upload(fileName, buffer, { contentType: type });
-        if (error) return null;
-        const { data } = supabase.storage.from('chat-media').getPublicUrl(fileName);
-        return data.publicUrl;
-    } catch { return null; }
-};
-
-const getBody = (msg) => {
-    if (!msg) return '';
-    return msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || msg.videoMessage?.caption || '';
-};
-
-// ==============================================================================
-// CONFIGURAÇÃO DOS LISTENERS
-// ==============================================================================
-export const setupListeners = ({ sock, sessionId, companyId }) => {
+// --- NAME SANITIZER BLINDADO V5 ---
+// Retorna TRUE se o nome for lixo (número puro, undefined, null, só símbolos)
+const isGenericName = (name, phone) => {
+    if (!name) return true;
+    const cleanName = name.toString().trim();
+    if (cleanName.length === 0) return true;
     
-    // --- 1. HISTÓRICO INTELIGENTE (COM TRAVA) ---
-    sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
-        if (isProcessingHistory) {
-            console.warn(`⚠️ [HISTÓRICO] Ignorando duplicação de evento.`);
-            return;
-        }
-        isProcessingHistory = true;
-
-        try {
-            console.log(`📚 [HISTÓRICO] Iniciando Sync... Sessão: ${sessionId}`);
-            await updateSyncStatus(sessionId, 'importing_contacts', 5);
-
-            // --- MAPA DE NOMES (NAME HUNTER V5.0) ---
-            // Usa Map para O(1) lookup. Chave = cleanJid (normalizado)
-            const contactsMap = new Map();
-            let namesFound = 0;
-
-            if (contacts && contacts.length > 0) {
-                contacts.forEach(c => {
-                    // ORDEM RIGOROSA: Agenda (name) > Verificado (verifiedName) > Perfil (notify)
-                    const bestName = c.name || c.verifiedName || c.notify || c.short;
-                    
-                    if (bestName) {
-                        const jidKey = cleanJid(c.id);
-                        if(jidKey) {
-                            contactsMap.set(jidKey, bestName);
-                            namesFound++;
-                        }
-                    }
-                });
-            }
-            console.log(`🗺️ [MAPA] ${namesFound} nomes reais mapeados.`);
-
-            // A. Salva Contatos (Lote)
-            await updateSyncStatus(sessionId, 'importing_messages', 20);
-            
-            // Filtra JIDs válidos (ignorando status, etc)
-            const validContacts = contacts.filter(c => c.id && (c.id.endsWith('@s.whatsapp.net') || c.id.endsWith('@g.us')));
-            
-            const batchSize = 100;
-            for (let i = 0; i < validContacts.length; i += batchSize) {
-                const batch = validContacts.slice(i, i + batchSize);
-                await Promise.all(batch.map(async (c) => {
-                    const jidKey = cleanJid(c.id);
-                    
-                    // Aplica a mesma ordem de prioridade aqui para salvar no banco
-                    const nameToSave = contactsMap.get(jidKey) || c.name || c.verifiedName || c.notify;
-                    
-                    // CHECK: Se veio c.name, é da Agenda!
-                    // Isso ativa o modo de sobrescrita no sync.js
-                    const isFromBook = !!c.name; 
-
-                    await upsertContact(jidKey, companyId, nameToSave || null, c.imgUrl || null, isFromBook);
-                }));
-            }
-            
-            // B. Grupos (Refresh Forçado)
-            try {
-                const groups = await sock.groupFetchAllParticipating();
-                const groupList = Object.values(groups);
-                console.log(`👥 [GRUPOS] Sincronizando ${groupList.length} grupos...`);
-                for (const g of groupList) {
-                    // Grupos sempre são "isFromBook=true" pois o nome do grupo é absoluto
-                    await upsertContact(g.id, companyId, g.subject, null, true);
-                    contactsMap.set(g.id, g.subject); 
-                }
-            } catch (e) {}
-
-            // C. Mensagens (Processamento)
-            await updateSyncStatus(sessionId, 'processing_history', 50);
-            const MAX_CHATS = 60;            
-            const MAX_MSGS_PER_CHAT = 25;
-            
-            const messagesByChat = new Map();
-            messages.forEach(msg => {
-                const unwrapped = unwrapMessage(msg);
-                if(!unwrapped.key || !unwrapped.key.remoteJid) return;
-                
-                const jid = cleanJid(unwrapped.key.remoteJid); // Normaliza chave
-                if (jid === 'status@broadcast') return;
-
-                if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
-                messagesByChat.get(jid).push(unwrapped);
-            });
-
-            // Ordena chats por atividade recente
-            const sortedChats = Array.from(messagesByChat.entries()).sort(([, msgsA], [, msgsB]) => {
-                const timeA = Math.max(...msgsA.map(m => m.messageTimestamp || 0));
-                const timeB = Math.max(...msgsB.map(m => m.messageTimestamp || 0));
-                return timeB - timeA; 
-            });
-
-            const topChats = sortedChats.slice(0, MAX_CHATS);
-            let finalMessagesToProcess = [];
-            
-            topChats.forEach(([jid, msgs]) => {
-                // Ordena mensagens (Antigas -> Novas)
-                msgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-                const limited = msgs.slice(-MAX_MSGS_PER_CHAT);
-                finalMessagesToProcess.push(...limited);
-            });
-
-            const totalMsgs = finalMessagesToProcess.length;
-            console.log(`🧠 [FILTRO] ${totalMsgs} mensagens selecionadas.`);
-
-            // D. Sync Sequencial
-            let processedCount = 0;
-            for (const msg of finalMessagesToProcess) {
-                const jidKey = cleanJid(msg.key.remoteJid);
-                
-                // Tenta nome da mensagem (pushName) OU do mapa construído (Agenda)
-                const msgPushName = msg.pushName;
-                const mapName = contactsMap.get(jidKey);
-                
-                // Prioridade: Mapa (Agenda/Verified) > Msg (PushName)
-                const finalName = mapName || msgPushName; 
-
-                // Mensagens históricas nunca sobrescrevem agenda explicitamente (isFromBook=false)
-                // Isso protege contra pushNames antigos sujando o banco
-                await processSingleMessage(msg, sock, companyId, sessionId, false, finalName);
-                
-                processedCount++;
-                if (processedCount % 20 === 0) {
-                    const percent = 50 + Math.round((processedCount / totalMsgs) * 50);
-                    await updateSyncStatus(sessionId, 'processing_history', percent);
-                }
-            }
-
-            await updateSyncStatus(sessionId, 'completed', 100);
-            console.log(`✅ [HISTÓRICO] Importação finalizada.`);
-
-        } catch (e) {
-            console.error(`❌ [ERRO HISTÓRICO]`, e);
-        } finally {
-            setTimeout(() => { isProcessingHistory = false; }, 10000);
-        }
-    });
-
-    // --- Eventos Realtime ---
-    sock.ev.on('contacts.upsert', async (contacts) => {
-        for (const c of contacts) {
-            // ORDEM RIGOROSA: Agenda > Verificado > Perfil
-            const bestName = c.name || c.verifiedName || c.notify || null;
-            
-            if (bestName) {
-                const jid = cleanJid(c.id);
-                
-                // DETECÇÃO CRÍTICA: Se 'c.name' existe, é atualização da agenda!
-                const isFromBook = !!c.name;
-                
-                await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook);
-            }
-        }
-    });
-
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type === 'notify' || type === 'append') {
-            for (const msg of messages) {
-                const clean = unwrapMessage(msg);
-                // Mensagens novas podem trazer nomes, mas NÃO são "da agenda" (isFromBook=false).
-                // Isso impede que um cliente mudando o nome no perfil sobrescreva o nome que você salvou.
-                await processSingleMessage(clean, sock, companyId, sessionId, true, clean.pushName);
-            }
-        }
-    });
+    // Se o nome for apenas caracteres não alfabéticos (ex: "+55 11...", "---", "1234")
+    // Permite letras, acentos e emojis. Rejeita se só tiver números e pontuação.
+    if (/^[\d\s\+\-\(\)\.]+$/.test(cleanName)) return true;
+    
+    // Comparação direta com o telefone
+    const cleanPhone = phone.replace(/\D/g, '');
+    const cleanNameDigits = cleanName.replace(/\D/g, '');
+    
+    if (cleanNameDigits === cleanPhone) return true; // É o próprio número
+    
+    return false;
 };
 
-// ==============================================================================
-// PROCESSADOR UNITÁRIO
-// ==============================================================================
-const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime, forcedName = null) => {
+export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     try {
-        if (!msg.message) return;
-        const jid = cleanJid(msg.key.remoteJid);
-        if (jid === 'status@broadcast') return;
+        await supabase.from('instances')
+            .update({ sync_status: status, sync_percent: percent, updated_at: new Date() })
+            .eq('session_id', sessionId);
+    } catch (e) {}
+};
 
-        const fromMe = msg.key.fromMe;
-        
-        // --- NAME HUNTER V5.0 (RESOLUÇÃO FINAL) ---
-        if (forcedName) {
-            // upsertContact tem isFromBook=false por padrão aqui
-            await upsertContact(jid, companyId, forcedName);
-        }
-        
-        const type = getContentType(msg.message) || Object.keys(msg.message)[0];
-        const body = getBody(msg.message);
+// PATCH: Adicionado parâmetro `isFromBook` (Prioridade Alta)
+export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false) => {
+    try {
+        if (!jid || !companyId) return;
 
-        let leadId = null;
-        // BLOQUEIO EXPLÍCITO DE GRUPOS COMO LEADS
-        if (jid && !jid.includes('@g.us')) {
-            // Se tiver nome, passamos para criar/atualizar o lead
-            leadId = await ensureLeadExists(jid, companyId, forcedName);
-        }
+        const isGroup = jid.includes('@g.us');
+        // Normaliza JID (remove dispositivo :2, etc)
+        const cleanJid = jid.split('@')[0].split(':')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
+        const phone = cleanJid.split('@')[0];
         
-        // Mídia (Apenas Realtime)
-        let mediaUrl = null;
-        const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
-        
-        if (isMedia && isRealtime) { 
-            try {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger });
-                let mimeType = 'application/octet-stream';
-                if (msg.message.imageMessage) mimeType = 'image/jpeg';
-                else if (msg.message.audioMessage) mimeType = 'audio/mp4';
-                else if (msg.message.videoMessage) mimeType = 'video/mp4';
-                else if (msg.message.stickerMessage) mimeType = 'image/webp';
-                else if (msg.message.documentMessage) mimeType = msg.message.documentMessage.mimetype;
-                mediaUrl = await uploadMedia(buffer, mimeType);
-            } catch (e) {}
-        }
+        // 1. Busca dados atuais (Leitura leve)
+        const { data: current } = await supabase
+            .from('contacts')
+            .select('name, push_name, profile_pic_url')
+            .eq('jid', cleanJid)
+            .eq('company_id', companyId)
+            .maybeSingle();
 
-        await upsertMessage({
+        const updateData = {
+            jid: cleanJid,
+            phone: phone,
             company_id: companyId,
-            session_id: sessionId,
-            remote_jid: jid,
-            whatsapp_id: msg.key.id,
-            from_me: fromMe,
-            content: body || (mediaUrl ? '[Mídia]' : ''),
-            media_url: mediaUrl,
-            message_type: type?.replace('Message', '') || 'text',
-            status: fromMe ? 'sent' : 'received',
-            lead_id: leadId,
-            created_at: new Date((msg.messageTimestamp || Date.now() / 1000) * 1000)
-        });
+            updated_at: new Date(),
+            last_message_at: new Date() // Mantém o contato "vivo"
+        };
 
+        // --- LÓGICA DE PRIORIDADE (NAME HUNTER V5 + AUTHORITY) ---
+        let finalName = null;
+        let shouldUpdateLead = false;
+        
+        // O nome que chegou é válido?
+        const incomingIsGood = !isGenericName(incomingName, phone);
+        // O nome que já temos no banco é válido?
+        const currentIsGood = current && !isGenericName(current.name, phone);
+
+        if (incomingIsGood) {
+            // Sempre salvamos o push_name se vier algo bom para histórico/debug
+            updateData.push_name = incomingName; 
+
+            // DECISÃO DE ATUALIZAÇÃO DO NOME PRINCIPAL (Display Name)
+            // 1. Se o banco está vazio ou tem nome ruim -> ATUALIZA SEMPRE.
+            // 2. Se a origem é a AGENDA (isFromBook) -> FORCE UPDATE (O usuário mandou).
+            // 3. Se não é da agenda (PushName), SÓ atualiza se o banco estiver ruim.
+            
+            const shouldOverwrite = !currentIsGood || isFromBook;
+
+            if (shouldOverwrite) {
+                // Só dispara update se o nome for realmente diferente
+                if (!current || current.name !== incomingName) {
+                    updateData.name = incomingName;
+                    finalName = incomingName;
+                    shouldUpdateLead = true;
+                }
+            } 
+        } else {
+            // Se o que chegou é ruim (null ou número), mas não temos nada no banco
+            // Forçamos NULL para evitar salvar o número como nome (regra do sanitizer)
+            if (!current && !currentIsGood) {
+                updateData.name = null;
+            }
+        }
+
+        if (profilePicUrl) {
+            updateData.profile_pic_url = profilePicUrl;
+        }
+
+        // Executa UPSERT
+        const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
+
+        if (error) {
+             console.error('[CONTACT SYNC ERROR]', error.message);
+        } else if (shouldUpdateLead && finalName && !isGroup) {
+            // [PROPAGAÇÃO PARA LEADS]
+            // Atualiza o Lead se o contato mudou de nome
+            
+            // 1. Busca Lead Existente
+            const { data: lead } = await supabase
+                .from('leads')
+                .select('id, name')
+                .eq('company_id', companyId)
+                .ilike('phone', `%${phone}%`)
+                .limit(1)
+                .maybeSingle();
+
+            // 2. Regra de Atualização do Lead:
+            // - Se o Lead tem nome ruim (Número) -> Atualiza.
+            // - Se veio da Agenda (isFromBook) -> Atualiza (Sincronia total Agenda -> CRM).
+            if (lead) {
+                if (isGenericName(lead.name, phone) || isFromBook) {
+                    await supabase.from('leads').update({ name: finalName }).eq('id', lead.id);
+                }
+            }
+        }
     } catch (e) {
-        // console.error(`Erro process msg:`, e.message);
+        logger.error({ err: e.message }, 'Erro upsertContact');
     }
+};
+
+export const ensureLeadExists = async (jid, companyId, pushName) => {
+    if (!jid || jid.endsWith('@g.us') || jid.includes('status@broadcast')) return null; 
+
+    const phone = jid.split('@')[0].split(':')[0]; // Clean phone
+    if (!/^\d+$/.test(phone)) return null;
+    
+    const lockKey = `${companyId}:${phone}`;
+    if (leadLock.has(lockKey)) return null;
+    
+    try {
+        leadLock.add(lockKey);
+
+        const { data: existing } = await supabase.from('leads').select('id, name').eq('phone', phone).eq('company_id', companyId).maybeSingle();
+
+        if (existing) {
+            // Atualiza nome do lead existente se ele não tiver nome bom e o novo for bom
+            if (pushName && !isGenericName(pushName, phone) && isGenericName(existing.name, phone)) {
+                await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
+            }
+            return existing.id;
+        }
+
+        // [NOVO LEAD]
+        // Se tem nome válido, usa. Se não, usa NULL (deixa o frontend lidar ou futura atualização)
+        const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : null;
+        
+        const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
+
+        const { data: newLead } = await supabase.from('leads').insert({
+            company_id: companyId,
+            phone: phone,
+            name: nameToUse,
+            status: 'new',
+            pipeline_stage_id: stage?.id
+        }).select('id').single();
+
+        return newLead?.id;
+    } catch (e) {
+        return null;
+    } finally {
+        leadLock.delete(lockKey);
+    }
+};
+
+export const upsertMessage = async (msgData) => {
+    try {
+        // Pequeno delay para garantir que o contato foi criado antes da mensagem
+        await new Promise(resolve => setTimeout(resolve, 150));
+        const { error } = await supabase.from('messages').upsert(msgData, { onConflict: 'remote_jid, whatsapp_id' });
+        if (error) throw error;
+    } catch (e) {
+        // logger.error({ err: e.message }, 'Erro upsertMessage');
+    }
+};
+
+export const savePollVote = async (msg, companyId) => {};
+export const deleteSessionData = async (sessionId) => {
+    await supabase.from('instances').update({ status: 'disconnected' }).eq('session_id', sessionId);
+    await supabase.from('baileys_auth_state').delete().eq('session_id', sessionId);
+};
+export const updateInstance = async (sessionId, data) => {
+    await supabase.from('instances').update(data).eq('session_id', sessionId);
 };
