@@ -17,8 +17,8 @@ import mime from 'mime-types';
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'silent' });
 
-// --- MEMORY CACHE ---
-// Impede processar a mesma mensagem 2x em curto período (Deduplicação)
+// --- MEMORY CACHE (DEDUPLICAÇÃO) ---
+// Impede processar a mesma mensagem 2x em curto período
 const msgCache = new Set();
 const addToCache = (id) => {
     if (msgCache.has(id)) return false;
@@ -38,6 +38,7 @@ const cleanJid = (jid) => {
 const unwrapMessage = (msg) => {
     if (!msg.message) return msg;
     let content = msg.message;
+    // Desenrola aninhamentos comuns do Baileys
     if (content.ephemeralMessage) content = content.ephemeralMessage.message;
     if (content.viewOnceMessage) content = content.viewOnceMessage.message;
     if (content.viewOnceMessageV2) content = content.viewOnceMessageV2.message;
@@ -57,6 +58,7 @@ const uploadMedia = async (buffer, type) => {
     } catch { return null; }
 };
 
+// Parser robusto para evitar mensagens vazias
 const getBody = (msg) => {
     if (!msg) return '';
     if (msg.conversation) return msg.conversation;
@@ -64,6 +66,7 @@ const getBody = (msg) => {
     if (msg.imageMessage?.caption) return msg.imageMessage.caption;
     if (msg.videoMessage?.caption) return msg.videoMessage.caption;
     if (msg.documentMessage?.caption) return msg.documentMessage.caption;
+    // Tags visuais
     if (msg.imageMessage) return '[Imagem]';
     if (msg.videoMessage) return '[Vídeo]';
     if (msg.stickerMessage) return '[Sticker]';
@@ -93,7 +96,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // --- HISTÓRICO COMPLETO ---
     sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
         try {
-            console.log(`📚 [HISTÓRICO] Iniciando Sync...`);
+            console.log(`📚 [HISTÓRICO] Iniciando Sync... Sessão: ${sessionId}`);
             await updateSyncStatus(sessionId, 'importing_contacts', 5);
 
             // 1. SYNC AGENDA (Priority 1)
@@ -112,7 +115,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         // Nome da Agenda (Notify ou Name)
                         const bestName = c.name || c.verifiedName || c.notify;
                         
-                        // Busca foto se tiver URL no payload (imgUrl) ou tenta buscar online se for importante
+                        // Busca foto se tiver URL no payload (imgUrl) 
                         let picUrl = c.imgUrl || null;
                         
                         // Salva na tabela Contacts
@@ -138,13 +141,14 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     messagesByChat.get(jid).push(unwrapped);
                 });
 
-                // Top 200 conversas, últimas 10 msgs
+                // Ordena chats por atividade recente
                 const sortedChats = Array.from(messagesByChat.entries()).sort(([, msgsA], [, msgsB]) => {
                     const tA = Math.max(...msgsA.map(m => m.messageTimestamp || 0));
                     const tB = Math.max(...msgsB.map(m => m.messageTimestamp || 0));
                     return tB - tA; 
                 });
 
+                // Top 200 conversas, últimas 10 msgs (PEDIDO V6.6)
                 const topChats = sortedChats.slice(0, 200); 
                 let processed = 0;
                 
@@ -178,12 +182,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
     // --- REALTIME MESSAGES ---
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        // Filtra tipos 'append' se não for necessário, mas geralmente queremos tudo.
-        // O importante é o msgCache evitar duplicatas.
         for (const msg of messages) {
             if (!msg.message) continue;
             
-            // DEDUPLICAÇÃO EM MEMÓRIA
+            // DEDUPLICAÇÃO EM MEMÓRIA (ANTI-ECHO)
             // Se já processamos este ID nos últimos 10s, ignora.
             if (!addToCache(msg.key.id)) {
                 // console.log('Duplicada ignorada:', msg.key.id);
@@ -192,9 +194,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
             const clean = unwrapMessage(msg);
             
-            // Busca foto se for um contato novo interagindo agora
+            // Busca foto se for um contato novo interagindo agora (e não for grupo)
             const jid = cleanJid(clean.key.remoteJid);
-            if (jid && !clean.key.fromMe && !clean.key.participant) { 
+            if (jid && !clean.key.fromMe && !clean.key.participant && jid.includes('@s.whatsapp.net')) { 
                  fetchProfilePicSafe(sock, jid).then(url => {
                      if(url) upsertContact(jid, companyId, clean.pushName, url, false);
                  });
@@ -225,6 +227,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
+        // Evita salvar mensagens de protocolo vazias que não sejam mídia
         if (!body && !isMedia) return;
 
         const fromMe = msg.key.fromMe;
@@ -241,12 +244,13 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
             }
         }
         
+        // Se for grupo, tenta salvar o remetente específico na agenda
         if (jid.includes('@g.us') && msg.key.participant && forcedName) {
              const partJid = cleanJid(msg.key.participant);
              await upsertContact(partJid, companyId, forcedName, null, false);
         }
 
-        // 2. MÍDIA
+        // 2. MÍDIA (BAIXA SEMPRE, SEJA HISTÓRICO OU REALTIME)
         let mediaUrl = null;
         if (isMedia) { 
             try {
@@ -260,7 +264,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
                 mediaUrl = await uploadMedia(buffer, mimeType);
             } catch (e) {
-                // Ignore download errors on history
+                // Ignora erro de download no histórico (mídia expirada), mas continua salvando a msg
             }
         }
 
@@ -280,6 +284,6 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         });
 
     } catch (e) {
-        // Silently fail
+        // Silently fail message processing
     }
 };
