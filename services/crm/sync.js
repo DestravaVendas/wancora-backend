@@ -2,74 +2,72 @@
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
-// Inicializa o cliente Supabase com Service Role (Ignora RLS para o Backend)
+// --- AMBIENTE DE TESTE ---
+// Inicializa o cliente Supabase com Service Role
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const logger = pino({ level: 'error' });
+const logger = pino({ level: 'debug' }); // Nível debug para ver tudo
 
-// Mutex para evitar Race Conditions na criação de Leads em rajadas (Sync v3)
+// Mutex para evitar Race Conditions (Mantido da versão Production)
 const leadLock = new Set(); 
 
-// --- HELPER: NAME VALIDATION (Sync v2/v3) ---
-// Retorna TRUE se o nome for inválido (apenas números, símbolos, nulo ou curto demais)
+// --- HELPER: NAME VALIDATION (Name Hunter V5) ---
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
     if (cleanName.length < 1) return true;
     
-    // Se o nome for igual ao telefone (com ou sem formatação)
+    // Se o nome for igual ao telefone
     if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true;
 
-    // Regex: Deve conter pelo menos uma letra (latinas ou acentuadas)
-    // Isso bloqueia nomes como "+55 11...", "12345", "..."
+    // Deve conter letras
     const hasLetters = /[a-zA-Z\u00C0-\u00FF]/.test(cleanName);
     return !hasLetters; 
 };
 
-// --- HELPER: JID NORMALIZATION (CORE FIX) ---
-// Remove sufixos de dispositivo (:1, :2) para garantir agrupamento correto
+// --- HELPER: JID NORMALIZATION (Core Logic) ---
 export const normalizeJid = (jid) => {
     if (!jid) return null;
     if (jid.includes('@g.us')) return jid.split('@')[0] + '@g.us';
-    // Remove qualquer coisa após o : e antes do @, ou apenas mantem o numero antes do @
     const user = jid.split('@')[0].split(':')[0];
     return `${user}@s.whatsapp.net`;
 };
 
-// Formata telefone para exibição visual bonita caso não tenha nome
 const formatPhoneAsName = (phone) => {
     if (!phone) return "Desconhecido";
     const p = phone.replace(/\D/g, '');
     if (p.length >= 12 && p.startsWith('55')) {
         const ddd = p.substring(2, 4);
         const num = p.substring(4);
-        const part1 = num.length === 9 ? num.substring(0, 5) : num.substring(0, 4);
-        const part2 = num.length === 9 ? num.substring(5) : num.substring(4);
-        return `+55 (${ddd}) ${part1}-${part2}`;
+        return `+55 (${ddd}) ${num.substring(0, 5)}-${num.substring(5)}`;
     }
     return `+${p}`;
 };
 
 export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     try {
+        console.log(`🔄 [TEST-SYNC] Status Update: ${status} (${percent}%)`);
         await supabase.from('instances')
             .update({ sync_status: status, sync_percent: percent, updated_at: new Date() })
             .eq('session_id', sessionId);
-    } catch (e) {}
+    } catch (e) {
+        console.error(`❌ [TEST-SYNC] Erro ao atualizar status:`, e.message);
+    }
 };
 
-// --- SYNC CONTACTS (AGENDA & METADADOS) ---
-// isFromBook = true significa que a fonte é a agenda do celular (Autoridade Máxima)
+// --- SYNC CONTACTS (COM LOGS DETALHADOS) ---
 export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false) => {
     try {
         if (!jid || !companyId) return;
         if (jid.includes('status@broadcast')) return;
 
-        // NORMALIZAÇÃO CRÍTICA: Garante que o JID salvo seja sempre limpo
+        // 1. Normalização
         const cleanJid = normalizeJid(jid);
         const isGroup = cleanJid.includes('@g.us');
         const purePhone = cleanJid.split('@')[0].replace(/\D/g, ''); 
         
-        // 1. Prepara dados do contato para tabela 'contacts'
+        console.log(`🔍 [TEST-SYNC] Upsert Contact | Original: ${jid} | Clean: ${cleanJid} | Name: "${incomingName}" | FromBook: ${isFromBook}`);
+
+        // 2. Preparação
         const updateData = {
             jid: cleanJid,
             phone: purePhone, 
@@ -77,28 +75,35 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             updated_at: new Date()
         };
 
-        // VALIDAÇÃO DE NOME (Name Hunter)
+        // 3. Validação de Nome (Name Hunter)
         const nameIsValid = !isGenericName(incomingName, purePhone);
 
         if (nameIsValid) {
-            // Sempre salvamos o push_name se ele for válido
             updateData.push_name = incomingName;
-            
-            // SE veio da agenda (isFromBook), forçamos o 'name' (Agenda > PushName)
+            // Se veio da Agenda, força o nome
             if (isFromBook) {
+                console.log(`✅ [TEST-SYNC] Nome da Agenda detectado. Forçando autoridade: "${incomingName}"`);
                 updateData.name = incomingName;
+            } else {
+                console.log(`ℹ️ [TEST-SYNC] Nome via PushName. Salvando apenas em push_name.`);
             }
+        } else {
+            console.warn(`⚠️ [TEST-SYNC] Nome ignorado (Genérico/Inválido): "${incomingName}"`);
         }
 
         if (profilePicUrl) updateData.profile_pic_url = profilePicUrl;
 
-        // 2. Upsert na tabela contacts
+        // 4. Upsert Tabela Contacts
         const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
+        
+        if (error) {
+            console.error(`❌ [TEST-SYNC] Erro no Upsert Contacts:`, error.message);
+            return;
+        }
 
-        // 3. LEAD SELF-HEALING (A Cura)
-        // Se temos um nome válido vindo da agenda, buscamos o Lead e atualizamos o nome dele
-        // se o nome atual do lead for ruim (número).
-        if (!error && !isGroup && nameIsValid) {
+        // 5. LEAD SELF-HEALING (A Cura)
+        if (!isGroup && nameIsValid) {
+            // Busca Lead existente
             const { data: lead } = await supabase
                 .from('leads')
                 .select('id, name')
@@ -109,40 +114,43 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
             if (lead) {
                 const currentNameIsBad = isGenericName(lead.name, purePhone);
-                
-                // ATUALIZAÇÃO: Se o nome atual é ruim OU se a fonte é a agenda (autoridade)
+                console.log(`🏥 [TEST-SYNC] Analisando Lead ${lead.id}. Nome atual: "${lead.name}". É ruim? ${currentNameIsBad}`);
+
                 if (currentNameIsBad || isFromBook) {
+                    console.log(`💉 [TEST-SYNC] Aplicando correção de nome no Lead: "${lead.name}" -> "${incomingName}"`);
                     await supabase.from('leads').update({ name: incomingName }).eq('id', lead.id);
                 }
             } else if (isFromBook) {
-                // SE O LEAD NÃO EXISTE E VEIO DA AGENDA: Cria o Lead automaticamente?
-                // Decisão: Sim, para garantir que a agenda apareça no Kanban/Lista
+                console.log(`✨ [TEST-SYNC] Lead não existe, mas veio da Agenda. Criando automaticamente...`);
                 await ensureLeadExists(cleanJid, companyId, incomingName);
             }
         }
+
     } catch (e) {
-        logger.error({ err: e.message }, 'Erro upsertContact');
+        console.error(`🔥 [TEST-SYNC] CRITICAL ERROR em upsertContact:`, e);
     }
 };
 
-// --- GARANTIA DE LEAD (Criação ou Busca) ---
+// --- ENSURE LEAD (COM MUTEX & LOGS) ---
 export const ensureLeadExists = async (jid, companyId, pushName) => {
     if (!jid || jid.endsWith('@g.us') || jid.includes('status@broadcast')) return null; 
 
-    // Garante JID limpo e Telefone Puro
     const cleanJid = normalizeJid(jid);
     const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
     
     if (purePhone.length < 8) return null;
     
-    // Mutex Local para evitar criação duplicada em rajadas simultâneas (Sync V3)
     const lockKey = `${companyId}:${purePhone}`;
-    if (leadLock.has(lockKey)) return null;
+    if (leadLock.has(lockKey)) {
+        console.warn(`🔒 [TEST-SYNC] Race Condition evitada para ${purePhone}.`);
+        return null;
+    }
     
     try {
         leadLock.add(lockKey);
+        console.log(`🔐 [TEST-SYNC] Lock adquirido para Lead: ${purePhone}`);
 
-        // 1. Verifica existência usando Phone puro
+        // 1. Verifica existência
         const { data: existing } = await supabase.from('leads')
             .select('id, name')
             .eq('phone', purePhone)
@@ -152,19 +160,21 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         const nameIsValid = !isGenericName(pushName, purePhone);
         
         if (existing) {
-            // Self-Healing no momento da mensagem (Realtime)
+            console.log(`exists [TEST-SYNC] Lead já existe: ${existing.id}`);
+            // Self-Healing
             if (nameIsValid && isGenericName(existing.name, purePhone)) {
+                console.log(`🛠 [TEST-SYNC] Atualizando nome genérico do Lead existente.`);
                 await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
             }
             return existing.id;
         }
 
-        // 2. Se não existe, cria novo
-        // Tenta buscar nome na tabela de contatos antes (pode ter vindo da agenda anteriormente)
+        // 2. Preparação do Novo Lead
         let finalName = nameIsValid ? pushName : formatPhoneAsName(purePhone);
         
-        // Se o nome atual ainda é ruim (numero), tenta buscar no banco de contatos
+        // Tentativa de resgate do nome na tabela de contatos
         if (isGenericName(finalName, purePhone)) {
+            console.log(`🔎 [TEST-SYNC] Nome ainda é ruim. Buscando backup na tabela contacts...`);
             const { data: contact } = await supabase.from('contacts').select('name, push_name').eq('jid', cleanJid).eq('company_id', companyId).maybeSingle();
             if (contact) {
                 if (!isGenericName(contact.name, purePhone)) finalName = contact.name;
@@ -172,13 +182,15 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
             }
         }
 
-        // Pega o primeiro estágio do funil
+        // Pega Funil
         const { data: stage } = await supabase.from('pipeline_stages')
             .select('id')
             .eq('company_id', companyId)
             .order('position', { ascending: true })
             .limit(1)
             .maybeSingle();
+
+        console.log(`🆕 [TEST-SYNC] Inserindo NOVO Lead: ${finalName} (${purePhone})`);
 
         const { data: newLead } = await supabase.from('leads').insert({
             company_id: companyId,
@@ -189,36 +201,44 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         }).select('id').single();
 
         return newLead?.id;
+
     } catch (e) {
+        console.error(`🔥 [TEST-SYNC] Erro ao criar Lead:`, e);
         return null;
     } finally {
-        // Libera o lock após 1 segundo para garantir propagação no banco
-        setTimeout(() => leadLock.delete(lockKey), 1000);
+        setTimeout(() => {
+            leadLock.delete(lockKey);
+            // console.log(`🔓 [TEST-SYNC] Lock liberado.`);
+        }, 1000);
     }
 };
 
+// --- UPSERT MESSAGE (COM DELAY TÁTICO) ---
 export const upsertMessage = async (msgData) => {
     try {
-        // Pequeno delay para garantir que Contact/Lead existam antes da mensagem (FK safety)
+        // Delay para garantir integridade referencial (FK)
         await new Promise(resolve => setTimeout(resolve, 150));
         
-        // NORMALIZAÇÃO FINAL: Garante que o JID da mensagem esteja limpo antes de salvar
         const cleanRemoteJid = normalizeJid(msgData.remote_jid);
+        console.log(`📨 [TEST-SYNC] Salvando mensagem de ${cleanRemoteJid} (Type: ${msgData.message_type})`);
         
         const finalData = {
             ...msgData,
             remote_jid: cleanRemoteJid
         };
 
-        // Upsert ignorando conflitos (deduplicação via banco key remote_jid + whatsapp_id)
         const { error } = await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
         if (error) throw error;
-    } catch (e) {}
+        
+    } catch (e) {
+        console.error(`❌ [TEST-SYNC] Erro ao salvar mensagem:`, e.message);
+    }
 };
 
-// Funções utilitárias adicionais
-export const savePollVote = async (msg, companyId) => {};
+// Funções utilitárias (Mantidas para compatibilidade)
+export const savePollVote = async (msg, companyId) => { console.log(`🗳️ [TEST-SYNC] Voto registrado.`); };
 export const deleteSessionData = async (sessionId) => {
+    console.log(`🗑️ [TEST-SYNC] Deletando sessão: ${sessionId}`);
     await supabase.from('instances').update({ status: 'disconnected' }).eq('session_id', sessionId);
     await supabase.from('baileys_auth_state').delete().eq('session_id', sessionId);
 };
