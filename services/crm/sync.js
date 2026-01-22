@@ -1,71 +1,56 @@
-
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
-// Inicializa o cliente Supabase com Service Role (Ignora RLS no lado do Node)
+// Inicializa o cliente Supabase com Service Role (Ignora RLS)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'error' });
 
-// Mutex para evitar criação duplicada de leads em rajadas de mensagens
+// Mutex para evitar criação duplicada
 const leadLock = new Set(); 
 
-// --- NAME SANITIZER V5.5 ---
-// Retorna TRUE se o nome for inválido (apenas números, simbolos, nulo ou curto demais)
+// --- NAME SANITIZER V6.0 ---
+// Retorna TRUE se o nome for ruim (nulo, só números, sem letras)
 const isGenericName = (name) => {
     if (!name) return true;
-    const clean = name.toString().trim();
+    const clean = String(name).trim();
     if (clean.length < 1) return true;
     
-    // Regex: Deve conter pelo menos uma letra (latinas ou acentuadas)
-    // Isso bloqueia nomes como "+55 11...", "12345", "..."
+    // Deve conter letras. Se for só "+55..." ou "12345", retorna true (é genérico)
     const hasLetters = /[a-zA-Z\u00C0-\u00FF]/.test(clean);
     return !hasLetters; 
 };
 
-// Atualiza o status visual da instância no frontend
 export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     try {
         await supabase.from('instances')
             .update({ sync_status: status, sync_percent: percent, updated_at: new Date() })
             .eq('session_id', sessionId);
-    } catch (e) {
-        // Ignora erros de update de status para não parar o fluxo
-    }
+    } catch (e) {}
 };
 
-// PATCH: Sincronização Robusta (Contact -> Lead)
+// PATCH: Sincronização Agressiva (Contact -> Lead)
 export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false) => {
     try {
         if (!jid || !companyId) return;
 
         const isGroup = jid.includes('@g.us');
-        // Normaliza JID (Remove sufixos de device :2, :99)
         const cleanJid = jid.split('@')[0].split(':')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
-        
-        // EXTRAÇÃO DE TELEFONE PURO (A Chave Mestra)
-        // Remove tudo que não for dígito. Essencial para match com a tabela 'leads'.
         const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
         
-        // 1. Prepara dados para UPSERT no CONTACTS
+        // 1. Dados para o Contato
         const updateData = {
             jid: cleanJid,
-            phone: purePhone, // Persiste o número limpo para facilitar buscas futuras
+            phone: purePhone,
             company_id: companyId,
             updated_at: new Date(),
             last_message_at: new Date()
         };
 
-        // 2. Lógica de Higiene de Nomes (Name Hunter)
-        const incomingIsGood = !isGenericName(incomingName);
+        const nameValid = !isGenericName(incomingName);
 
-        if (incomingIsGood) {
-            // Sempre salvamos o push_name se ele for válido
+        if (nameValid) {
             updateData.push_name = incomingName;
-            
-            // DECISÃO DE AUTORIDADE PARA O CAMPO 'NAME':
-            // Se veio da Agenda (isFromBook), é a verdade absoluta.
-            // Se não, deixamos o banco decidir (via ON CONFLICT ou Trigger), 
-            // mas se formos forçar, seria apenas se o banco estivesse vazio.
+            // Se veio da agenda, forçamos o 'name'. Se não, deixamos o banco decidir.
             if (isFromBook) {
                 updateData.name = incomingName;
             }
@@ -73,14 +58,14 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
         if (profilePicUrl) updateData.profile_pic_url = profilePicUrl;
 
-        // 3. Executa UPSERT no CONTACTS
-        // O Trigger SQL `trg_auto_sync_lead_name` deve estar ativo no banco para propagar isso para leads.
+        // 2. Upsert Contato
         const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
 
-        // 4. FAIL-SAFE: Atualização Manual de Leads (Caso Trigger falhe ou Race Condition)
-        // Se temos um nome de alta confiança (Agenda), forçamos a atualização no Lead também.
-        if (!error && incomingIsGood && isFromBook && !isGroup) {
-            // Busca Lead pelo Pure Phone (Match Matemático)
+        // 3. AUTO-HEALING DE LEADS (A Correção Principal)
+        // Se temos um nome válido, tentamos corrigir o Lead imediatamente
+        if (!error && nameValid && !isGroup) {
+            
+            // Busca o Lead apenas pelo telefone numérico
             const { data: lead } = await supabase
                 .from('leads')
                 .select('id, name')
@@ -90,57 +75,61 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
                 .maybeSingle();
 
             if (lead) {
-                // Só atualiza se o nome atual for ruim ou diferente da agenda
-                if (isGenericName(lead.name) || lead.name !== incomingName) {
-                    await supabase.from('leads')
-                        .update({ name: incomingName })
-                        .eq('id', lead.id);
+                // LÓGICA DE OURO v6.0:
+                // Atualiza SE: 
+                // 1. O nome do lead atual é NULO
+                // 2. OU O nome do lead atual é genérico (só numero)
+                // 3. OU Veio da Agenda (Autoridade Máxima)
+                const currentNameBad = !lead.name || isGenericName(lead.name);
+                
+                if (currentNameBad || isFromBook) {
+                    // Só atualiza se o novo nome for diferente do atual
+                    if (lead.name !== incomingName) {
+                        await supabase.from('leads')
+                            .update({ name: incomingName })
+                            .eq('id', lead.id);
+                    }
                 }
             }
         }
-
     } catch (e) {
         logger.error({ err: e.message }, 'Erro upsertContact');
     }
 };
 
-// Garante que o Lead exista quando chega uma mensagem
+// Garante criação do Lead
 export const ensureLeadExists = async (jid, companyId, pushName) => {
-    // Ignora grupos e status
     if (!jid || jid.endsWith('@g.us') || jid.includes('status@broadcast')) return null; 
 
-    // Pure Phone para busca segura
     const purePhone = jid.split('@')[0].replace(/\D/g, '');
     if (purePhone.length < 8) return null;
     
     const lockKey = `${companyId}:${purePhone}`;
     
-    // Mutex: Evita criar 2 leads se chegarem 10 mensagens em 1 segundo
+    // Se já estamos criando este lead, retorna null para evitar duplicidade no DB
     if (leadLock.has(lockKey)) return null;
     
     try {
         leadLock.add(lockKey);
 
-        // 1. Verifica existência usando Phone puro
         const { data: existing } = await supabase.from('leads')
             .select('id, name')
             .eq('phone', purePhone)
             .eq('company_id', companyId)
             .maybeSingle();
 
-        // 2. Se existe, verifica se precisa de Auto-Fix no nome (Self-Healing)
+        // Se existe, fazemos o Auto-Healing aqui também
         if (existing) {
-            if (pushName && !isGenericName(pushName) && isGenericName(existing.name)) {
-                // Se o lead tem nome ruim ("5511...") e chegou um nome bom ("João"), corrige.
+            // Se o lead tem nome ruim e chegou um nome bom -> Atualiza
+            if (!isGenericName(pushName) && (isGenericName(existing.name) || !existing.name)) {
                 await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
             }
             return existing.id;
         }
 
-        // 3. Se não existe, cria novo Lead
-        const nameToUse = (pushName && !isGenericName(pushName)) ? pushName : null; // Cria como NULL se não tiver nome bom
+        // Se não existe, cria
+        const nameToUse = !isGenericName(pushName) ? pushName : null;
         
-        // Pega primeiro estágio do funil
         const { data: stage } = await supabase.from('pipeline_stages')
             .select('id')
             .eq('company_id', companyId)
@@ -150,45 +139,33 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
 
         const { data: newLead } = await supabase.from('leads').insert({
             company_id: companyId,
-            phone: purePhone, // Salva apenas números
-            name: nameToUse,
+            phone: purePhone,
+            name: nameToUse, // Tenta já criar com nome se possível
             status: 'new',
             pipeline_stage_id: stage?.id
         }).select('id').single();
 
         return newLead?.id;
     } catch (e) {
-        // logger.error({ err: e.message }, 'Erro ensureLeadExists');
         return null;
     } finally {
         leadLock.delete(lockKey);
     }
 };
 
-// Salva a mensagem no banco
 export const upsertMessage = async (msgData) => {
     try {
-        // Delay tático (200ms) para permitir que 'ensureLeadExists' ou 'upsertContact'
-        // terminem suas transações antes de salvar a mensagem, evitando FK errors.
         await new Promise(resolve => setTimeout(resolve, 200));
-        
         const { error } = await supabase.from('messages').upsert(msgData, { onConflict: 'remote_jid, whatsapp_id' });
         if (error) throw error;
-    } catch (e) {
-        // logger.error({ err: e.message }, 'Erro upsertMessage');
-    }
+    } catch (e) {}
 };
 
-// Funções Auxiliares (Mantidas para compatibilidade total)
-export const savePollVote = async (msg, companyId) => {
-    // Implementação futura de votos
-};
-
+export const savePollVote = async (msg, companyId) => {};
 export const deleteSessionData = async (sessionId) => {
     await supabase.from('instances').update({ status: 'disconnected' }).eq('session_id', sessionId);
     await supabase.from('baileys_auth_state').delete().eq('session_id', sessionId);
 };
-
 export const updateInstance = async (sessionId, data) => {
     await supabase.from('instances').update(data).eq('session_id', sessionId);
 };
