@@ -1,3 +1,4 @@
+
 import {
     upsertContact,
     upsertMessage,
@@ -62,13 +63,14 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         isProcessingHistory = true;
 
         try {
-            console.log(`📚 [HISTÓRICO] Iniciando Sync V6... Sessão: ${sessionId}`);
+            console.log(`📚 [HISTÓRICO] Iniciando Sync V6.1... Sessão: ${sessionId}`);
             await updateSyncStatus(sessionId, 'importing_contacts', 5);
 
             // 1. MAPA DE NOMES (Name Hunter)
+            // Constrói um dicionário JID -> Melhor Nome Disponível
             const contactsMap = new Map();
             
-            // A. Agenda
+            // A. Pega da Agenda do WhatsApp
             if (contacts) {
                 contacts.forEach(c => {
                     const bestName = c.name || c.verifiedName || c.notify || c.short;
@@ -76,40 +78,37 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 });
             }
 
-            // B. Mensagens (Scavenger)
+            // B. Pega das Mensagens (PushName) - Scavenger
             if (messages) {
                 messages.forEach(msg => {
                     if (msg.key.fromMe) return;
                     const jidKey = cleanJid(msg.key.remoteJid);
-                    // Só pega o pushName se não tivermos nome da agenda ainda
+                    // Só usa o pushName se a agenda não tiver nada para esse JID
                     if (jidKey && msg.pushName && !contactsMap.has(jidKey)) {
                         contactsMap.set(jidKey, msg.pushName);
                     }
                 });
             }
 
-            // 2. SALVAR CONTATOS PRIORITÁRIOS
-            // Isso garante que o contato exista com nome ANTES de processar mensagens
+            // 2. SALVAR CONTATOS PRIORITÁRIOS (Lote Seguro)
+            // Garante que o contato exista na tabela 'contacts' com o nome correto
             await updateSyncStatus(sessionId, 'importing_messages', 20);
             
-            // Converte o Map para Array para iterar
             const mapEntries = Array.from(contactsMap.entries());
-            
-            // Processa em lotes para não travar o banco
             const BATCH_SIZE = 50;
+            
             for (let i = 0; i < mapEntries.length; i += BATCH_SIZE) {
                 const batch = mapEntries.slice(i, i + BATCH_SIZE);
                 await Promise.all(batch.map(async ([jid, name]) => {
-                    // Verifica se veio da agenda original
+                    // Verifica se veio originalmente da agenda para flag 'isFromBook'
                     const isFromBook = contacts?.some(c => cleanJid(c.id) === jid && c.name);
                     await upsertContact(jid, companyId, name, null, isFromBook);
                 }));
             }
 
-            // 3. PROCESSAR MENSAGENS
+            // 3. PROCESSAR MENSAGENS E CRIAR LEADS
             await updateSyncStatus(sessionId, 'processing_history', 40);
             
-            // Filtra e ordena (Mesma lógica V5)
             const messagesByChat = new Map();
             messages.forEach(msg => {
                 const unwrapped = unwrapMessage(msg);
@@ -120,25 +119,29 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 messagesByChat.get(jid).push(unwrapped);
             });
 
+            // Ordena chats por atividade recente
             const sortedChats = Array.from(messagesByChat.entries()).sort(([, msgsA], [, msgsB]) => {
                 const tA = Math.max(...msgsA.map(m => m.messageTimestamp || 0));
                 const tB = Math.max(...msgsB.map(m => m.messageTimestamp || 0));
                 return tB - tA; 
             });
 
-            const topChats = sortedChats.slice(0, 60); // Top 60 chats
+            const topChats = sortedChats.slice(0, 60); // Limite de 60 conversas recentes
             let finalMessages = [];
             topChats.forEach(([_, msgs]) => {
                 msgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-                finalMessages.push(...msgs.slice(-25)); // Últimas 25
+                finalMessages.push(...msgs.slice(-25)); // Limite de 25 msgs por chat
             });
 
             let processed = 0;
             for (const msg of finalMessages) {
                 const jidKey = cleanJid(msg.key.remoteJid);
-                // Resgata o nome do mapa para garantir consistência
+                
+                // CRÍTICO: Resgata o nome do mapa criado no passo 1
+                // Se não tiver no mapa, tenta o pushName da mensagem atual
                 const bestName = contactsMap.get(jidKey) || msg.pushName;
                 
+                // Passa o 'bestName' explicitamente. O sync.js usará isso para corrigir Leads NULL.
                 await processSingleMessage(msg, sock, companyId, sessionId, false, bestName);
                 
                 processed++;
@@ -149,7 +152,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             }
 
             await updateSyncStatus(sessionId, 'completed', 100);
-            console.log(`✅ [HISTÓRICO] Sync V6 Finalizado. ${processed} mensagens.`);
+            console.log(`✅ [HISTÓRICO] Finalizado. ${processed} mensagens processadas.`);
 
         } catch (e) {
             console.error(e);
@@ -162,7 +165,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         if (type === 'notify' || type === 'append') {
             for (const msg of messages) {
                 const clean = unwrapMessage(msg);
-                // Realtime: Passamos o pushName para tentar corrigir leads sem nome na hora
+                // Realtime: Passa o pushName novo para tentar corrigir leads antigos
                 await processSingleMessage(clean, sock, companyId, sessionId, true, clean.pushName);
             }
         }
@@ -179,21 +182,20 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
         const body = getBody(msg.message);
 
-        // 1. Tenta criar/recuperar Lead
-        // Se forcedName vier (do mapa ou pushName), o ensureLeadExists vai tentar corrigir nomes NULL
+        // 1. Tenta criar/recuperar Lead (Com Self-Healing de nome)
         let leadId = null;
         if (jid && !jid.includes('@g.us')) {
             leadId = await ensureLeadExists(jid, companyId, forcedName);
         }
         
-        // 2. Mídia (Só realtime)
+        // 2. Mídia (Apenas em tempo real para não travar histórico)
         let mediaUrl = null;
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         if (isMedia && isRealtime) { 
             try {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger });
                 let mimeType = 'application/octet-stream';
-                // ... lógica simples de mime
+                // ... lógica de mime type simplificada
                 mediaUrl = await uploadMedia(buffer, mimeType);
             } catch (e) {}
         }
