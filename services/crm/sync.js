@@ -8,22 +8,23 @@ const logger = pino({ level: 'error' });
 
 const leadLock = new Set(); 
 
-// --- NAME SANITIZER BLINDADO V5 ---
-// Retorna TRUE se o nome for lixo (número puro, undefined, null, só símbolos)
+// --- NAME SANITIZER BLINDADO V5.1 ---
+// Retorna TRUE se o nome for lixo ou parecer um número de telefone
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
     if (cleanName.length === 0) return true;
     
-    // Se o nome for apenas caracteres não alfabéticos (ex: "+55 11...", "---", "1234")
-    // Permite letras, acentos e emojis. Rejeita se só tiver números e pontuação.
+    // Regra 1: Apenas símbolos ou números
     if (/^[\d\s\+\-\(\)\.]+$/.test(cleanName)) return true;
     
-    // Comparação direta com o telefone
+    // Regra 2: Comparação direta com o telefone (ignora +55, espaços, traços)
     const cleanPhone = phone.replace(/\D/g, '');
     const cleanNameDigits = cleanName.replace(/\D/g, '');
     
-    if (cleanNameDigits === cleanPhone) return true; // É o próprio número
+    // Se o nome contiver pelo menos 8 dígitos e for igual ao telefone, é genérico
+    if (cleanNameDigits.length > 7 && cleanNameDigits.includes(cleanPhone)) return true;
+    if (cleanNameDigits === cleanPhone) return true;
     
     return false;
 };
@@ -36,17 +37,17 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     } catch (e) {}
 };
 
-// PATCH: Adicionado parâmetro `isFromBook` (Prioridade Alta)
+// PATCH: Adicionado parâmetro `isFromBook`
 export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false) => {
     try {
         if (!jid || !companyId) return;
 
         const isGroup = jid.includes('@g.us');
-        // Normaliza JID (remove dispositivo :2, etc)
+        // Normaliza JID
         const cleanJid = jid.split('@')[0].split(':')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
         const phone = cleanJid.split('@')[0];
         
-        // 1. Busca dados atuais (Leitura leve)
+        // 1. Busca dados atuais
         const { data: current } = await supabase
             .from('contacts')
             .select('name, push_name, profile_pic_url')
@@ -59,31 +60,27 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             phone: phone,
             company_id: companyId,
             updated_at: new Date(),
-            last_message_at: new Date() // Mantém o contato "vivo"
+            last_message_at: new Date()
         };
 
-        // --- LÓGICA DE PRIORIDADE (NAME HUNTER V5 + AUTHORITY) ---
+        // --- LÓGICA DE PRIORIDADE (NAME HUNTER V5.1) ---
         let finalName = null;
         let shouldUpdateLead = false;
         
-        // O nome que chegou é válido?
         const incomingIsGood = !isGenericName(incomingName, phone);
-        // O nome que já temos no banco é válido?
         const currentIsGood = current && !isGenericName(current.name, phone);
 
         if (incomingIsGood) {
-            // Sempre salvamos o push_name se vier algo bom para histórico/debug
+            // Sempre salvamos push_name se vier algo válido
             updateData.push_name = incomingName; 
 
-            // DECISÃO DE ATUALIZAÇÃO DO NOME PRINCIPAL (Display Name)
-            // 1. Se o banco está vazio ou tem nome ruim -> ATUALIZA SEMPRE.
-            // 2. Se a origem é a AGENDA (isFromBook) -> FORCE UPDATE (O usuário mandou).
-            // 3. Se não é da agenda (PushName), SÓ atualiza se o banco estiver ruim.
-            
+            // Regra de Ouro:
+            // - Se o banco tem nome ruim -> ATUALIZA
+            // - Se veio da Agenda -> ATUALIZA (Autoridade)
+            // - Se o banco já tem nome bom e não veio da agenda -> PRESERVA (Não deixa pushName sobrescrever Agenda)
             const shouldOverwrite = !currentIsGood || isFromBook;
 
             if (shouldOverwrite) {
-                // Só dispara update se o nome for realmente diferente
                 if (!current || current.name !== incomingName) {
                     updateData.name = incomingName;
                     finalName = incomingName;
@@ -91,8 +88,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
                 }
             } 
         } else {
-            // Se o que chegou é ruim (null ou número), mas não temos nada no banco
-            // Forçamos NULL para evitar salvar o número como nome (regra do sanitizer)
+            // Se chegou nome ruim e não temos nada, força NULL para limpar lixo
             if (!current && !currentIsGood) {
                 updateData.name = null;
             }
@@ -108,10 +104,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         if (error) {
              console.error('[CONTACT SYNC ERROR]', error.message);
         } else if (shouldUpdateLead && finalName && !isGroup) {
-            // [PROPAGAÇÃO PARA LEADS]
-            // Atualiza o Lead se o contato mudou de nome
-            
-            // 1. Busca Lead Existente
+            // Propagação para Leads
             const { data: lead } = await supabase
                 .from('leads')
                 .select('id, name')
@@ -120,10 +113,8 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
                 .limit(1)
                 .maybeSingle();
 
-            // 2. Regra de Atualização do Lead:
-            // - Se o Lead tem nome ruim (Número) -> Atualiza.
-            // - Se veio da Agenda (isFromBook) -> Atualiza (Sincronia total Agenda -> CRM).
             if (lead) {
+                // Só atualiza Lead se o nome atual dele for ruim ou se a fonte for confiável (Agenda)
                 if (isGenericName(lead.name, phone) || isFromBook) {
                     await supabase.from('leads').update({ name: finalName }).eq('id', lead.id);
                 }
@@ -149,15 +140,13 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         const { data: existing } = await supabase.from('leads').select('id, name').eq('phone', phone).eq('company_id', companyId).maybeSingle();
 
         if (existing) {
-            // Atualiza nome do lead existente se ele não tiver nome bom e o novo for bom
+            // Se o lead existe mas tem nome genérico (número), tenta atualizar com o pushName
             if (pushName && !isGenericName(pushName, phone) && isGenericName(existing.name, phone)) {
                 await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
             }
             return existing.id;
         }
 
-        // [NOVO LEAD]
-        // Se tem nome válido, usa. Se não, usa NULL (deixa o frontend lidar ou futura atualização)
         const nameToUse = (pushName && !isGenericName(pushName, phone)) ? pushName : null;
         
         const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
