@@ -27,6 +27,10 @@ const addToCache = (id) => {
     return true;
 };
 
+// --- TRAVA DE SEGURANÇA (Listener V2) ---
+// Evita processamento duplicado do histórico se o evento disparar 2x
+let isProcessingHistory = false;
+
 // --- HELPERS ---
 const unwrapMessage = (msg) => {
     if (!msg.message) return msg;
@@ -82,38 +86,66 @@ const fetchProfilePicSafe = async (sock, jid) => {
 // ==============================================================================
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
-    // --- HISTÓRICO COMPLETO ---
+    // --- HISTÓRICO COMPLETO (Fusão V1 + V2) ---
     sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
+        // Trava de segurança
+        if (isProcessingHistory) {
+            console.warn(`⚠️ [HISTÓRICO] Ignorando duplicação de evento para ${sessionId}.`);
+            return;
+        }
+        isProcessingHistory = true;
+
         try {
             console.log(`📚 [HISTÓRICO] Iniciando Sync... Sessão: ${sessionId}`);
             await updateSyncStatus(sessionId, 'importing_contacts', 5);
 
-            // 1. SYNC AGENDA (Priority 1)
-            // Itera explicitamente sobre o array de contatos para salvar no banco
+            // --- MAPA DE NOMES (NAME HUNTER V5.0) ---
+            // Cria um mapa em memória para resolver nomes antes de salvar
+            const contactsMap = new Map();
+
+            // 1. Coleta da Agenda (Prioridade Máxima)
             if (contacts && contacts.length > 0) {
                 console.log(`📇 [AGENDA] Processando ${contacts.length} contatos da agenda...`);
-                
-                // Processa em lotes para não travar o loop de eventos
-                const BATCH_SIZE = 50;
-                for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
-                    const batch = contacts.slice(i, i + BATCH_SIZE);
-                    await Promise.all(batch.map(async (c) => {
-                        // NORMALIZA JID AQUI TAMBÉM
-                        const jid = normalizeJid(c.id);
-                        if (!jid || jid.includes('status@')) return;
-
-                        // Nome da Agenda (Notify ou Name)
-                        const bestName = c.name || c.verifiedName || c.notify;
-                        let picUrl = c.imgUrl || null;
-                        
-                        // isFromBook = true força o nome da agenda a prevalecer
-                        // E o sync.js vai criar o Lead se ele não existir
-                        await upsertContact(jid, companyId, bestName, picUrl, true);
-                    }));
-                }
+                contacts.forEach(c => {
+                    const jid = normalizeJid(c.id);
+                    if (!jid) return;
+                    
+                    // Tenta todos os campos possíveis
+                    const bestName = c.name || c.verifiedName || c.notify;
+                    if (bestName) {
+                        contactsMap.set(jid, { name: bestName, imgUrl: c.imgUrl, isFromBook: true });
+                    }
+                });
             }
 
-            // 2. PROCESSAR MENSAGENS (Histórico)
+            // 2. Coleta das Mensagens (Scavenger Hunt)
+            // Se não estava na agenda, tenta pegar o PushName das mensagens
+            if (messages && messages.length > 0) {
+                messages.forEach(msg => {
+                    if (msg.key.fromMe) return;
+                    const jid = normalizeJid(msg.key.remoteJid);
+                    if (!jid) return;
+
+                    if (!contactsMap.has(jid) && msg.pushName) {
+                        contactsMap.set(jid, { name: msg.pushName, imgUrl: null, isFromBook: false });
+                    }
+                });
+            }
+
+            // 3. Salva Contatos (Lote) - Agora temos os nomes resolvidos
+            const uniqueJids = Array.from(contactsMap.keys());
+            const BATCH_SIZE = 50;
+            
+            for (let i = 0; i < uniqueJids.length; i += BATCH_SIZE) {
+                const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
+                await Promise.all(batchJids.map(async (jid) => {
+                    const data = contactsMap.get(jid);
+                    // Aqui a mágica acontece: Se isFromBook=true, o sync.js vai forçar a atualização do Lead
+                    await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook);
+                }));
+            }
+
+            // 4. Processa Mensagens (Histórico)
             if (messages && messages.length > 0) {
                 await updateSyncStatus(sessionId, 'importing_messages', 30);
                 
@@ -122,9 +154,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     const unwrapped = unwrapMessage(msg);
                     if(!unwrapped.key?.remoteJid) return;
                     
-                    // NORMALIZAÇÃO DE CHAT
                     const jid = normalizeJid(unwrapped.key.remoteJid);
-                    if (jid === 'status@broadcast') return;
+                    if (!jid || jid === 'status@broadcast') return;
                     
                     if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
                     messagesByChat.get(jid).push(unwrapped);
@@ -136,20 +167,27 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     return tB - tA; 
                 });
 
+                // Top 200 conversas, últimas 15 msgs
                 const topChats = sortedChats.slice(0, 200); 
                 let processed = 0;
                 
                 for (const [chatJid, chatMsgs] of topChats) {
-                    fetchProfilePicSafe(sock, chatJid).then(url => {
-                        if (url) upsertContact(chatJid, companyId, null, url, false);
-                    });
+                    // Busca foto atualizada se não veio no mapa
+                    if (!contactsMap.has(chatJid)) {
+                        fetchProfilePicSafe(sock, chatJid).then(url => {
+                            if (url) upsertContact(chatJid, companyId, null, url, false);
+                        });
+                    }
 
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-                    const msgsToSave = chatMsgs.slice(-10);
+                    const msgsToSave = chatMsgs.slice(-15);
 
                     for (const msg of msgsToSave) {
-                        const pushName = msg.pushName;
-                        await processSingleMessage(msg, sock, companyId, sessionId, false, pushName);
+                        // Tenta usar o nome do mapa se o pushName da mensagem for nulo
+                        const mapData = contactsMap.get(chatJid);
+                        const forcedName = msg.pushName || (mapData ? mapData.name : null);
+                        
+                        await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName);
                     }
                     processed += msgsToSave.length;
                 }
@@ -160,6 +198,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
         } catch (e) {
             console.error("History Sync Error:", e);
+        } finally {
+            // Libera a trava após 15 segundos
+            setTimeout(() => { isProcessingHistory = false; }, 15000);
         }
     });
 
@@ -175,7 +216,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
             const clean = unwrapMessage(msg);
             
-            // Normaliza JID para buscar foto corretamente e para processamento
+            // Normaliza JID na entrada
             const jid = normalizeJid(clean.key.remoteJid);
             
             // Busca foto se for um contato novo interagindo agora (e não for grupo)
@@ -189,6 +230,20 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         }
     });
     
+    // Atualização de Contatos em Tempo Real
+    sock.ev.on('contacts.upsert', async (contacts) => {
+        for (const c of contacts) {
+            const jid = normalizeJid(c.id);
+            if (!jid) continue;
+
+            const bestName = c.name || c.verifiedName || c.notify;
+            // Se c.name existe, é atualização da agenda -> isFromBook = true
+            const isFromBook = !!c.name;
+            
+            await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook);
+        }
+    });
+
     sock.ev.on('contacts.update', async (updates) => {
         for (const update of updates) {
             if (update.imgUrl) {
@@ -221,6 +276,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
             
             // Se for realtime, garante que o contato no banco esteja atualizado com o pushName recente
             if (isRealtime && forcedName) {
+                // isFromBook = false pois pushName não é autoridade máxima (mas ensureLeadExists trata isso)
                 await upsertContact(jid, companyId, forcedName, null, false);
             }
         }
@@ -233,7 +289,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
         // 2. MÍDIA
         let mediaUrl = null;
-        if (isMedia) { 
+        if (isMedia && isRealtime) { // Só baixa mídia em realtime para performance
             try {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger });
                 let mimeType = 'application/octet-stream';
