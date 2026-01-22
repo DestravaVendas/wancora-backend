@@ -6,20 +6,19 @@ import pino from "pino";
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'error' });
 
-// Mutex
+// Mutex para evitar Race Conditions na criação de Leads
 const leadLock = new Set(); 
 
-// --- NAME SANITIZER V6.3 ---
-const isGenericName = (name) => {
+// --- HELPER: NAME VALIDATION ---
+const isPhoneNumber = (name) => {
     if (!name) return true;
-    const clean = String(name).trim();
-    if (clean.length < 1) return true;
-    // Verifica se tem letras. Se não tiver (só números/símbolos), é genérico.
-    const hasLetters = /[a-zA-Z\u00C0-\u00FF]/.test(clean);
-    return !hasLetters; 
+    // Remove tudo que não é letra
+    const letters = name.replace(/[^a-zA-Z]/g, '');
+    // Se tiver menos de 1 letra, consideramos que é um número ou símbolo
+    return letters.length < 1; 
 };
 
-// Helper para formatar telefone bonito (+55 11...) quando não temos nome
+// Formata telefone para exibição visual bonita
 const formatPhoneAsName = (phone) => {
     if (!phone) return "Desconhecido";
     const p = phone.replace(/\D/g, '');
@@ -41,39 +40,37 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     } catch (e) {}
 };
 
-// PATCH: Sincronização Agressiva (Contact -> Lead)
+// --- SYNC CONTACTS (AGENDA & METADADOS) ---
 export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false) => {
     try {
         if (!jid || !companyId) return;
+        if (jid.includes('status@broadcast')) return;
 
         const isGroup = jid.includes('@g.us');
+        // Normaliza JID para evitar duplicatas (ex: remove :12@...)
         const cleanJid = jid.split('@')[0].split(':')[0] + (isGroup ? '@g.us' : '@s.whatsapp.net');
         const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
         
+        // 1. Prepara dados do contato
         const updateData = {
             jid: cleanJid,
             phone: purePhone, 
             company_id: companyId,
-            updated_at: new Date(),
-            last_message_at: new Date()
+            updated_at: new Date()
         };
 
-        const nameValid = !isGenericName(incomingName);
-
-        if (nameValid) {
-            updateData.push_name = incomingName;
-            if (isFromBook) {
-                updateData.name = incomingName;
-            }
+        // Só atualiza nome se vier algo válido (evita sobrescrever com null)
+        if (incomingName && !isPhoneNumber(incomingName)) {
+            if (isFromBook) updateData.name = incomingName; // Nome da Agenda
+            else updateData.push_name = incomingName;       // Nome do Perfil
         }
 
         if (profilePicUrl) updateData.profile_pic_url = profilePicUrl;
 
-        // 2. Upsert Contato
+        // 2. Upsert na tabela contacts (Agenda)
         const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
 
-        // 3. AUTO-HEALING & CREATION DE LEADS
-        // Se veio da agenda (isFromBook) ou se temos um nome válido, propagamos.
+        // 3. LEAD SELF-HEALING (A Mágica da Atualização)
         if (!error && !isGroup) {
             const { data: lead } = await supabase
                 .from('leads')
@@ -84,22 +81,20 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
                 .maybeSingle();
 
             if (lead) {
-                // Atualiza se nome atual for ruim ou diferente da agenda
-                const currentNameBad = !lead.name || isGenericName(lead.name);
-                
-                // Se temos um nome bom chegando, atualizamos o lead
-                if (nameValid && (currentNameBad || (isFromBook && lead.name !== incomingName))) {
+                // Se o lead existe, verificamos se o nome atual é "ruim" (número)
+                const currentNameIsBad = !lead.name || isPhoneNumber(lead.name);
+                const newNameIsGood = incomingName && !isPhoneNumber(incomingName);
+
+                // Se temos um nome novo BOM e o atual é RUIM (ou se veio da agenda), atualizamos
+                if (newNameIsGood && (currentNameIsBad || isFromBook)) {
+                    // console.log(`[SYNC] Corrigindo nome do Lead ${purePhone}: ${lead.name} -> ${incomingName}`);
                     await supabase.from('leads').update({ name: incomingName }).eq('id', lead.id);
                 }
-            } else if (isFromBook && nameValid) {
-                // Se não existe e veio da agenda, cria imediatamente
-                const { data: stage } = await supabase.from('pipeline_stages')
-                    .select('id')
-                    .eq('company_id', companyId)
-                    .order('position', { ascending: true })
-                    .limit(1)
-                    .maybeSingle();
-                
+            } else if (isFromBook && incomingName && !isPhoneNumber(incomingName)) {
+                // Se veio da agenda, tem nome válido e não existe Lead, cria (Opcional, mas bom para popular CRM)
+                // Descomente abaixo se quiser criar leads automaticamente para toda a agenda (pode poluir)
+                /*
+                const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position').limit(1).single();
                 await supabase.from('leads').insert({
                     company_id: companyId,
                     phone: purePhone,
@@ -107,6 +102,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
                     status: 'new',
                     pipeline_stage_id: stage?.id
                 });
+                */
             }
         }
     } catch (e) {
@@ -114,44 +110,48 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
     }
 };
 
-// Garante criação do Lead (Com trava de concorrência)
+// --- GARANTIA DE LEAD (Criação ou Busca) ---
 export const ensureLeadExists = async (jid, companyId, pushName) => {
     if (!jid || jid.endsWith('@g.us') || jid.includes('status@broadcast')) return null; 
 
     const purePhone = jid.split('@')[0].replace(/\D/g, '');
     if (purePhone.length < 8) return null;
     
+    // Mutex Local para evitar criação duplicada em rajadas
     const lockKey = `${companyId}:${purePhone}`;
     if (leadLock.has(lockKey)) return null;
     
     try {
         leadLock.add(lockKey);
 
+        // 1. Verifica existência
         const { data: existing } = await supabase.from('leads')
             .select('id, name')
             .eq('phone', purePhone)
             .eq('company_id', companyId)
             .maybeSingle();
 
-        // LÓGICA DE NOME (FALLBACK V6.3)
-        // Se pushName for válido, usa ele.
-        // Se não for, usa o número formatado como nome provisório.
-        const nameIsValid = !isGenericName(pushName);
-        const fallbackName = formatPhoneAsName(purePhone);
-        const nameToUse = nameIsValid ? pushName : fallbackName;
-
+        // Lógica de Nome: PushName > Telefone Formatado
+        const nameIsValid = pushName && !isPhoneNumber(pushName);
+        
         if (existing) {
-            // Self-Healing: Se o nome atual for genérico/nulo e agora temos um nome válido, atualiza.
-            // Se o nome atual for o número formatado (fallback) e chegou um pushName real, atualiza.
-            const currentIsBad = !existing.name || isGenericName(existing.name) || existing.name.includes('+55');
-            
-            if (nameIsValid && currentIsBad) {
+            // Self-Healing: Atualiza se o nome no banco for número e agora temos nome real
+            if (nameIsValid && isPhoneNumber(existing.name)) {
                 await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
             }
             return existing.id;
         }
 
-        // Create
+        // 2. Se não existe, cria novo
+        // Tenta buscar nome na tabela de contatos antes (pode ter vindo da agenda)
+        let finalName = nameIsValid ? pushName : formatPhoneAsName(purePhone);
+        
+        if (!nameIsValid) {
+            const { data: contact } = await supabase.from('contacts').select('name, push_name').eq('jid', jid).eq('company_id', companyId).maybeSingle();
+            if (contact?.name) finalName = contact.name;
+            else if (contact?.push_name) finalName = contact.push_name;
+        }
+
         const { data: stage } = await supabase.from('pipeline_stages')
             .select('id')
             .eq('company_id', companyId)
@@ -162,7 +162,7 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
         const { data: newLead } = await supabase.from('leads').insert({
             company_id: companyId,
             phone: purePhone,
-            name: nameToUse, // Nunca será NULL agora
+            name: finalName, 
             status: 'new',
             pipeline_stage_id: stage?.id
         }).select('id').single();
@@ -171,13 +171,17 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
     } catch (e) {
         return null;
     } finally {
-        leadLock.delete(lockKey);
+        // Libera o lock após 1 segundo para garantir propagação no banco
+        setTimeout(() => leadLock.delete(lockKey), 1000);
     }
 };
 
 export const upsertMessage = async (msgData) => {
     try {
-        await new Promise(resolve => setTimeout(resolve, 200));
+        // Pequeno delay para garantir que Contact/Lead existam antes da mensagem (FK safety)
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        // Upsert ignorando conflitos (deduplicação via banco)
         const { error } = await supabase.from('messages').upsert(msgData, { onConflict: 'remote_jid, whatsapp_id' });
         if (error) throw error;
     } catch (e) {}
