@@ -8,8 +8,7 @@ import {
 } from '../crm/sync.js';
 import {
     downloadMediaMessage,
-    getContentType,
-    jidNormalizedUser
+    getContentType
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { createClient } from '@supabase/supabase-js';
@@ -60,13 +59,12 @@ const getBody = (msg) => {
     return ''; 
 };
 
-// Fetch agressivo de foto (sempre tenta se não vier url)
+// Fetch Inteligente: Tenta obter URL. Se falhar ou vier vazia, não crasha.
 const fetchProfilePicSafe = async (sock, jid) => {
     try {
-        // Pequeno delay aleatório para evitar Rate Limit do WhatsApp em loops
-        await new Promise(r => setTimeout(r, Math.random() * 500));
-        const url = await sock.profilePictureUrl(jid, 'image'); 
-        return url;
+        // Random delay para não tomar 429 Too Many Requests
+        await new Promise(r => setTimeout(r, Math.random() * 800));
+        return await sock.profilePictureUrl(jid, 'image'); 
     } catch (e) {
         return null; 
     }
@@ -83,27 +81,30 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             console.log(`📚 [HISTÓRICO] Iniciando Sync... Sessão: ${sessionId}`);
             await updateSyncStatus(sessionId, 'importing_contacts', 5);
 
-            // --- MAPA DE NOMES E FOTOS ---
             const contactsMap = new Map();
 
-            // 1. Processa Contatos (Agenda)
+            // 1. Processa Contatos (Lote com Extração de LID)
             if (contacts && contacts.length > 0) {
                 console.log(`📇 [AGENDA] Processando ${contacts.length} contatos...`);
                 
-                // Lote para processamento
                 await Promise.all(contacts.map(async (c) => {
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
                     
                     const bestName = c.name || c.verifiedName || c.notify;
-                    // Se não tiver foto no objeto do Baileys, marca para buscar depois
-                    let imgUrl = c.imgUrl; 
+                    // Extrai LID se disponível (Baileys as vezes manda no objeto contact)
+                    const lid = c.lid || null; 
                     
-                    contactsMap.set(jid, { name: bestName, imgUrl, isFromBook: !!bestName });
+                    contactsMap.set(jid, { 
+                        name: bestName, 
+                        imgUrl: c.imgUrl, 
+                        isFromBook: !!bestName,
+                        lid: lid 
+                    });
                 }));
             }
 
-            // 2. Varredura de Mensagens (PushNames para quem não está na agenda)
+            // 2. Scan PushNames
             if (messages && messages.length > 0) {
                 messages.forEach(msg => {
                     if (msg.key.fromMe) return;
@@ -111,35 +112,45 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     if (!jid) return;
 
                     if (!contactsMap.has(jid)) {
-                        contactsMap.set(jid, { name: msg.pushName, imgUrl: null, isFromBook: false });
+                        contactsMap.set(jid, { name: msg.pushName, imgUrl: null, isFromBook: false, lid: null });
                     }
                 });
             }
 
-            // 3. Salva Contatos (Com Fetch de Foto se necessário - O GRANDE DIFERENCIAL)
+            // 3. Salva Contatos (Lote Controlado com Progresso Real)
             const uniqueJids = Array.from(contactsMap.keys());
-            const BATCH_SIZE = 15; // Lote reduzido para garantir fetch de fotos seguro
+            const BATCH_SIZE = 10; // Reduzido para garantir fetch de fotos
+            let processedContacts = 0;
             
             for (let i = 0; i < uniqueJids.length; i += BATCH_SIZE) {
                 const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
+                
                 await Promise.all(batchJids.map(async (jid) => {
                     let data = contactsMap.get(jid);
                     
-                    // DEEP FETCH: Se não tem foto, busca agora na API do WhatsApp
+                    // DEEP FETCH: Busca foto se não tiver
                     if (!data.imgUrl && !jid.includes('@g.us')) {
                         const freshPic = await fetchProfilePicSafe(sock, jid);
                         if (freshPic) data.imgUrl = freshPic;
                     }
 
-                    await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook);
+                    // Passa o LID para mapeamento no sync.js
+                    await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                 }));
+
+                processedContacts += batchJids.length;
+                
+                // ATUALIZAÇÃO PROGRESSIVA (Evita "travamento" da barra)
+                const percent = 5 + Math.floor((processedContacts / uniqueJids.length) * 25); // Vai de 5% a 30%
+                if (percent % 5 === 0) {
+                    await updateSyncStatus(sessionId, 'importing_contacts', percent);
+                }
             }
 
-            // 4. Processa Mensagens
+            // 4. Processa Mensagens (Lote Controlado)
             if (messages && messages.length > 0) {
                 await updateSyncStatus(sessionId, 'importing_messages', 30);
                 
-                // Agrupa e ordena
                 const messagesByChat = new Map();
                 messages.forEach(msg => {
                     const unwrapped = unwrapMessage(msg);
@@ -156,22 +167,28 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     return tB - tA; 
                 });
 
-                // Limita histórico para performance (ex: 200 conversas recentes)
                 const topChats = sortedChats.slice(0, 200); 
-                let processed = 0;
+                let processedMsgs = 0;
+                const totalMsgs = topChats.reduce((acc, [, msgs]) => acc + msgs.length, 0);
                 
-                for (const [chatJid, chatMsgs] of topChats) {
+                for (let i = 0; i < topChats.length; i++) {
+                    const [chatJid, chatMsgs] = topChats[i];
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-                    const msgsToSave = chatMsgs.slice(-20); // Aumentado para 20 últimas mensagens
+                    const msgsToSave = chatMsgs.slice(-25); // Top 25
 
                     for (const msg of msgsToSave) {
                         const mapData = contactsMap.get(chatJid);
                         const forcedName = msg.pushName || (mapData ? mapData.name : null);
                         await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName);
+                        processedMsgs++;
                     }
-                    processed += msgsToSave.length;
+
+                    // ATUALIZAÇÃO PROGRESSIVA DE MENSAGENS
+                    const percent = 30 + Math.floor((i / topChats.length) * 70); // Vai de 30% a 100%
+                    if (i % 5 === 0) {
+                        await updateSyncStatus(sessionId, 'importing_messages', percent);
+                    }
                 }
-                console.log(`✅ [HISTÓRICO] Processadas ${processed} mensagens.`);
             }
 
             await updateSyncStatus(sessionId, 'completed', 100);
@@ -192,10 +209,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const clean = unwrapMessage(msg);
             const jid = normalizeJid(clean.key.remoteJid);
             
-            // Busca foto em tempo real se for conversa direta e não tivermos no cache local
+            // BUSCA FOTO REATIVA (Ao receber mensagem de desconhecido)
             if (jid && !clean.key.fromMe && !clean.key.participant && jid.includes('@s.whatsapp.net')) { 
-                 // Dispara em background para não travar a mensagem
                  fetchProfilePicSafe(sock, jid).then(url => {
+                     // Atualiza contato silenciosamente com a nova foto
                      if(url) upsertContact(jid, companyId, clean.pushName, url, false);
                  });
             }
@@ -210,11 +227,11 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const jid = normalizeJid(c.id);
             if (!jid) continue;
             const bestName = c.name || c.verifiedName || c.notify;
-            await upsertContact(jid, companyId, bestName, c.imgUrl || null, !!c.name);
+            // Passa LID se existir no update
+            await upsertContact(jid, companyId, bestName, c.imgUrl || null, !!c.name, c.lid);
         }
     });
 
-    // Atualização específica de foto ou status
     sock.ev.on('contacts.update', async (updates) => {
         for (const update of updates) {
             const jid = normalizeJid(update.id);
@@ -228,7 +245,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime, forcedName = null) => {
     try {
         if (!msg.message) return;
-        const jid = normalizeJid(msg.key.remoteJid); // NORMALIZAÇÃO AQUI
+        const jid = normalizeJid(msg.key.remoteJid);
         if (jid === 'status@broadcast') return;
 
         const body = getBody(msg.message);
@@ -239,12 +256,15 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
         const fromMe = msg.key.fromMe;
 
-        // 1. GARANTE ESTRUTURA (Lead & Contato)
+        // 1. GARANTE ESTRUTURA (Lead & Contato & LID Map)
         let leadId = null;
         if (jid && !jid.includes('@g.us')) {
+            // Se for realtime, garantimos que o contato existe e tentamos mapear LID
+            // msg.key.id as vezes contém pistas, mas o melhor é deixar o upsertContact lidar com isso
             leadId = await ensureLeadExists(jid, companyId, forcedName);
             
             if (isRealtime && forcedName) {
+                // Atualiza pushname
                 await upsertContact(jid, companyId, forcedName, null, false);
             }
         }
@@ -261,7 +281,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger });
                 let mimeType = 'application/octet-stream';
                 if (msg.message?.imageMessage) mimeType = 'image/jpeg';
-                else if (msg.message?.audioMessage) mimeType = 'audio/mp4'; // PTT
+                else if (msg.message?.audioMessage) mimeType = 'audio/mp4'; 
                 else if (msg.message?.videoMessage) mimeType = 'video/mp4';
                 else if (msg.message?.documentMessage) mimeType = msg.message.documentMessage.mimetype;
                 else if (msg.message?.stickerMessage) mimeType = 'image/webp';
@@ -274,7 +294,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         await upsertMessage({
             company_id: companyId,
             session_id: sessionId,
-            remote_jid: jid, // AGORA ESTÁ NORMALIZADO
+            remote_jid: jid,
             whatsapp_id: msg.key.id,
             from_me: fromMe,
             content: body || (mediaUrl ? '[Mídia]' : ''),
