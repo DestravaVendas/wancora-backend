@@ -71,16 +71,14 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             console.log(`📚 [HISTÓRICO] Iniciando Sync... Sessão: ${sessionId}`);
             await updateSyncStatus(sessionId, 'importing_contacts', 5);
 
-            // --- MAPA DE NOMES (NAME HUNTER V5.0) ---
-            // Usa Map para O(1) lookup. Chave = cleanJid (normalizado)
+            // --- MAPA DE NOMES (NAME HUNTER V5.0 - SCAVENGER MODE) ---
             const contactsMap = new Map();
             let namesFound = 0;
 
+            // PASSO 1: Agenda (Prioridade Máxima)
             if (contacts && contacts.length > 0) {
                 contacts.forEach(c => {
-                    // ORDEM RIGOROSA: Agenda (name) > Verificado (verifiedName) > Perfil (notify)
                     const bestName = c.name || c.verifiedName || c.notify || c.short;
-                    
                     if (bestName) {
                         const jidKey = cleanJid(c.id);
                         if(jidKey) {
@@ -90,28 +88,55 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     }
                 });
             }
-            console.log(`🗺️ [MAPA] ${namesFound} nomes reais mapeados.`);
+
+            // PASSO 2: Varredura de Mensagens (Scavenger Hunt)
+            // Procura pushNames em mensagens de pessoas que NÃO estão na agenda
+            if (messages && messages.length > 0) {
+                messages.forEach(msg => {
+                    if (msg.key.fromMe) return; // Ignora minhas mensagens
+                    const jidKey = cleanJid(msg.key.remoteJid);
+                    const pushName = msg.pushName;
+
+                    // Se temos um PushName e esse JID ainda NÃO tem nome no mapa, salvamos!
+                    if (jidKey && pushName && !contactsMap.has(jidKey)) {
+                        // Filtra nomes genéricos (só números)
+                        if (!/^[\d\s\+\-\(\)\.]+$/.test(pushName)) {
+                            contactsMap.set(jidKey, pushName);
+                            namesFound++;
+                        }
+                    }
+                });
+            }
+
+            console.log(`🗺️ [MAPA] ${namesFound} nomes reais mapeados (Agenda + Histórico).`);
 
             // A. Salva Contatos (Lote)
             await updateSyncStatus(sessionId, 'importing_messages', 20);
             
-            // Filtra JIDs válidos (ignorando status, etc)
-            const validContacts = contacts.filter(c => c.id && (c.id.endsWith('@s.whatsapp.net') || c.id.endsWith('@g.us')));
+            // Unimos contatos oficiais + contatos descobertos nas mensagens
+            const allJids = new Set([
+                ...(contacts || []).map(c => cleanJid(c.id)),
+                ...Array.from(contactsMap.keys())
+            ]);
+
+            const validJids = Array.from(allJids).filter(jid => jid && (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@g.us')));
             
             const batchSize = 100;
-            for (let i = 0; i < validContacts.length; i += batchSize) {
-                const batch = validContacts.slice(i, i + batchSize);
-                await Promise.all(batch.map(async (c) => {
-                    const jidKey = cleanJid(c.id);
+            for (let i = 0; i < validJids.length; i += batchSize) {
+                const batch = validJids.slice(i, i + batchSize);
+                await Promise.all(batch.map(async (jidKey) => {
+                    // Tenta achar o objeto de contato original para pegar foto
+                    const originalContact = contacts?.find(c => cleanJid(c.id) === jidKey);
                     
-                    // Aplica a mesma ordem de prioridade aqui para salvar no banco
-                    const nameToSave = contactsMap.get(jidKey) || c.name || c.verifiedName || c.notify;
+                    // O nome vem do nosso Mapa Inteligente
+                    const nameToSave = contactsMap.get(jidKey);
                     
-                    // CHECK: Se veio c.name, é da Agenda!
-                    // Isso ativa o modo de sobrescrita no sync.js
-                    const isFromBook = !!c.name; 
+                    // CHECK: Se veio originalContact.name, é da Agenda!
+                    const isFromBook = !!(originalContact && originalContact.name); 
 
-                    await upsertContact(jidKey, companyId, nameToSave || null, c.imgUrl || null, isFromBook);
+                    if (nameToSave) {
+                        await upsertContact(jidKey, companyId, nameToSave, originalContact?.imgUrl || null, isFromBook);
+                    }
                 }));
             }
             
@@ -121,7 +146,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 const groupList = Object.values(groups);
                 console.log(`👥 [GRUPOS] Sincronizando ${groupList.length} grupos...`);
                 for (const g of groupList) {
-                    // Grupos sempre são "isFromBook=true" pois o nome do grupo é absoluto
                     await upsertContact(g.id, companyId, g.subject, null, true);
                     contactsMap.set(g.id, g.subject); 
                 }
@@ -137,7 +161,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 const unwrapped = unwrapMessage(msg);
                 if(!unwrapped.key || !unwrapped.key.remoteJid) return;
                 
-                const jid = cleanJid(unwrapped.key.remoteJid); // Normaliza chave
+                const jid = cleanJid(unwrapped.key.remoteJid); 
                 if (jid === 'status@broadcast') return;
 
                 if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
@@ -155,7 +179,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             let finalMessagesToProcess = [];
             
             topChats.forEach(([jid, msgs]) => {
-                // Ordena mensagens (Antigas -> Novas)
                 msgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                 const limited = msgs.slice(-MAX_MSGS_PER_CHAT);
                 finalMessagesToProcess.push(...limited);
@@ -169,15 +192,12 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             for (const msg of finalMessagesToProcess) {
                 const jidKey = cleanJid(msg.key.remoteJid);
                 
-                // Tenta nome da mensagem (pushName) OU do mapa construído (Agenda)
+                // Prioridade: Mapa (Agenda/Verified/Scavenged) > Msg Atual (PushName)
                 const msgPushName = msg.pushName;
                 const mapName = contactsMap.get(jidKey);
-                
-                // Prioridade: Mapa (Agenda/Verified) > Msg (PushName)
                 const finalName = mapName || msgPushName; 
 
                 // Mensagens históricas nunca sobrescrevem agenda explicitamente (isFromBook=false)
-                // Isso protege contra pushNames antigos sujando o banco
                 await processSingleMessage(msg, sock, companyId, sessionId, false, finalName);
                 
                 processedCount++;
@@ -205,10 +225,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             
             if (bestName) {
                 const jid = cleanJid(c.id);
-                
                 // DETECÇÃO CRÍTICA: Se 'c.name' existe, é atualização da agenda!
                 const isFromBook = !!c.name;
-                
                 await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook);
             }
         }
@@ -218,8 +236,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         if (type === 'notify' || type === 'append') {
             for (const msg of messages) {
                 const clean = unwrapMessage(msg);
-                // Mensagens novas podem trazer nomes, mas NÃO são "da agenda" (isFromBook=false).
-                // Isso impede que um cliente mudando o nome no perfil sobrescreva o nome que você salvou.
+                // Realtime: Mensagens novas podem trazer nomes (PushName)
+                // Se o contato já existe com nome ruim, o sync.js vai atualizar
                 await processSingleMessage(clean, sock, companyId, sessionId, true, clean.pushName);
             }
         }
@@ -239,7 +257,8 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         
         // --- NAME HUNTER V5.0 (RESOLUÇÃO FINAL) ---
         if (forcedName) {
-            // upsertContact tem isFromBook=false por padrão aqui
+            // isFromBook=false aqui, pois pushName não é autoridade máxima
+            // Mas o sync.js vai aceitar se o banco estiver vazio/ruim
             await upsertContact(jid, companyId, forcedName);
         }
         
@@ -247,9 +266,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         const body = getBody(msg.message);
 
         let leadId = null;
-        // BLOQUEIO EXPLÍCITO DE GRUPOS COMO LEADS
         if (jid && !jid.includes('@g.us')) {
-            // Se tiver nome, passamos para criar/atualizar o lead
             leadId = await ensureLeadExists(jid, companyId, forcedName);
         }
         
