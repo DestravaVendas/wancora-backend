@@ -3,7 +3,8 @@ import {
     upsertContact,
     upsertMessage,
     ensureLeadExists,
-    updateSyncStatus
+    updateSyncStatus,
+    normalizeJid // Importante: Importar a função de normalização
 } from '../crm/sync.js';
 import {
     downloadMediaMessage,
@@ -18,27 +19,18 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const logger = pino({ level: 'silent' });
 
 // --- MEMORY CACHE (DEDUPLICAÇÃO) ---
-// Impede processar a mesma mensagem 2x em curto período
 const msgCache = new Set();
 const addToCache = (id) => {
     if (msgCache.has(id)) return false;
     msgCache.add(id);
-    setTimeout(() => msgCache.delete(id), 10000); // Limpa após 10s
+    setTimeout(() => msgCache.delete(id), 10000); 
     return true;
 };
 
 // --- HELPERS ---
-const cleanJid = (jid) => {
-    if (!jid) return null;
-    const temp = jid.split('@')[0].split(':')[0];
-    const suffix = jid.includes('@g.us') ? '@g.us' : '@s.whatsapp.net';
-    return temp + suffix;
-};
-
 const unwrapMessage = (msg) => {
     if (!msg.message) return msg;
     let content = msg.message;
-    // Desenrola aninhamentos comuns do Baileys
     if (content.ephemeralMessage) content = content.ephemeralMessage.message;
     if (content.viewOnceMessage) content = content.viewOnceMessage.message;
     if (content.viewOnceMessageV2) content = content.viewOnceMessageV2.message;
@@ -58,7 +50,6 @@ const uploadMedia = async (buffer, type) => {
     } catch { return null; }
 };
 
-// Parser robusto para evitar mensagens vazias
 const getBody = (msg) => {
     if (!msg) return '';
     if (msg.conversation) return msg.conversation;
@@ -66,7 +57,6 @@ const getBody = (msg) => {
     if (msg.imageMessage?.caption) return msg.imageMessage.caption;
     if (msg.videoMessage?.caption) return msg.videoMessage.caption;
     if (msg.documentMessage?.caption) return msg.documentMessage.caption;
-    // Tags visuais
     if (msg.imageMessage) return '[Imagem]';
     if (msg.videoMessage) return '[Vídeo]';
     if (msg.stickerMessage) return '[Sticker]';
@@ -79,7 +69,6 @@ const getBody = (msg) => {
     return ''; 
 };
 
-// Busca segura de foto (com tratamento de erro e privacy)
 const fetchProfilePicSafe = async (sock, jid) => {
     try {
         return await sock.profilePictureUrl(jid, 'image'); 
@@ -109,17 +98,16 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
                     const batch = contacts.slice(i, i + BATCH_SIZE);
                     await Promise.all(batch.map(async (c) => {
-                        const jid = cleanJid(c.id);
+                        // NORMALIZA JID AQUI TAMBÉM
+                        const jid = normalizeJid(c.id);
                         if (!jid || jid.includes('status@')) return;
 
                         // Nome da Agenda (Notify ou Name)
                         const bestName = c.name || c.verifiedName || c.notify;
-                        
-                        // Busca foto se tiver URL no payload (imgUrl) 
                         let picUrl = c.imgUrl || null;
                         
-                        // Salva na tabela Contacts
                         // isFromBook = true força o nome da agenda a prevalecer
+                        // E o sync.js vai criar o Lead se ele não existir
                         await upsertContact(jid, companyId, bestName, picUrl, true);
                     }));
                 }
@@ -129,43 +117,38 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             if (messages && messages.length > 0) {
                 await updateSyncStatus(sessionId, 'importing_messages', 30);
                 
-                // Filtra e organiza
                 const messagesByChat = new Map();
                 messages.forEach(msg => {
                     const unwrapped = unwrapMessage(msg);
                     if(!unwrapped.key?.remoteJid) return;
-                    const jid = cleanJid(unwrapped.key.remoteJid);
+                    
+                    // NORMALIZAÇÃO DE CHAT
+                    const jid = normalizeJid(unwrapped.key.remoteJid);
                     if (jid === 'status@broadcast') return;
                     
                     if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
                     messagesByChat.get(jid).push(unwrapped);
                 });
 
-                // Ordena chats por atividade recente
                 const sortedChats = Array.from(messagesByChat.entries()).sort(([, msgsA], [, msgsB]) => {
                     const tA = Math.max(...msgsA.map(m => m.messageTimestamp || 0));
                     const tB = Math.max(...msgsB.map(m => m.messageTimestamp || 0));
                     return tB - tA; 
                 });
 
-                // Top 200 conversas, últimas 10 msgs (PEDIDO V6.6)
                 const topChats = sortedChats.slice(0, 200); 
                 let processed = 0;
                 
-                // Itera sobre as conversas mais ativas
                 for (const [chatJid, chatMsgs] of topChats) {
-                    // Busca foto atualizada para chats ativos (se não tivermos ainda)
                     fetchProfilePicSafe(sock, chatJid).then(url => {
                         if (url) upsertContact(chatJid, companyId, null, url, false);
                     });
 
-                    // Ordena e pega as últimas 10
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                     const msgsToSave = chatMsgs.slice(-10);
 
                     for (const msg of msgsToSave) {
                         const pushName = msg.pushName;
-                        // Salva msg
                         await processSingleMessage(msg, sock, companyId, sessionId, false, pushName);
                     }
                     processed += msgsToSave.length;
@@ -185,17 +168,17 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         for (const msg of messages) {
             if (!msg.message) continue;
             
-            // DEDUPLICAÇÃO EM MEMÓRIA (ANTI-ECHO)
-            // Se já processamos este ID nos últimos 10s, ignora.
+            // DEDUPLICAÇÃO EM MEMÓRIA
             if (!addToCache(msg.key.id)) {
-                // console.log('Duplicada ignorada:', msg.key.id);
                 continue;
             }
 
             const clean = unwrapMessage(msg);
             
+            // Normaliza JID para buscar foto corretamente e para processamento
+            const jid = normalizeJid(clean.key.remoteJid);
+            
             // Busca foto se for um contato novo interagindo agora (e não for grupo)
-            const jid = cleanJid(clean.key.remoteJid);
             if (jid && !clean.key.fromMe && !clean.key.participant && jid.includes('@s.whatsapp.net')) { 
                  fetchProfilePicSafe(sock, jid).then(url => {
                      if(url) upsertContact(jid, companyId, clean.pushName, url, false);
@@ -206,11 +189,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         }
     });
     
-    // --- ATUALIZAÇÃO DE CONTATOS (Eventos do Baileys) ---
     sock.ev.on('contacts.update', async (updates) => {
         for (const update of updates) {
             if (update.imgUrl) {
-                const jid = cleanJid(update.id);
+                const jid = normalizeJid(update.id);
                 await upsertContact(jid, companyId, null, update.imgUrl, false);
             }
         }
@@ -220,14 +202,13 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime, forcedName = null) => {
     try {
         if (!msg.message) return;
-        const jid = cleanJid(msg.key.remoteJid);
+        const jid = normalizeJid(msg.key.remoteJid); // NORMALIZAÇÃO AQUI
         if (jid === 'status@broadcast') return;
 
         const body = getBody(msg.message);
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
-        // Evita salvar mensagens de protocolo vazias que não sejam mídia
         if (!body && !isMedia) return;
 
         const fromMe = msg.key.fromMe;
@@ -244,13 +225,13 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
             }
         }
         
-        // Se for grupo, tenta salvar o remetente específico na agenda
+        // Se for grupo
         if (jid.includes('@g.us') && msg.key.participant && forcedName) {
-             const partJid = cleanJid(msg.key.participant);
+             const partJid = normalizeJid(msg.key.participant);
              await upsertContact(partJid, companyId, forcedName, null, false);
         }
 
-        // 2. MÍDIA (BAIXA SEMPRE, SEJA HISTÓRICO OU REALTIME)
+        // 2. MÍDIA
         let mediaUrl = null;
         if (isMedia) { 
             try {
@@ -263,16 +244,14 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
                 else if (msg.message?.stickerMessage) mimeType = 'image/webp';
 
                 mediaUrl = await uploadMedia(buffer, mimeType);
-            } catch (e) {
-                // Ignora erro de download no histórico (mídia expirada), mas continua salvando a msg
-            }
+            } catch (e) {}
         }
 
         // 3. SALVA MENSAGEM
         await upsertMessage({
             company_id: companyId,
             session_id: sessionId,
-            remote_jid: jid,
+            remote_jid: jid, // AGORA ESTÁ NORMALIZADO
             whatsapp_id: msg.key.id,
             from_me: fromMe,
             content: body || (mediaUrl ? '[Mídia]' : '[Arquivo]'),
@@ -283,7 +262,5 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
             created_at: new Date((msg.messageTimestamp || Date.now() / 1000) * 1000)
         });
 
-    } catch (e) {
-        // Silently fail message processing
-    }
+    } catch (e) {}
 };
