@@ -63,32 +63,29 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             last_message_at: new Date()
         };
 
-        // --- LÓGICA DE PRIORIDADE (NAME HUNTER V5.1) ---
-        let finalName = null;
-        let shouldUpdateLead = false;
+        // --- LÓGICA DE PRIORIDADE (NAME HUNTER V5.2 - LEAD FIX) ---
         
         const incomingIsGood = !isGenericName(incomingName, phone);
         const currentIsGood = current && !isGenericName(current.name, phone);
 
-        if (incomingIsGood) {
-            // Sempre salvamos push_name se vier algo válido
-            updateData.push_name = incomingName; 
+        // Define qual é o "Melhor Nome Disponível" neste momento (Novo ou Existente)
+        const bestNameAvailable = incomingIsGood ? incomingName : (currentIsGood ? current.name : null);
 
-            // Regra de Ouro:
-            // - Se o banco tem nome ruim -> ATUALIZA
-            // - Se veio da Agenda -> ATUALIZA (Autoridade)
-            // - Se o banco já tem nome bom e não veio da agenda -> PRESERVA (Não deixa pushName sobrescrever Agenda)
-            const shouldOverwrite = !currentIsGood || isFromBook;
+        // Lógica de Atualização do CONTATO (Tabela Contacts)
+        if (incomingIsGood) {
+            updateData.push_name = incomingName; 
+            
+            // Só sobrescreve se: 
+            // 1. O banco está ruim.
+            // 2. Veio da Agenda (Autoridade).
+            // 3. O nome mudou (ex: mudou na agenda).
+            const shouldOverwrite = !currentIsGood || isFromBook || (current && current.name !== incomingName && isFromBook);
 
             if (shouldOverwrite) {
-                if (!current || current.name !== incomingName) {
-                    updateData.name = incomingName;
-                    finalName = incomingName;
-                    shouldUpdateLead = true;
-                }
+                updateData.name = incomingName;
             } 
         } else {
-            // Se chegou nome ruim e não temos nada, força NULL para limpar lixo
+            // Se chegou lixo e não temos nada, força NULL
             if (!current && !currentIsGood) {
                 updateData.name = null;
             }
@@ -98,13 +95,14 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             updateData.profile_pic_url = profilePicUrl;
         }
 
-        // Executa UPSERT
+        // Executa UPSERT no CONTACTS
         const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
 
-        if (error) {
-             console.error('[CONTACT SYNC ERROR]', error.message);
-        } else if (shouldUpdateLead && finalName && !isGroup) {
-            // Propagação para Leads
+        // --- PROPAGAÇÃO PARA LEADS (CORREÇÃO DE SINCRONIA) ---
+        // Agora verificamos o lead se tivermos QUALQUER nome bom disponível,
+        // independente se o contato foi atualizado agora ou já estava certo.
+        if (!error && bestNameAvailable && !isGroup) {
+            
             const { data: lead } = await supabase
                 .from('leads')
                 .select('id, name')
@@ -114,9 +112,18 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
                 .maybeSingle();
 
             if (lead) {
-                // Só atualiza Lead se o nome atual dele for ruim ou se a fonte for confiável (Agenda)
-                if (isGenericName(lead.name, phone) || isFromBook) {
-                    await supabase.from('leads').update({ name: finalName }).eq('id', lead.id);
+                // LÓGICA DE OURO: Atualiza o Lead SE:
+                // 1. O Lead tem nome genérico/ruim (Prioridade Alta: Correção).
+                // 2. A fonte é da Agenda (Prioridade Alta: Sincronia).
+                // 3. O nome do Lead está diferente do Melhor Nome (Sincronia eventual).
+                
+                const leadHasBadName = isGenericName(lead.name, phone);
+                
+                if (leadHasBadName || isFromBook) {
+                    // Só faz o update se realmente for mudar algo para economizar write
+                    if (lead.name !== bestNameAvailable) {
+                        await supabase.from('leads').update({ name: bestNameAvailable }).eq('id', lead.id);
+                    }
                 }
             }
         }
