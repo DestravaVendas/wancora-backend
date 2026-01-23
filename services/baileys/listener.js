@@ -2,6 +2,7 @@
 import {
     upsertContact,
     upsertMessage,
+    upsertMessagesBatch, // NOVA FUNÇÃO
     ensureLeadExists,
     updateSyncStatus,
     normalizeJid
@@ -15,10 +16,8 @@ import { createClient } from '@supabase/supabase-js';
 import mime from 'mime-types';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-// Logger configurado para silenciar logs internos do Baileys e focar nos nossos
 const logger = pino({ level: 'silent' });
 
-// Cache simples para evitar processamento duplo de mensagens em milissegundos (debounce)
 const msgCache = new Set();
 const addToCache = (id) => {
     if (msgCache.has(id)) return false;
@@ -27,7 +26,6 @@ const addToCache = (id) => {
     return true;
 };
 
-// Utilitário para desenrolar mensagens complexas (ViewOnce, Editadas, etc)
 const unwrapMessage = (msg) => {
     if (!msg.message) return msg;
     let content = msg.message;
@@ -39,7 +37,6 @@ const unwrapMessage = (msg) => {
     return { ...msg, message: content };
 };
 
-// Upload de Mídia para Supabase Storage (Bucket: chat-media)
 const uploadMedia = async (buffer, type) => {
     try {
         const ext = mime.extension(type) || 'bin';
@@ -51,7 +48,6 @@ const uploadMedia = async (buffer, type) => {
     } catch { return null; }
 };
 
-// Extração segura do texto da mensagem
 const getBody = (msg) => {
     if (!msg) return '';
     if (msg.conversation) return msg.conversation;
@@ -61,15 +57,12 @@ const getBody = (msg) => {
     return ''; 
 };
 
-// Fetch seguro de Foto de Perfil com Jitter para evitar Rate Limit (429)
 const fetchProfilePicSafe = async (sock, jid) => {
     try {
         await new Promise(r => setTimeout(r, Math.random() * 200 + 100)); 
         const url = await sock.profilePictureUrl(jid, 'image'); 
         return url;
-    } catch (e) {
-        return null; 
-    }
+    } catch (e) { return null; }
 };
 
 const fetchGroupSubjectSafe = async (sock, jid) => {
@@ -77,18 +70,15 @@ const fetchGroupSubjectSafe = async (sock, jid) => {
         await new Promise(r => setTimeout(r, 300)); 
         const metadata = await sock.groupMetadata(jid);
         return metadata.subject;
-    } catch (e) {
-        return null;
-    }
+    } catch (e) { return null; }
 };
 
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
-    // --- EVENTO CRÍTICO: HISTÓRICO DE MENSAGENS ---
-    // Correção v4.2: Removemos o bloqueio de "isProcessing" para permitir chunks paralelos
+    // --- BATCH HISTORY SYNC ---
     sock.ev.on('messaging-history.set', async ({ contacts, messages, isLatest }) => {
         const itemCount = (contacts?.length || 0) + (messages?.length || 0);
-        console.log(`📚 [HISTÓRICO] Pacote recebido: ${itemCount} itens (Latest: ${isLatest}). Iniciando processamento seguro...`);
+        console.log(`📚 [HISTÓRICO] Pacote: ${itemCount} itens (Latest: ${isLatest}). Modo Turbo Ativado 🚀`);
 
         if (itemCount === 0) {
             if (isLatest) await updateSyncStatus(sessionId, 'completed', 100);
@@ -96,15 +86,12 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         }
 
         try {
-            // Mapa em memória para evitar queries repetitivas durante o processamento do lote
             const contactsMap = new Map();
 
-            // 1. Processamento de Contatos (Upsert em Batch Controlado)
+            // 1. Contatos (Otimizado com Batch Size 50)
             if (contacts && contacts.length > 0) {
-                console.log(`📇 [HISTÓRICO] Mapeando ${contacts.length} contatos...`);
                 await updateSyncStatus(sessionId, 'importing_contacts', 10);
                 
-                // Popula mapa
                 contacts.forEach(c => {
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
@@ -117,59 +104,51 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     });
                 });
 
-                // Executa upserts
                 const uniqueJids = Array.from(contactsMap.keys());
-                const BATCH_SIZE = 20; // Tamanho do lote para não afogar o banco
+                const CONTACT_BATCH = 50; 
                 
-                for (let i = 0; i < uniqueJids.length; i += BATCH_SIZE) {
-                    const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
-                    
+                for (let i = 0; i < uniqueJids.length; i += CONTACT_BATCH) {
+                    const batchJids = uniqueJids.slice(i, i + CONTACT_BATCH);
                     await Promise.all(batchJids.map(async (jid) => {
                         let data = contactsMap.get(jid);
-                        
-                        // Enriquece dados se for grupo ou sem foto
+                        // Logica de enriquecimento (Grupo/Foto) mantida
                         if (jid.includes('@g.us') && !data.name) {
                             const groupName = await fetchGroupSubjectSafe(sock, jid);
                             if (groupName) data.name = groupName;
                         }
                         if (!data.imgUrl) {
-                            const freshPic = await fetchProfilePicSafe(sock, jid);
-                            if (freshPic) data.imgUrl = freshPic;
+                            // Não bloqueia o loop esperando foto em histórico
+                            fetchProfilePicSafe(sock, jid).then(url => {
+                                if(url) upsertContact(jid, companyId, null, url, false);
+                            });
                         }
                         await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                     }));
-
-                    // Libera Event Loop por 10ms para o Node respirar
-                    await new Promise(r => setTimeout(r, 10));
                     
-                    // Log de Progresso (Visível no Render)
-                    if (i % 100 === 0) console.log(`📇 [SYNC CONTATOS] Processados ${Math.min(i + BATCH_SIZE, uniqueJids.length)}/${uniqueJids.length}`);
+                    if (i % 200 === 0) console.log(`📇 [SYNC CONTATOS] ${Math.min(i + CONTACT_BATCH, uniqueJids.length)}/${uniqueJids.length}`);
                 }
             }
 
-            // 2. Scan de Mensagens (Name Hunter - Tenta achar nomes nos metadados das mensagens)
+            // 2. Name Hunter Light (Scan rápido)
             if (messages && messages.length > 0) {
                 messages.forEach(msg => {
                     if (msg.key.fromMe) return;
                     const jid = normalizeJid(msg.key.remoteJid);
                     if (!jid) return;
                     const existing = contactsMap.get(jid);
-                    // Se não temos nome ainda, mas a mensagem tem pushName, usamos ele
-                    if (!existing || !existing.name) {
-                        if (msg.pushName) {
-                            if (existing) existing.name = msg.pushName; 
-                            else contactsMap.set(jid, { name: msg.pushName, imgUrl: null, isFromBook: false, lid: null });
-                        }
+                    if ((!existing || !existing.name) && msg.pushName) {
+                        if (existing) existing.name = msg.pushName; 
+                        else contactsMap.set(jid, { name: msg.pushName, imgUrl: null, isFromBook: false, lid: null });
                     }
                 });
             }
 
-            // 3. Processamento de Mensagens (O mais pesado)
+            // 3. MENSAGENS EM LOTE (CORE FIX)
             if (messages && messages.length > 0) {
-                console.log(`💬 [HISTÓRICO] Processando ${messages.length} mensagens...`);
+                console.log(`💬 [HISTÓRICO] Preparando Batch de ${messages.length} mensagens...`);
                 await updateSyncStatus(sessionId, 'importing_messages', 30);
                 
-                // Agrupa por Chat para manter ordem cronológica e consistência de contexto
+                // Agrupa por Chat
                 const messagesByChat = new Map();
                 messages.forEach(msg => {
                     const unwrapped = unwrapMessage(msg);
@@ -180,84 +159,103 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     messagesByChat.get(jid).push(unwrapped);
                 });
 
-                // Ordena chats por atividade recente (Mais recentes primeiro)
-                const sortedChats = Array.from(messagesByChat.entries()).sort(([, msgsA], [, msgsB]) => {
-                    const tA = Math.max(...msgsA.map(m => m.messageTimestamp || 0));
-                    const tB = Math.max(...msgsB.map(m => m.messageTimestamp || 0));
-                    return tB - tA; 
-                });
-
-                // Limita a 300 chats mais recentes para não estourar memória na importação inicial
-                const topChats = sortedChats.slice(0, 300); 
+                const sortedChats = Array.from(messagesByChat.entries()); // Sem sort pesado para economizar CPU
+                const myJid = normalizeJid(sock.user?.id); 
                 
-                let processedCount = 0;
-                for (let i = 0; i < topChats.length; i++) {
-                    const [chatJid, chatMsgs] = topChats[i];
-                    // Ordena mensagens dentro do chat (Antigas -> Novas)
-                    chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+                let messageBatchBuffer = [];
+                let totalProcessed = 0;
+
+                for (let i = 0; i < sortedChats.length; i++) {
+                    const [chatJid, chatMsgs] = sortedChats[i];
                     
-                    // Salva apenas as últimas 50 mensagens de cada chat (Performance Trade-off)
+                    // IMPORTANTE: Garantimos o Lead UMA VEZ por chat, não por mensagem
+                    let leadId = null;
+                    if (!chatJid.includes('@g.us')) {
+                        const mapData = contactsMap.get(chatJid);
+                        // Tenta pegar o melhor nome disponível no mapa
+                        const bestName = mapData?.name || chatMsgs.find(m => !m.key.fromMe && m.pushName)?.pushName;
+                        leadId = await ensureLeadExists(chatJid, companyId, bestName, myJid);
+                    }
+
+                    // Prepara objetos para insert (sem IO de banco individual)
+                    // Pega as últimas 50 mensagens por chat para não floodar
+                    chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                     const msgsToSave = chatMsgs.slice(-50); 
 
                     for (const msg of msgsToSave) {
-                        const mapData = contactsMap.get(chatJid);
-                        const forcedName = msg.pushName || (mapData ? mapData.name : null);
-                        // Mensagens históricas não baixam mídia (isRealtime = false)
-                        await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName);
+                        const body = getBody(msg.message);
+                        const type = getContentType(msg.message) || Object.keys(msg.message)[0];
+                        const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
+                        
+                        if (!body && !isMedia) continue;
+
+                        messageBatchBuffer.push({
+                            company_id: companyId,
+                            session_id: sessionId,
+                            remote_jid: chatJid,
+                            whatsapp_id: msg.key.id,
+                            from_me: msg.key.fromMe,
+                            content: body || (isMedia ? '[Mídia Histórica]' : ''),
+                            media_url: null, // Histórico não baixa mídia para performance
+                            message_type: type?.replace('Message', '') || 'text',
+                            status: msg.key.fromMe ? 'sent' : 'received',
+                            lead_id: leadId,
+                            created_at: new Date((msg.messageTimestamp || Date.now() / 1000) * 1000)
+                        });
                     }
-                    processedCount += msgsToSave.length;
 
-                    // Unblock Event Loop
-                    await new Promise(r => setTimeout(r, 5));
+                    totalProcessed += msgsToSave.length;
 
-                    // Atualiza status a cada 10 chats
-                    if (i % 10 === 0 || i === topChats.length - 1) {
-                        const progress = 30 + Math.floor((i / topChats.length) * 65); // 30% a 95%
+                    // Flush do Buffer a cada 200 mensagens ou 20 chats
+                    if (messageBatchBuffer.length >= 200 || i % 20 === 0) {
+                        await upsertMessagesBatch(messageBatchBuffer);
+                        messageBatchBuffer = []; // Limpa buffer
+                        
+                        // Atualiza progresso visual
+                        const progress = 30 + Math.floor((i / sortedChats.length) * 65);
                         await updateSyncStatus(sessionId, 'importing_messages', progress);
-                        console.log(`💬 [SYNC MSGS] Chat ${i}/${topChats.length} (${processedCount} msgs salvas)`);
                     }
                 }
+
+                // Flush final
+                if (messageBatchBuffer.length > 0) {
+                    await upsertMessagesBatch(messageBatchBuffer);
+                }
+                
+                console.log(`✅ [SYNC BATCH] Finalizado. Total: ${totalProcessed} msgs.`);
             }
 
         } catch (e) {
-            console.error("❌ [CRITICAL SYNC ERROR]", e);
+            console.error("❌ [SYNC ERROR]", e);
         } finally {
-            // LÓGICA DE OURO: Só libera o frontend se for o ÚLTIMO pacote (isLatest = true)
-            // Isso previne que a barra feche prematuramente enquanto o Baileys ainda está mandando dados.
             if (isLatest) {
-                console.log(`✅ [SYNC] Pacote Final processado. Liberando UI (100%).`);
+                console.log(`✅ [SYNC] 100% Completo. UI Liberada.`);
                 await updateSyncStatus(sessionId, 'completed', 100);
             } else {
-                console.log(`⏳ [SYNC] Pacote intermediário processado. Aguardando mais dados...`);
-                // Mantém em 99% visualmente para indicar "Quase lá"
                 await updateSyncStatus(sessionId, 'importing_messages', 99);
             }
         }
     });
 
-    // --- MENSAGENS EM TEMPO REAL (MENSAGEM NOVA) ---
+    // --- REALTIME (MANTIDO ESTRUTURA ORIGINAL SEGURA) ---
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         for (const msg of messages) {
             if (!msg.message) continue;
-            // Evita processar a mesma mensagem duas vezes
             if (!addToCache(msg.key.id)) continue;
 
             const clean = unwrapMessage(msg);
             const jid = normalizeJid(clean.key.remoteJid);
             
-            // Em tempo real, tentamos buscar a foto e nome imediatamente para atualizar o CRM
             if (jid && !clean.key.fromMe) { 
                  fetchProfilePicSafe(sock, jid).then(url => {
                      if(url) upsertContact(jid, companyId, clean.pushName, url, false);
                  });
             }
-            
-            // isRealtime = true (Baixa mídia, dispara gatilhos de automação)
+            // Realtime continua processando um por um para baixar mídia e gatilhos
             await processSingleMessage(clean, sock, companyId, sessionId, true, clean.pushName);
         }
     });
     
-    // --- ATUALIZAÇÃO DE CONTATOS (MUDANÇA DE FOTO/NOME) ---
     sock.ev.on('contacts.upsert', async (contacts) => {
         for (const c of contacts) {
             const jid = normalizeJid(c.id);
@@ -279,6 +277,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 };
 
+// Mantido para Realtime
 const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime, forcedName = null) => {
     try {
         if (!msg.message) return;
@@ -289,26 +288,20 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
-        // Ignora mensagens vazias e sem mídia
         if (!body && !isMedia) return;
 
         const fromMe = msg.key.fromMe;
         const myJid = normalizeJid(sock.user?.id); 
 
-        // 1. GARANTE ESTRUTURA (LEAD/CONTATO)
-        // Se a mensagem chegou, garantimos que o Lead exista no banco
         let leadId = null;
         if (jid && !jid.includes('@g.us')) {
-            // ensureLeadExists cuida da criação e do "Anti-Ghost" (is_ignored)
             leadId = await ensureLeadExists(jid, companyId, forcedName, myJid);
             
-            // Se for realtime e tivermos um nome novo, forçamos atualização do contato
             if (isRealtime && forcedName && jid !== myJid) {
                 await upsertContact(jid, companyId, forcedName, null, false);
             }
         }
         
-        // Suporte para Grupos: Atualiza quem mandou a mensagem dentro do grupo
         if (jid.includes('@g.us') && msg.key.participant && forcedName) {
              const partJid = normalizeJid(msg.key.participant);
              if (partJid !== myJid) {
@@ -316,7 +309,6 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
              }
         }
 
-        // 2. DOWNLOAD E UPLOAD DE MÍDIA (APENAS REALTIME)
         let mediaUrl = null;
         if (isMedia && isRealtime) {
             try {
@@ -328,14 +320,12 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
                 else if (msg.message?.documentMessage) mimeType = msg.message.documentMessage.mimetype;
                 else if (msg.message?.stickerMessage) mimeType = 'image/webp';
 
-                // Salva no Supabase Storage e pega URL pública
                 mediaUrl = await uploadMedia(buffer, mimeType);
             } catch (e) {
                 console.error("Erro download media:", e);
             }
         }
 
-        // 3. PERSISTÊNCIA DA MENSAGEM
         await upsertMessage({
             company_id: companyId,
             session_id: sessionId,
