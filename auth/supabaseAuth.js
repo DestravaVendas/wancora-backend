@@ -10,6 +10,13 @@ export const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPAB
     auth: { persistSession: false }
 });
 
+// 🛡️ CORREÇÃO CRÍTICA (FIX BUFFER)
+// Transforma objetos { type: 'Buffer', data: [...] } de volta em Buffers reais.
+// Isso impede que o Baileys rejeite a sessão ao reiniciar.
+const fixBuffer = (data) => {
+    return JSON.parse(JSON.stringify(data), BufferJSON.reviver);
+};
+
 export const useSupabaseAuthState = async (sessionId) => {
     
     // 1. Carrega credenciais iniciais
@@ -23,7 +30,8 @@ export const useSupabaseAuthState = async (sessionId) => {
                 .eq('key_id', 'creds')
                 .maybeSingle();
             
-            return data?.payload ? JSON.parse(data.payload, BufferJSON.reviver) : null;
+            // APLICA O FIXBUFFER AQUI
+            return data?.payload ? fixBuffer(JSON.parse(data.payload)) : null;
         } catch (e) {
             console.error('[AUTH] Erro ao buscar credenciais:', e);
             return null;
@@ -47,7 +55,8 @@ export const useSupabaseAuthState = async (sessionId) => {
 
                         const result = {};
                         data?.forEach(row => {
-                            result[row.key_id] = JSON.parse(row.payload, BufferJSON.reviver);
+                            // APLICA O FIXBUFFER AQUI TAMBÉM
+                            result[row.key_id] = fixBuffer(JSON.parse(row.payload));
                         });
                         return result;
                     } catch (e) {
@@ -69,6 +78,7 @@ export const useSupabaseAuthState = async (sessionId) => {
                                     session_id: sessionId,
                                     data_type: type,
                                     key_id: id,
+                                    // BufferJSON.replacer garante que salva corretamente
                                     payload: JSON.stringify(value, BufferJSON.replacer),
                                     updated_at: new Date()
                                 });
