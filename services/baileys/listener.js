@@ -27,7 +27,6 @@ const addToCache = (id) => {
 
 let isProcessingHistory = false;
 
-// --- HELPERS ---
 const unwrapMessage = (msg) => {
     if (!msg.message) return msg;
     let content = msg.message;
@@ -59,14 +58,16 @@ const getBody = (msg) => {
     return ''; 
 };
 
-// Fetch Inteligente: Tenta obter URL. Se falhar ou vier vazia, não crasha.
+// Safe Profile Pic Fetcher
 const fetchProfilePicSafe = async (sock, jid) => {
     try {
-        // Random delay para não tomar 429 Too Many Requests
-        await new Promise(r => setTimeout(r, Math.random() * 800));
-        return await sock.profilePictureUrl(jid, 'image'); 
+        // Tenta obter foto. Funciona para grupos e usuarios.
+        // Adiciona um delay aleatório minúsculo para evitar rate-limit
+        await new Promise(r => setTimeout(r, Math.random() * 200));
+        const url = await sock.profilePictureUrl(jid, 'image'); 
+        return url;
     } catch (e) {
-        return null; 
+        return null; // 404 ou 401 normal se não tiver foto
     }
 };
 
@@ -79,47 +80,43 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
         try {
             console.log(`📚 [HISTÓRICO] Iniciando Sync... Sessão: ${sessionId}`);
+            // Feedback inicial imediato
             await updateSyncStatus(sessionId, 'importing_contacts', 5);
 
             const contactsMap = new Map();
 
-            // 1. Processa Contatos (Lote com Extração de LID)
+            // 1. Mapeia Contatos da Agenda (Sem salvar ainda)
             if (contacts && contacts.length > 0) {
                 console.log(`📇 [AGENDA] Processando ${contacts.length} contatos...`);
                 
                 await Promise.all(contacts.map(async (c) => {
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
-                    
                     const bestName = c.name || c.verifiedName || c.notify;
-                    // Extrai LID se disponível (Baileys as vezes manda no objeto contact)
-                    const lid = c.lid || null; 
-                    
                     contactsMap.set(jid, { 
                         name: bestName, 
                         imgUrl: c.imgUrl, 
                         isFromBook: !!bestName,
-                        lid: lid 
+                        lid: c.lid || null // Captura LID se disponível
                     });
                 }));
             }
 
-            // 2. Scan PushNames
+            // 2. Scan de Mensagens para enriquecer nomes (PushName)
             if (messages && messages.length > 0) {
                 messages.forEach(msg => {
                     if (msg.key.fromMe) return;
                     const jid = normalizeJid(msg.key.remoteJid);
                     if (!jid) return;
-
                     if (!contactsMap.has(jid)) {
                         contactsMap.set(jid, { name: msg.pushName, imgUrl: null, isFromBook: false, lid: null });
                     }
                 });
             }
 
-            // 3. Salva Contatos (Lote Controlado com Progresso Real)
+            // 3. Salva Contatos e Busca Fotos (Lote Controlado com UNBLOCK)
             const uniqueJids = Array.from(contactsMap.keys());
-            const BATCH_SIZE = 10; // Reduzido para garantir fetch de fotos
+            const BATCH_SIZE = 10; 
             let processedContacts = 0;
             
             for (let i = 0; i < uniqueJids.length; i += BATCH_SIZE) {
@@ -128,29 +125,34 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 await Promise.all(batchJids.map(async (jid) => {
                     let data = contactsMap.get(jid);
                     
-                    // DEEP FETCH: Busca foto se não tiver
-                    if (!data.imgUrl && !jid.includes('@g.us')) {
+                    // FETCH FOTO: Agora permitido para grupos também!
+                    if (!data.imgUrl) {
                         const freshPic = await fetchProfilePicSafe(sock, jid);
                         if (freshPic) data.imgUrl = freshPic;
                     }
 
-                    // Passa o LID para mapeamento no sync.js
                     await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                 }));
 
                 processedContacts += batchJids.length;
                 
-                // ATUALIZAÇÃO PROGRESSIVA (Evita "travamento" da barra)
-                const percent = 5 + Math.floor((processedContacts / uniqueJids.length) * 25); // Vai de 5% a 30%
-                if (percent % 5 === 0) {
+                // --- PONTO CRÍTICO: UNBLOCK EVENT LOOP ---
+                // Isso permite que o Node processe outras tarefas (como o HTTP request do updateSyncStatus ou WebSockets)
+                // impedindo o travamento da UI durante loops pesados.
+                await new Promise(r => setTimeout(r, 0)); 
+                
+                const percent = 5 + Math.floor((processedContacts / uniqueJids.length) * 25);
+                // Atualiza status no banco a cada 10% para não spamar
+                if (processedContacts % 50 === 0) {
                     await updateSyncStatus(sessionId, 'importing_contacts', percent);
                 }
             }
 
-            // 4. Processa Mensagens (Lote Controlado)
+            // 4. Processa Mensagens
             if (messages && messages.length > 0) {
                 await updateSyncStatus(sessionId, 'importing_messages', 30);
                 
+                // Organiza mensagens por chat para processar as mais recentes
                 const messagesByChat = new Map();
                 messages.forEach(msg => {
                     const unwrapped = unwrapMessage(msg);
@@ -161,30 +163,32 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     messagesByChat.get(jid).push(unwrapped);
                 });
 
+                // Prioriza chats com atividade recente
                 const sortedChats = Array.from(messagesByChat.entries()).sort(([, msgsA], [, msgsB]) => {
                     const tA = Math.max(...msgsA.map(m => m.messageTimestamp || 0));
                     const tB = Math.max(...msgsB.map(m => m.messageTimestamp || 0));
                     return tB - tA; 
                 });
 
-                const topChats = sortedChats.slice(0, 200); 
-                let processedMsgs = 0;
-                const totalMsgs = topChats.reduce((acc, [, msgs]) => acc + msgs.length, 0);
+                const topChats = sortedChats.slice(0, 150); // Limite de chats iniciais
                 
                 for (let i = 0; i < topChats.length; i++) {
                     const [chatJid, chatMsgs] = topChats[i];
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-                    const msgsToSave = chatMsgs.slice(-25); // Top 25
+                    const msgsToSave = chatMsgs.slice(-30); // Aumentado limite por chat
 
                     for (const msg of msgsToSave) {
                         const mapData = contactsMap.get(chatJid);
                         const forcedName = msg.pushName || (mapData ? mapData.name : null);
+                        
+                        // Passamos o ID do bot para evitar auto-criação de lead
                         await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName);
-                        processedMsgs++;
                     }
 
-                    // ATUALIZAÇÃO PROGRESSIVA DE MENSAGENS
-                    const percent = 30 + Math.floor((i / topChats.length) * 70); // Vai de 30% a 100%
+                    // Unblock Event Loop
+                    await new Promise(r => setTimeout(r, 0));
+
+                    const percent = 30 + Math.floor((i / topChats.length) * 70);
                     if (i % 5 === 0) {
                         await updateSyncStatus(sessionId, 'importing_messages', percent);
                     }
@@ -209,10 +213,11 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const clean = unwrapMessage(msg);
             const jid = normalizeJid(clean.key.remoteJid);
             
-            // BUSCA FOTO REATIVA (Ao receber mensagem de desconhecido)
-            if (jid && !clean.key.fromMe && !clean.key.participant && jid.includes('@s.whatsapp.net')) { 
+            // BUSCA FOTO REATIVA
+            // Se receber msg e não tiver foto ou for grupo, tenta buscar
+            if (jid && !clean.key.fromMe) { 
                  fetchProfilePicSafe(sock, jid).then(url => {
-                     // Atualiza contato silenciosamente com a nova foto
+                     // Atualiza silenciosamente se achar foto nova
                      if(url) upsertContact(jid, companyId, clean.pushName, url, false);
                  });
             }
@@ -227,7 +232,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const jid = normalizeJid(c.id);
             if (!jid) continue;
             const bestName = c.name || c.verifiedName || c.notify;
-            // Passa LID se existir no update
             await upsertContact(jid, companyId, bestName, c.imgUrl || null, !!c.name, c.lid);
         }
     });
@@ -255,23 +259,29 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         if (!body && !isMedia) return;
 
         const fromMe = msg.key.fromMe;
+        
+        // --- IDENTIFICAÇÃO DO BOT (CRÍTICO) ---
+        // Pega o ID normalizado do bot conectado para evitar criar Lead de si mesmo
+        const myJid = normalizeJid(sock.user?.id); 
 
-        // 1. GARANTE ESTRUTURA (Lead & Contato & LID Map)
+        // 1. GARANTE ESTRUTURA (Com Proteção Self-Lead)
         let leadId = null;
         if (jid && !jid.includes('@g.us')) {
-            // Se for realtime, garantimos que o contato existe e tentamos mapear LID
-            // msg.key.id as vezes contém pistas, mas o melhor é deixar o upsertContact lidar com isso
-            leadId = await ensureLeadExists(jid, companyId, forcedName);
+            // Passa o ID do bot. Se jid == myJid, ensureLeadExists retorna null.
+            leadId = await ensureLeadExists(jid, companyId, forcedName, myJid);
             
-            if (isRealtime && forcedName) {
-                // Atualiza pushname
+            // Só atualiza contato se for realtime e não for eu mesmo
+            if (isRealtime && forcedName && jid !== myJid) {
                 await upsertContact(jid, companyId, forcedName, null, false);
             }
         }
         
+        // Em grupos, garante o participante
         if (jid.includes('@g.us') && msg.key.participant && forcedName) {
              const partJid = normalizeJid(msg.key.participant);
-             await upsertContact(partJid, companyId, forcedName, null, false);
+             if (partJid !== myJid) {
+                 await upsertContact(partJid, companyId, forcedName, null, false);
+             }
         }
 
         // 2. MÍDIA
