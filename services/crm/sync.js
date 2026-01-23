@@ -5,56 +5,47 @@ import pino from "pino";
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'error' });
 
-// Mutex para evitar criação duplicada de Leads em rajadas
 const leadLock = new Set(); 
 
-// --- HELPER: NAME VALIDATION ---
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
     if (cleanName.length < 1) return true;
     const lower = cleanName.toLowerCase();
     if (lower === 'null' || lower === 'undefined' || lower === 'unknown') return true;
-    
-    // Se o nome for igual ao telefone (anti-spam)
     if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true;
-
-    // Deve conter letras reais
     return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName); 
 };
 
-// --- HELPER: JID NORMALIZATION ---
 export const normalizeJid = (jid) => {
     if (!jid) return null;
     if (jid.includes('@g.us')) return jid.split('@')[0] + '@g.us';
-    if (jid.includes('@lid')) return jid; // Mantém LID intacto para resolução
+    if (jid.includes('@lid')) return jid; 
     return jid.split('@')[0].split(':')[0] + '@s.whatsapp.net';
 };
 
 export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     try {
-        await supabase.from('instances')
+        // Envia sem await para não bloquear o loop (Fire & Forget)
+        supabase.from('instances')
             .update({ sync_status: status, sync_percent: percent, updated_at: new Date() })
-            .eq('session_id', sessionId);
+            .eq('session_id', sessionId)
+            .then(() => {}); 
     } catch (e) {}
 };
 
-// --- IDENTITY RESOLVER (A CURA DA DUPLICIDADE) ---
-// Tenta encontrar o telefone real dado um JID (que pode ser um LID)
+// --- IDENTITY RESOLVER 2.0 ---
+// Busca o telefone real (JID legado) dado um LID ou JID
 const resolveRealPhone = async (jid, companyId) => {
-    // 1. Se já é um telefone padrão BR (DDI 55), retorna limpo
-    if (jid.includes('@s.whatsapp.net') && jid.startsWith('55')) {
+    if (!jid) return null;
+    
+    // 1. Se já é telefone padrão, retorna limpo
+    if (jid.includes('@s.whatsapp.net') && !jid.includes('@lid')) {
         return jid.split('@')[0];
     }
 
-    // 2. Se é um LID ou número estranho, busca no mapa de identidades
-    if (jid.includes('@lid') || !jid.startsWith('55')) {
-        // Tenta buscar na tabela contacts se esse JID tem um vinculo
-        // Nota: A tabela identity_map seria ideal, mas vamos usar contacts.phone se disponível ou fallback
-        // Lógica: Busca um contato onde jid == o LID atual
-        // Mas o ideal é que tenhamos salvo o link antes.
-        
-        // Tentativa de buscar mapeamento reverso no banco
+    // 2. Se for LID, busca no identity_map
+    if (jid.includes('@lid')) {
         const { data } = await supabase.from('identity_map')
             .select('phone_jid')
             .eq('lid_jid', jid)
@@ -66,11 +57,11 @@ const resolveRealPhone = async (jid, companyId) => {
         }
     }
 
-    // Fallback: Retorna o próprio número limpo
+    // Fallback: Se não achou mapeamento, retorna o próprio ID mas limpo
+    // Isso evita crash, mas o ideal é ter o mapeamento.
     return jid.split('@')[0];
 };
 
-// --- SYNC CONTACTS ---
 export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false, lidJid = null) => {
     try {
         if (!jid || !companyId) return;
@@ -79,30 +70,41 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         const cleanJid = normalizeJid(jid);
         const isGroup = cleanJid.includes('@g.us');
         
-        // LÓGICA LID: Se recebermos um LID junto com o telefone, salvamos o mapeamento
+        // --- 1. SALVAR MAPEAMENTO DE IDENTIDADE ---
+        // Se recebemos um par LID + Phone, salvamos imediatamente
         if (lidJid && !isGroup) {
             await supabase.from('identity_map').upsert({
                 lid_jid: normalizeJid(lidJid),
-                phone_jid: cleanJid,
+                phone_jid: cleanJid, // Assume que cleanJid aqui é o phone (vinda do listener)
                 company_id: companyId
             }, { onConflict: 'lid_jid' });
         }
 
-        const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
+        // --- 2. DEFINIR COLUNA PHONE CORRETA ---
+        let phoneColumnValue = cleanJid.split('@')[0].replace(/\D/g, '');
         
+        // Se o JID principal for LID, precisamos achar o telefone real para a coluna 'phone'
+        // senão a coluna fica com "123123123..." (ID interno do whatsapp)
+        if (cleanJid.includes('@lid')) {
+            const realPhone = await resolveRealPhone(cleanJid, companyId);
+            if (realPhone && !realPhone.includes('@lid')) {
+                phoneColumnValue = realPhone.replace(/\D/g, '');
+            }
+        }
+
         const updateData = {
             jid: cleanJid,
-            phone: purePhone, 
+            phone: phoneColumnValue, // Agora contém o número real legível
             company_id: companyId,
             updated_at: new Date()
         };
 
-        const nameIsValid = !isGenericName(incomingName, purePhone);
+        const nameIsValid = !isGenericName(incomingName, phoneColumnValue);
 
         if (nameIsValid) {
             updateData.push_name = incomingName;
             if (isFromBook) {
-                updateData.name = incomingName; // Autoridade Máxima
+                updateData.name = incomingName;
             }
         }
 
@@ -111,25 +113,30 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         // Upsert Contato
         const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
 
-        // LEAD SELF-HEALING
+        // --- 3. LEAD SELF-HEALING ---
         if (!error && !isGroup) {
-            // Resolve telefone real (caso tenhamos passado um LID por engano, embora upsertContact deva receber Phone JID preferencialmente)
-            const realPhone = await resolveRealPhone(cleanJid, companyId);
-            
-            const { data: lead } = await supabase.from('leads')
-                .select('id, name')
-                .eq('company_id', companyId)
-                .eq('phone', realPhone)
-                .limit(1)
-                .maybeSingle();
+            // Resolvemos novamente para garantir consistência ao buscar o Lead
+            const realPhoneJid = await resolveRealPhone(cleanJid, companyId);
+            const realPhoneNum = realPhoneJid ? realPhoneJid.replace(/\D/g, '') : phoneColumnValue;
 
-            if (lead) {
-                const currentNameIsBad = !lead.name || isGenericName(lead.name, realPhone);
-                if (nameIsValid && (currentNameIsBad || isFromBook)) {
-                    await supabase.from('leads').update({ name: incomingName }).eq('id', lead.id);
+            // Só processa lead se tivermos um número de telefone válido (não LID)
+            if (realPhoneNum.length < 15) { // LIDs costumam ser maiores, telefones < 15
+                const { data: lead } = await supabase.from('leads')
+                    .select('id, name')
+                    .eq('company_id', companyId)
+                    .eq('phone', realPhoneNum)
+                    .limit(1)
+                    .maybeSingle();
+
+                if (lead) {
+                    const currentNameIsBad = !lead.name || isGenericName(lead.name, realPhoneNum);
+                    if (nameIsValid && (currentNameIsBad || isFromBook)) {
+                        await supabase.from('leads').update({ name: incomingName }).eq('id', lead.id);
+                    }
+                } else if (isFromBook && nameIsValid) {
+                    // Se veio da agenda, cria o lead imediatamente
+                    await ensureLeadExists(cleanJid, companyId, incomingName);
                 }
-            } else if (isFromBook && nameIsValid) {
-                await ensureLeadExists(cleanJid, companyId, incomingName);
             }
         }
     } catch (e) {
@@ -137,18 +144,29 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
     }
 };
 
-// --- ENSURE LEAD ---
-export const ensureLeadExists = async (jid, companyId, pushName) => {
+export const ensureLeadExists = async (jid, companyId, pushName, myBotJid = null) => {
     if (!jid || jid.endsWith('@g.us') || jid.includes('status@broadcast')) return null; 
 
-    // RESOLUÇÃO DE IDENTIDADE CRÍTICA
-    // Se jid for LID, isso retorna o telefone real. Se for telefone, retorna ele mesmo.
-    const realPhone = await resolveRealPhone(normalizeJid(jid), companyId);
+    const cleanJid = normalizeJid(jid);
     
-    // Se ainda parecer um LID (começa com 2, longo, não é BR), e não conseguimos resolver
-    // ABORTA a criação para não criar lead duplicado/lixo.
-    if (realPhone.length > 13 && !realPhone.startsWith('55')) {
-        // console.warn(`[SYNC] Ignorando criação de lead para ID não resolvido: ${realPhone}`);
+    // --- PROTEÇÃO ANTI SELF-LEAD (CRÍTICO) ---
+    // Se o remetente for eu mesmo (Bot), não cria Lead.
+    if (myBotJid) {
+        const cleanBot = normalizeJid(myBotJid);
+        // Compara JIDs diretos
+        if (cleanJid === cleanBot) return null;
+        
+        // Compara telefones (caso um seja LID e outro Phone)
+        const phoneA = await resolveRealPhone(cleanJid, companyId);
+        const phoneB = await resolveRealPhone(cleanBot, companyId);
+        if (phoneA && phoneB && phoneA === phoneB) return null;
+    }
+
+    const realPhone = await resolveRealPhone(cleanJid, companyId);
+    
+    // Se ainda for LID ou inválido, aborta.
+    // Telefones BR começam com 55 e tem < 14 digitos. LIDs tem > 15.
+    if (!realPhone || (realPhone.length > 14 && !realPhone.startsWith('55'))) {
         return null;
     }
 
@@ -173,15 +191,12 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
             return existing.id;
         }
 
-        // CRIAÇÃO DE NOVO LEAD
-        // Regra: Nome NULL se for inválido
+        // Backup: Busca nome na tabela contacts se o pushName for ruim
         let finalName = nameIsValid ? pushName : null;
-        
         if (!finalName) {
-            // Backup na tabela contacts usando o phone JID
             const { data: contact } = await supabase.from('contacts')
                 .select('name, push_name')
-                .eq('phone', realPhone) // Busca pelo phone column
+                .eq('phone', realPhone)
                 .eq('company_id', companyId)
                 .limit(1)
                 .maybeSingle();
@@ -192,7 +207,6 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
             }
         }
 
-        // Pega Funil Default
         const { data: stage } = await supabase.from('pipeline_stages')
             .select('id')
             .eq('company_id', companyId)
@@ -218,13 +232,10 @@ export const ensureLeadExists = async (jid, companyId, pushName) => {
 
 export const upsertMessage = async (msgData) => {
     try {
-        // Delay para garantir que Identity Map e Lead já existam
-        await new Promise(resolve => setTimeout(resolve, 300));
+        // Delay tático reduzido
+        await new Promise(resolve => setTimeout(resolve, 50)); 
         
         const cleanRemoteJid = normalizeJid(msgData.remote_jid);
-        
-        // Se a mensagem vier de um LID, tentamos salvar também o mapeamento se possível,
-        // mas aqui focamos em salvar a mensagem
         
         const finalData = {
             ...msgData,
@@ -236,7 +247,6 @@ export const upsertMessage = async (msgData) => {
     } catch (e) {}
 };
 
-// Funções utilitárias
 export const savePollVote = async (msg, companyId) => {};
 export const deleteSessionData = async (sessionId) => {
     await supabase.from('instances').update({ status: 'disconnected' }).eq('session_id', sessionId);
