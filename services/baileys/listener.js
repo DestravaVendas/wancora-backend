@@ -1,4 +1,3 @@
-
 import {
     upsertContact,
     upsertMessage,
@@ -84,14 +83,18 @@ const fetchGroupSubjectSafe = async (sock, jid) => {
 
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
+    // Contador de Lotes para Fast Sync (Limita a 2 pacotes)
+    let historyChunkCounter = 0;
+
     // --- EVENTO CRÍTICO: HISTÓRICO DE MENSAGENS ---
-    // Correção v4.2: Removemos o bloqueio de "isProcessing" para permitir chunks paralelos
     sock.ev.on('messaging-history.set', async ({ contacts, messages, isLatest }) => {
+        historyChunkCounter++;
         const itemCount = (contacts?.length || 0) + (messages?.length || 0);
-        console.log(`📚 [HISTÓRICO] Pacote recebido: ${itemCount} itens (Latest: ${isLatest}). Iniciando processamento seguro...`);
+        console.log(`📚 [HISTÓRICO] Pacote ${historyChunkCounter} recebido: ${itemCount} itens. Processando Fast Sync...`);
 
         if (itemCount === 0) {
-            if (isLatest) await updateSyncStatus(sessionId, 'completed', 100);
+            // Se vier vazio OU se já passamos de 2 lotes, libera o frontend
+            if (isLatest || historyChunkCounter >= 2) await updateSyncStatus(sessionId, 'completed', 100);
             return;
         }
 
@@ -196,8 +199,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     // Ordena mensagens dentro do chat (Antigas -> Novas)
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                     
-                    // Salva apenas as últimas 50 mensagens de cada chat (Performance Trade-off)
-                    const msgsToSave = chatMsgs.slice(-50); 
+                    // FAST BOOT: Reduzido de 50 para 10 mensagens por chat
+                    const msgsToSave = chatMsgs.slice(-10); 
 
                     for (const msg of msgsToSave) {
                         const mapData = contactsMap.get(chatJid);
@@ -222,14 +225,13 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         } catch (e) {
             console.error("❌ [CRITICAL SYNC ERROR]", e);
         } finally {
-            // LÓGICA DE OURO: Só libera o frontend se for o ÚLTIMO pacote (isLatest = true)
-            // Isso previne que a barra feche prematuramente enquanto o Baileys ainda está mandando dados.
-            if (isLatest) {
-                console.log(`✅ [SYNC] Pacote Final processado. Liberando UI (100%).`);
+            // LÓGICA DE FAST BOOT: Se for o último pacote OU se já processamos 2 pacotes, força 100%.
+            if (isLatest || historyChunkCounter >= 2) {
+                console.log(`✅ [SYNC] Fast Boot completo (Chunk ${historyChunkCounter}). Liberando UI (100%).`);
                 await updateSyncStatus(sessionId, 'completed', 100);
             } else {
-                console.log(`⏳ [SYNC] Pacote intermediário processado. Aguardando mais dados...`);
-                // Mantém em 99% visualmente para indicar "Quase lá"
+                console.log(`⏳ [SYNC] Chunk ${historyChunkCounter} processado. Aguardando próximo...`);
+                // Mantém em 99% visualmente
                 await updateSyncStatus(sessionId, 'importing_messages', 99);
             }
         }
@@ -286,9 +288,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         if (jid === 'status@broadcast') return;
 
         const body = getBody(msg.message);
-        // FIX: Verificação de segurança para evitar TypeError: Cannot convert undefined or null to object
-        const type = getContentType(msg.message) || (msg.message ? Object.keys(msg.message)[0] : 'unknown');
-        
+        const type = getContentType(msg.message) || Object.keys(msg.message)[0];
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
         // Ignora mensagens vazias e sem mídia
