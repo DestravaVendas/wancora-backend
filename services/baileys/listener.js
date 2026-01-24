@@ -16,10 +16,8 @@ import { createClient } from '@supabase/supabase-js';
 import mime from 'mime-types';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-// Logger configurado para silenciar logs internos do Baileys e focar nos nossos
 const logger = pino({ level: 'silent' });
 
-// Cache simples para evitar processamento duplo de mensagens em milissegundos (debounce)
 const msgCache = new Set();
 const addToCache = (id) => {
     if (msgCache.has(id)) return false;
@@ -28,18 +26,16 @@ const addToCache = (id) => {
     return true;
 };
 
-// Utilitário para desenrolar mensagens complexas (ViewOnce, Ephemeral, Edited)
+// Utilitário para desenrolar mensagens complexas
 const unwrapMessage = (msg) => {
     if (!msg.message) return msg;
     let content = msg.message;
     
-    // Desenrola camadas de proteção do WhatsApp
     if (content.ephemeralMessage) content = content.ephemeralMessage.message;
     if (content.viewOnceMessage) content = content.viewOnceMessage.message;
     if (content.viewOnceMessageV2) content = content.viewOnceMessageV2.message;
     if (content.documentWithCaptionMessage) content = content.documentWithCaptionMessage.message;
     
-    // Tratamento de Edição: Pega a mensagem nova
     if (content.editedMessage) {
         content = content.editedMessage.message?.protocolMessage?.editedMessage || content.editedMessage.message;
     }
@@ -47,7 +43,6 @@ const unwrapMessage = (msg) => {
     return { ...msg, message: content };
 };
 
-// Upload de Mídia (Core Feature)
 const uploadMedia = async (buffer, type) => {
     try {
         const ext = mime.extension(type) || 'bin';
@@ -70,7 +65,6 @@ const uploadMedia = async (buffer, type) => {
     }
 };
 
-// Extração de Texto Robusta
 const getBody = (msg) => {
     if (!msg) return '';
     if (msg.conversation) return msg.conversation;
@@ -82,10 +76,8 @@ const getBody = (msg) => {
     return ''; 
 };
 
-// Helpers de Contato
 const fetchProfilePicSafe = async (sock, jid) => {
     try {
-        // Delay aleatório para evitar Rate Limit ao baixar muitas fotos
         await new Promise(r => setTimeout(r, Math.random() * 500 + 200)); 
         const url = await sock.profilePictureUrl(jid, 'image'); 
         return url;
@@ -105,7 +97,19 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     let historyChunkCounter = 0;
 
     // -----------------------------------------------------------
-    // 1. PRESENÇA (ONLINE / LAST SEEN)
+    // 0. GATILHO IMEDIATO DE SYNC (ZERO GAP)
+    // -----------------------------------------------------------
+    sock.ev.on('connection.update', async (update) => {
+        const { connection } = update;
+        if (connection === 'open') {
+            console.log(`⚡ [LISTENER] Conexão aberta! Forçando status 'importing' imediatamente.`);
+            // Força o status visual para o usuário não ficar esperando o evento 'messaging-history.set'
+            await updateSyncStatus(sessionId, 'importing_contacts', 5);
+        }
+    });
+
+    // -----------------------------------------------------------
+    // 1. PRESENÇA
     // -----------------------------------------------------------
     sock.ev.on('presence.update', async (presenceUpdate) => {
         const id = presenceUpdate.id;
@@ -115,20 +119,16 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const lastKnown = presences[id].lastKnownPresence;
             const isOnline = lastKnown === 'composing' || lastKnown === 'recording' || lastKnown === 'available';
             
-            // Atualiza DB sem bloquear
             supabase.from('contacts')
-                .update({ 
-                    is_online: isOnline,
-                    last_seen_at: new Date().toISOString()
-                })
+                .update({ is_online: isOnline, last_seen_at: new Date().toISOString() })
                 .eq('jid', normalizeJid(id))
                 .eq('company_id', companyId)
-                .then(({ error }) => { if(error) console.error("Erro presence:", error); });
+                .then(() => {});
         }
     });
 
     // -----------------------------------------------------------
-    // 2. ATUALIZAÇÕES (POLLS)
+    // 2. ATUALIZAÇÕES (ENQUETES V6)
     // -----------------------------------------------------------
     sock.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
@@ -144,7 +144,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     const voterJid = normalizeJid(pollUpdate.pollUpdateMessageKey?.participant || pollUpdate.pollUpdateMessageKey?.remoteJid);
                     const selectedOptions = vote.selectedOptions || [];
                     
-                    // Recupera mensagem original para contexto
+                    // Recupera mensagem original
                     const { data: originalMsg } = await supabase
                         .from('messages')
                         .select('content, poll_votes')
@@ -157,13 +157,14 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         try { pollData = typeof originalMsg.content === 'string' ? JSON.parse(originalMsg.content) : originalMsg.content; } catch(e){}
                         
                         let currentVotes = Array.isArray(originalMsg.poll_votes) ? originalMsg.poll_votes : [];
-                        // Remove voto anterior desse usuário
+                        // Remove voto anterior desse usuário para evitar duplicidade
                         currentVotes = currentVotes.filter(v => v.voterJid !== voterJid);
 
                         if (selectedOptions.length > 0) {
                              selectedOptions.forEach(opt => {
                                  // Tenta achar index pelo nome (Baileys v6+)
                                  const optName = opt.name || 'Desconhecido';
+                                 // Procura o index da opção no array original da enquete
                                  const idx = pollData.options?.findIndex(o => o === optName);
                                  
                                  currentVotes.push({
@@ -178,6 +179,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                             .update({ poll_votes: currentVotes })
                             .eq('whatsapp_id', pollCreationKey.id)
                             .eq('company_id', companyId);
+                            
+                        console.log(`🗳️ [VOTE] Voto registrado para ${voterJid} na enquete ${pollCreationKey.id}`);
                     }
                 }
             }
@@ -185,45 +188,35 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // -----------------------------------------------------------
-    // 3. HISTÓRICO DE MENSAGENS (FAST SYNC - LOTE ÚNICO)
+    // 3. HISTÓRICO DE MENSAGENS (FAST SYNC)
     // -----------------------------------------------------------
     sock.ev.on('messaging-history.set', async ({ contacts, messages, isLatest }) => {
         
-        // TRAVA DE SEGURANÇA: Se já está completed, ignora tudo.
         const { data: currentInstance } = await supabase.from('instances').select('sync_status').eq('session_id', sessionId).eq('company_id', companyId).single();
         if (currentInstance?.sync_status === 'completed') {
-            console.log(`⏩ [HISTÓRICO] Sessão já sincronizada. Ignorando evento.`);
             return;
         }
 
         historyChunkCounter++;
-        
-        // REGRA: Apenas 1 lote. Se vier o segundo, ignoramos e forçamos 100%.
         if (historyChunkCounter > 1) {
-            console.log(`⏩ [HISTÓRICO] Ignorando lote extra ${historyChunkCounter} (Regra Lote Único).`);
-            // FORÇA FINALIZAÇÃO PARA DESTRAVAR A TELA
+            console.log(`⏩ [HISTÓRICO] Ignorando lote extra ${historyChunkCounter}.`);
             await updateSyncStatus(sessionId, 'completed', 100);
             return;
         }
 
-        console.log(`📚 [HISTÓRICO] Processando Lote Único (Recentes)...`);
+        console.log(`📚 [HISTÓRICO] Processando Lote Único...`);
 
         try {
             const contactsMap = new Map();
 
-            // A. Processamento de Contatos (Batch 10)
+            // A. Contatos
             if (contacts && contacts.length > 0) {
                 await updateSyncStatus(sessionId, 'importing_contacts', 10);
                 
                 contacts.forEach(c => {
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
-                    contactsMap.set(jid, { 
-                        name: c.name || c.verifiedName || c.notify, 
-                        imgUrl: c.imgUrl, 
-                        isFromBook: !!c.name,
-                        lid: c.lid || null 
-                    });
+                    contactsMap.set(jid, { name: c.name || c.verifiedName || c.notify, imgUrl: c.imgUrl, isFromBook: !!c.name, lid: c.lid || null });
                 });
 
                 const uniqueJids = Array.from(contactsMap.keys());
@@ -233,26 +226,21 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
                     await Promise.all(batchJids.map(async (jid) => {
                         let data = contactsMap.get(jid);
-                        
                         if (jid.includes('@g.us') && !data.name) {
                             const groupName = await fetchGroupSubjectSafe(sock, jid);
                             if (groupName) data.name = groupName;
                         }
-                        
                         if (!data.imgUrl) {
                             const freshPic = await fetchProfilePicSafe(sock, jid);
                             if (freshPic) data.imgUrl = freshPic;
                         }
-                        
                         await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                     }));
-                    
-                    // Delay para liberar o Event Loop e evitar ETIMEDOUT
-                    await new Promise(r => setTimeout(r, 150)); 
+                    await new Promise(r => setTimeout(r, 100)); 
                 }
             }
 
-            // B. Name Hunter (Simplificado)
+            // B. Name Hunter
             if (messages && messages.length > 0) {
                 messages.forEach(msg => {
                     if (msg.key.fromMe) return;
@@ -265,7 +253,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 });
             }
 
-            // C. Mensagens (Regra: Max 10 por chat)
+            // C. Mensagens
             if (messages && messages.length > 0) {
                 await updateSyncStatus(sessionId, 'importing_messages', 30);
                 
@@ -284,11 +272,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 
                 for (let i = 0; i < chats.length; i++) {
                     const [chatJid, chatMsgs] = chats[i];
-                    
-                    // Ordena cronologicamente
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-                    
-                    // CORTA: Apenas as últimas 10 mensagens (REGRA DE PERFORMANCE)
                     const msgsToSave = chatMsgs.slice(-10); 
 
                     for (const msg of msgsToSave) {
@@ -297,10 +281,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName);
                     }
                     
-                    // Delay agressivo a cada 5 chats para manter conexão do banco viva
-                    if (i % 5 === 0) await new Promise(r => setTimeout(r, 200));
-                    else await new Promise(r => setTimeout(r, 20));
-
+                    if (i % 5 === 0) await new Promise(r => setTimeout(r, 100));
                     if (i % 10 === 0) {
                         const progress = 30 + Math.floor((i / chats.length) * 65);
                         await updateSyncStatus(sessionId, 'importing_messages', progress);
@@ -311,19 +292,17 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         } catch (e) {
             console.error("❌ [SYNC ERROR]", e);
         } finally {
-            // FORCE COMPLETED: Garante que a barra de progresso vá para 100% e suma
-            // Independente de erro ou sucesso, liberamos a UI.
             await updateSyncStatus(sessionId, 'completed', 100);
-            console.log(`✅ [HISTÓRICO] Sincronização Rápida Finalizada (100%).`);
+            console.log(`✅ [HISTÓRICO] Sync Finalizado (100%).`);
         }
     });
 
     // -----------------------------------------------------------
-    // 4. MENSAGENS EM TEMPO REAL (UPSERT)
+    // 4. MENSAGENS EM TEMPO REAL
     // -----------------------------------------------------------
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         for (const msg of messages) {
-            // 4.1 REVOKE
+            // REVOKE
             const protocolMsg = msg.message?.protocolMessage;
             if (protocolMsg && protocolMsg.type === 0) {
                 const keyToRevoke = protocolMsg.key;
@@ -358,23 +337,29 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
     
     // -----------------------------------------------------------
-    // 5. STATUS DE LEITURA (TICKS)
+    // 5. STATUS DE LEITURA (TICKS) - CORRIGIDO
     // -----------------------------------------------------------
     sock.ev.on('message-receipt.update', async (events) => {
         for (const event of events) {
-            const statusMap = {
-                1: 'sent',       // 1 Check Cinza
-                2: 'delivered',  // 2 Checks Cinza
-                3: 'read',       // Azul
-                4: 'played'      // Azul (Áudio Ouvido)
-            };
-            const newStatus = statusMap[event.receipt.userJid ? 0 : event.receipt.status] || statusMap[event.receipt.status];
+            // Baileys Status: 
+            // 0: ERROR/UNKNOWN
+            // 1: PENDING (Reloginho)
+            // 2: SERVER_ACK (1 Tick Cinza)
+            // 3: DELIVERY_ACK (2 Ticks Cinza)
+            // 4: READ (2 Ticks Azuis)
+            // 5: PLAYED (Audio)
 
-            if (!newStatus) continue;
+            const receiptStatus = event.receipt.status;
+            let dbStatus = null;
 
-            const updates = { status: newStatus };
-            if (newStatus === 'delivered') updates.delivered_at = new Date();
-            if (newStatus === 'read' || newStatus === 'played') updates.read_at = new Date();
+            if (receiptStatus === 3) dbStatus = 'delivered';
+            else if (receiptStatus === 4 || receiptStatus === 5) dbStatus = 'read';
+            
+            if (!dbStatus) continue;
+
+            const updates = { status: dbStatus };
+            if (dbStatus === 'delivered') updates.delivered_at = new Date();
+            if (dbStatus === 'read') updates.read_at = new Date();
 
             await supabase.from('messages')
                 .update(updates)
@@ -384,7 +369,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // -----------------------------------------------------------
-    // 6. REAÇÕES (EMOJIS)
+    // 6. REAÇÕES
     // -----------------------------------------------------------
     sock.ev.on('messages.reaction', async (reactions) => {
         for (const reaction of reactions) {
@@ -418,7 +403,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // -----------------------------------------------------------
-    // 7. EVENTOS DE CONTATO (SYNC)
+    // 7. EVENTOS DE CONTATO
     // -----------------------------------------------------------
     sock.ev.on('contacts.upsert', async (contacts) => {
         for (const c of contacts) {
@@ -441,16 +426,12 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 };
 
-// -----------------------------------------------------------
-// PROCESSADOR CENTRAL DE MENSAGENS
-// -----------------------------------------------------------
 const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime, forcedName = null) => {
     try {
         if (!msg.message) return;
         const jid = normalizeJid(msg.key.remoteJid);
         if (jid === 'status@broadcast') return;
 
-        // 1. Extração de Conteúdo
         const body = getBody(msg.message);
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
         
@@ -461,11 +442,9 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         const fromMe = msg.key.fromMe;
         const myJid = normalizeJid(sock.user?.id); 
 
-        // 2. Garantia de Lead (Anti-Ghost)
         let leadId = null;
         if (jid && !jid.includes('@g.us')) {
             leadId = await ensureLeadExists(jid, companyId, forcedName, myJid);
-            
             if (isRealtime && forcedName && jid !== myJid) {
                 await upsertContact(jid, companyId, forcedName, null, false);
             }
@@ -478,12 +457,10 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
              }
         }
 
-        // 3. Processamento de Mídia
         let mediaUrl = null;
         if (isMedia && isRealtime) {
             try {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger });
-                
                 let mimeType = 'application/octet-stream';
                 if (msg.message?.imageMessage) mimeType = 'image/jpeg';
                 else if (msg.message?.audioMessage) mimeType = 'audio/mp4'; 
@@ -497,16 +474,10 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
             }
         }
 
-        // 4. Detecção de PTT
         let messageTypeClean = type?.replace('Message', '') || 'text';
-        if (type === 'audioMessage' && msg.message.audioMessage.ptt) {
-            messageTypeClean = 'ptt'; 
-        }
-        if (type === 'pollCreationMessageV3' || type === 'pollCreationMessage') {
-            messageTypeClean = 'poll';
-        }
+        if (type === 'audioMessage' && msg.message.audioMessage.ptt) messageTypeClean = 'ptt'; 
+        if (type === 'pollCreationMessageV3' || type === 'pollCreationMessage') messageTypeClean = 'poll';
 
-        // 5. Tratamento do Conteúdo
         let finalContent = body || (mediaUrl ? '[Mídia]' : '');
         
         if (messageTypeClean === 'poll') {
@@ -520,7 +491,6 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
             }
         }
 
-        // 6. Persistência
         await upsertMessage({
             company_id: companyId,
             session_id: sessionId,
