@@ -133,7 +133,10 @@ export const sendReaction = async (sessionId, companyId, remoteJid, msgId, react
 
 export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, everyone = false) => {
     try {
-        await supabase.from('messages').update({ is_deleted: true, content: '🚫 Mensagem apagada' }).eq('id', msgId).eq('company_id', companyId);
+        await supabase.from('messages')
+            .update({ is_deleted: true, content: '⊘ Mensagem apagada' }) // Símbolo atualizado
+            .eq('id', msgId)
+            .eq('company_id', companyId);
 
         if (everyone) {
             const session = sessions.get(sessionId);
