@@ -1,6 +1,6 @@
 
 import { sessions } from './connection.js';
-import { delay } from '@whiskeysockets/baileys';
+import { delay, generateWAMessageFromContent, proto } from '@whiskeysockets/baileys';
 
 // Helper: Delay Aleatório
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
@@ -37,9 +37,6 @@ export const sendMessage = async ({
 
     // 1. Checagem de Segurança: O número existe? (Ignora grupos)
     if (!jid.includes('@g.us')) {
-        // Nota: onWhatsApp pode falhar em alguns casos de instabilidade do Meta, 
-        // então usamos um try/catch frouxo apenas para logar, mas não bloqueamos o envio 
-        // para não prejudicar a UX em caso de falso negativo.
         try {
             const [result] = await sock.onWhatsApp(jid);
             if (result && !result.exists) {
@@ -49,7 +46,7 @@ export const sendMessage = async ({
     }
 
     try {
-        console.log(`🤖 [HUMAN-SEND] Iniciando protocolo para: ${jid}`);
+        console.log(`🤖 [HUMAN-SEND] Iniciando protocolo para: ${jid} (Tipo: ${type})`);
 
         // 2. Delay Inicial (Simula tempo de reação)
         await delay(randomDelay(500, 1500));
@@ -62,10 +59,8 @@ export const sendMessage = async ({
         let typingTime = 2000; // Mínimo 2s
         if (type === 'text' && content) {
             const textLen = content.length;
-            // ~100ms por caractere, teto de 10s
             typingTime = Math.min(textLen * 100, 10000); 
         } else if (type === 'audio') {
-            // Simula tempo de gravação
             typingTime = randomDelay(3000, 6000); 
         }
 
@@ -74,18 +69,16 @@ export const sendMessage = async ({
         // 5. Pausa (Momento antes de enviar)
         await sock.sendPresenceUpdate('paused', jid);
 
-        // 6. Montagem do Payload
-        let payload = {};
+        // 6. Montagem do Payload e Envio
+        let sentMsg;
 
         switch (type) {
-            case 'text':
-                payload = { text: content || "" };
-                break;
-            
             case 'pix':
-                // IMPLEMENTAÇÃO DO BOTÃO "COPIAR" NATIVO
-                // Usa 'interactiveMessage' com 'native_flow_message' -> 'cta_copy'
-                payload = {
+                // FIX CRÍTICO PIX: Usando relayMessage para garantir estrutura Native Flow
+                // Isso resolve o erro "Invalid media type" pois montamos o proto manualmente
+                const pixKey = content || "CHAVE_NAO_INFORMADA";
+                
+                const msgContent = {
                     viewOnceMessage: {
                         message: {
                             interactiveMessage: {
@@ -107,7 +100,7 @@ export const sendMessage = async ({
                                             buttonParamsJson: JSON.stringify({
                                                 display_text: "COPIAR CHAVE PIX",
                                                 id: "copy_pix_key",
-                                                copy_code: content // A chave Pix vem aqui
+                                                copy_code: pixKey
                                             })
                                         }
                                     ]
@@ -116,67 +109,76 @@ export const sendMessage = async ({
                         }
                     }
                 };
+
+                // Gera a mensagem raw com ID correto e contexto da sessão
+                const waMessage = await generateWAMessageFromContent(jid, msgContent, { userJid: sock.user.id });
+                
+                // Envia via Relay (Bypassa validações estritas de tipo do sendMessage)
+                await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
+                sentMsg = waMessage;
+                break;
+
+            case 'text':
+                sentMsg = await sock.sendMessage(jid, { text: content || "" });
                 break;
 
             case 'image':
-                payload = { image: { url }, caption: caption };
+                sentMsg = await sock.sendMessage(jid, { image: { url }, caption: caption });
                 break;
 
             case 'video':
-                payload = { video: { url }, caption: caption, gifPlayback: false };
+                sentMsg = await sock.sendMessage(jid, { video: { url }, caption: caption, gifPlayback: false });
                 break;
 
             case 'audio':
-                payload = { audio: { url }, ptt: !!ptt, mimetype: mimetype || 'audio/mp4' };
+                sentMsg = await sock.sendMessage(jid, { audio: { url }, ptt: !!ptt, mimetype: mimetype || 'audio/mp4' });
                 break;
 
             case 'document':
-                payload = { document: { url }, mimetype: mimetype || 'application/pdf', fileName: fileName || 'documento' };
-                if (caption) payload.caption = caption;
+                sentMsg = await sock.sendMessage(jid, { document: { url }, mimetype: mimetype || 'application/pdf', fileName: fileName || 'documento', caption: caption });
                 break;
 
             case 'poll':
                 if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
-                payload = {
+                // FIX ENQUETE: Estrutura correta para Baileys
+                // O Baileys espera 'values' como array de strings, não options
+                sentMsg = await sock.sendMessage(jid, {
                     poll: {
                         name: poll.name,
-                        values: poll.options,
-                        selectableCount: poll.selectableOptionsCount || 1
+                        values: poll.options, // Array de strings simples
+                        selectableCount: Number(poll.selectableOptionsCount) || 1
                     }
-                };
+                });
                 break;
 
             case 'location':
                 if (!location || !location.latitude || !location.longitude) throw new Error("Dados de localização inválidos");
-                payload = {
+                sentMsg = await sock.sendMessage(jid, {
                     location: {
                         degreesLatitude: location.latitude,
                         degreesLongitude: location.longitude
                     }
-                };
+                });
                 break;
 
             case 'contact':
                 if (!contact || !contact.vcard) throw new Error("Dados de contato inválidos");
-                payload = {
+                sentMsg = await sock.sendMessage(jid, {
                     contacts: {
                         displayName: contact.displayName,
                         contacts: [{ vcard: contact.vcard }]
                     }
-                };
+                });
                 break;
 
             default:
-                payload = { text: content || "" };
+                sentMsg = await sock.sendMessage(jid, { text: content || "" });
         }
 
-        // 7. Disparo Real
-        const sentMsg = await sock.sendMessage(jid, payload);
         return sentMsg;
 
     } catch (err) {
         console.error("❌ Erro no envio seguro:", err);
-        // Garante que para de digitar se der erro
         if (session && session.sock) {
             await sock.sendPresenceUpdate('paused', jid).catch(() => {});
         }
