@@ -2,7 +2,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
 import { sendMessage as sendService } from '../services/baileys/sender.js';
-import { savePollVote, normalizeJid } from '../services/crm/sync.js'; // Importei normalizeJid
+import { savePollVote, normalizeJid } from '../services/crm/sync.js';
 
 // Cliente Supabase para consultas auxiliares (Service Role ou Anon, depende do env, mas para leitura OK)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -54,10 +54,9 @@ export const sendMessage = async (sessionId, to, payload) => {
 export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, optionId) => {
     try {
         const session = sessions.get(sessionId);
-        if (!session?.sock) throw new Error("Sessão desconectada.");
+        if (!session || !session.sock) throw new Error("Sessão desconectada.");
 
         // 1. Recuperar a mensagem original do banco para saber quais são as opções
-        // O Baileys exige o TEXTO da opção para calcular o hash do voto, não apenas o índice
         const { data: pollMsg } = await supabase
             .from('messages')
             .select('whatsapp_id, from_me, content')
@@ -77,43 +76,46 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         }
 
         // Validação da estrutura
-        if (!pollContent || !Array.isArray(pollContent.options)) {
-            throw new Error("Estrutura da enquete inválida no banco.");
+        // Em alguns casos, as options podem vir salvas como array de objetos {optionName: 'X'} ou array de strings
+        let optionsList = [];
+        if (Array.isArray(pollContent.options)) {
+            optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
+        } else {
+            throw new Error("Estrutura da enquete inválida no banco (sem opções).");
         }
 
         // 3. Extrair a Opção exata (Texto)
-        const selectedOptionText = pollContent.options[optionId];
+        const selectedOptionText = optionsList[optionId];
         
         if (selectedOptionText === undefined || selectedOptionText === null) {
-            throw new Error(`Opção inválida (Index: ${optionId}). Opções disponíveis: ${pollContent.options.length}`);
+            throw new Error(`Opção inválida (Index: ${optionId}). Opções disponíveis: ${optionsList.length}`);
         }
 
-        console.log(`🗳️ [VOTE] Votando em: "${selectedOptionText}" (Index: ${optionId})`);
+        console.log(`🗳️ [VOTE] Preparando voto: "${selectedOptionText}" (Index: ${optionId})`);
 
         // FIX CRÍTICO: Normalizar JID para garantir match da chave
         const chatJid = normalizeJid(remoteJid); 
         
-        // 4. Enviar voto pelo Socket
-        // O segredo é garantir que 'vote' exista e 'selectedOptions' seja array de strings
+        // 4. Enviar voto pelo Socket (Estrutura VOTE precisa)
+        // Se usar apenas sendMessage({ poll: { vote: ... } }), o Baileys valida como criação.
+        // Precisamos garantir que a chave 'vote' esteja presente e 'name' AUSENTE.
+        
         const votePayload = {
-            poll: {
-                vote: {
-                    key: {
-                        id: pollMsg.whatsapp_id,
-                        remoteJid: chatJid,
-                        fromMe: pollMsg.from_me,
-                        // Se for grupo, precisa do participant? O Baileys geralmente lida, mas em mensagens 'fromMe'
-                        // a chave deve ser limpa.
-                    },
-                    selectedOptions: [String(selectedOptionText)] // Força String
-                }
+            vote: {
+                key: {
+                    id: pollMsg.whatsapp_id,
+                    remoteJid: chatJid,
+                    fromMe: pollMsg.from_me,
+                    // Se a mensagem original foi 'fromMe', a chave deve refletir isso
+                },
+                selectedOptions: [String(selectedOptionText)] // Força String
             }
         };
 
-        await session.sock.sendMessage(chatJid, votePayload);
+        // Usa 'poll' wrapper mas SEM 'name' ou 'values', para o Baileys entender que é voto
+        await session.sock.sendMessage(chatJid, { poll: votePayload });
 
         // 5. Salvar voto no banco localmente (Optimistic Update)
-        // Usamos o ID do bot como 'voter'
         const myJid = normalizeJid(session.sock.user?.id);
         await savePollVote({
             companyId,
@@ -122,6 +124,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             optionId
         });
 
+        console.log(`✅ [VOTE] Voto enviado e persistido.`);
         return { success: true };
 
     } catch (error) {
