@@ -1,4 +1,3 @@
-
 import { createClient } from "@supabase/supabase-js";
 import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
 import { sendMessage as sendService } from '../services/baileys/sender.js';
@@ -60,7 +59,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error("Conteúdo da enquete corrompido.");
         }
 
-        // 2. Resolve a opção selecionada (Precisa do texto da opção, não só do ID)
+        // 2. Resolve a opção selecionada (Precisa do texto da opção)
         let optionsList = [];
         if (Array.isArray(pollContent.options)) {
             optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
@@ -79,7 +78,6 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         
         // 3. Monta o payload de VOTO para o Baileys
         // IMPORTANTE: A estrutura correta para VOTAR é enviar um objeto 'vote' dentro de 'poll'.
-        // Não se deve enviar 'name' ou 'values' aqui, pois isso seria criar uma nova enquete.
         const votePayload = {
             vote: {
                 key: {
@@ -91,7 +89,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             }
         };
 
-        // Envia usando a chave 'poll' mas com o conteúdo de voto formatado
+        // Envia usando a chave 'poll' com payload de voto
         await session.sock.sendMessage(chatJid, { poll: votePayload });
 
         // 4. Salva no banco (Optimistic Update)
