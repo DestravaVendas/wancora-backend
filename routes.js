@@ -5,7 +5,7 @@ import { sendAppointmentConfirmation } from './controllers/appointmentController
 
 // Serviços Modulares
 import { startSession, deleteSession } from "./services/baileys/connection.js";
-import { sendMessage, sendPollVote, sendReaction } from "./controllers/whatsappController.js"; 
+import { sendMessage, sendPollVote, sendReaction, deleteMessage } from "./controllers/whatsappController.js"; 
 
 // Controller de Campanhas
 import { createCampaign } from "./controllers/campaignController.js"; 
@@ -179,6 +179,23 @@ router.post("/message/react", async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error("Erro ao reagir:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- Rota de Deleção (Revoke) ---
+router.post("/message/delete", async (req, res) => {
+    const { sessionId, companyId, remoteJid, msgId, everyone } = req.body;
+
+    if (!msgId) {
+         return res.status(400).json({ error: "ID da mensagem obrigatório." });
+    }
+
+    try {
+        await deleteMessage(sessionId, companyId, remoteJid, msgId, everyone);
+        res.json({ success: true });
+    } catch (error) {
+        console.error("Erro ao deletar:", error);
         res.status(500).json({ error: error.message });
     }
 });
