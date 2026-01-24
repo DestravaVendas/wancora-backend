@@ -2,7 +2,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
 import { sendMessage as sendService } from '../services/baileys/sender.js';
-import { savePollVote } from '../services/crm/sync.js';
+import { savePollVote, normalizeJid } from '../services/crm/sync.js'; // Importei normalizeJid
 
 // Cliente Supabase para consultas auxiliares (Service Role ou Anon, depende do env, mas para leitura OK)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -90,23 +90,31 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
 
         console.log(`🗳️ [VOTE] Votando em: "${selectedOptionText}" (Index: ${optionId})`);
 
+        // FIX CRÍTICO: Normalizar JID para garantir match da chave
+        const chatJid = normalizeJid(remoteJid); 
+        
         // 4. Enviar voto pelo Socket
-        // IMPORTANTE: selectableCount deve ser respeitado se for single select
-        await session.sock.sendMessage(remoteJid, {
+        // O segredo é garantir que 'vote' exista e 'selectedOptions' seja array de strings
+        const votePayload = {
             poll: {
                 vote: {
                     key: {
                         id: pollMsg.whatsapp_id,
-                        remoteJid: remoteJid,
-                        fromMe: pollMsg.from_me
+                        remoteJid: chatJid,
+                        fromMe: pollMsg.from_me,
+                        // Se for grupo, precisa do participant? O Baileys geralmente lida, mas em mensagens 'fromMe'
+                        // a chave deve ser limpa.
                     },
-                    selectedOptions: [selectedOptionText] // O Baileys fará o hash internamente baseado neste texto
+                    selectedOptions: [String(selectedOptionText)] // Força String
                 }
             }
-        });
+        };
+
+        await session.sock.sendMessage(chatJid, votePayload);
 
         // 5. Salvar voto no banco localmente (Optimistic Update)
-        const myJid = session.sock.user?.id.split(':')[0] + '@s.whatsapp.net';
+        // Usamos o ID do bot como 'voter'
+        const myJid = normalizeJid(session.sock.user?.id);
         await savePollVote({
             companyId,
             msgId: pollMsg.whatsapp_id,
@@ -138,13 +146,13 @@ export const sendReaction = async (sessionId, companyId, remoteJid, msgId, react
         if (!targetMsg) throw new Error("Mensagem alvo não encontrada.");
 
         const key = {
-            remoteJid: remoteJid,
+            remoteJid: normalizeJid(remoteJid),
             id: targetMsg.whatsapp_id,
             fromMe: targetMsg.from_me
         };
 
         // Envia reação via Socket
-        await session.sock.sendMessage(remoteJid, {
+        await session.sock.sendMessage(normalizeJid(remoteJid), {
             react: {
                 text: reaction, // Emoji ou '' para remover
                 key: key
@@ -180,11 +188,11 @@ export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, ever
 
                 if (targetMsg) {
                     const key = {
-                        remoteJid: remoteJid,
+                        remoteJid: normalizeJid(remoteJid),
                         id: targetMsg.whatsapp_id,
                         fromMe: targetMsg.from_me 
                     };
-                    await session.sock.sendMessage(remoteJid, { delete: key });
+                    await session.sock.sendMessage(normalizeJid(remoteJid), { delete: key });
                 }
             }
         }
