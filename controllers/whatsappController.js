@@ -56,7 +56,8 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         const session = sessions.get(sessionId);
         if (!session?.sock) throw new Error("Sessão desconectada.");
 
-        // 1. Recuperar a mensagem original do banco para pegar o TEXTO da opção e a CHAVE original
+        // 1. Recuperar a mensagem original do banco para saber quais são as opções
+        // O Baileys exige o TEXTO da opção para calcular o hash do voto, não apenas o índice
         const { data: pollMsg } = await supabase
             .from('messages')
             .select('whatsapp_id, from_me, content')
@@ -65,20 +66,32 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
 
         if (!pollMsg) throw new Error("Enquete não encontrada no banco.");
 
-        // 2. Extrair o texto da opção selecionada (Baileys exige o valor, não o índice)
+        // 2. Parsing Robusto do Conteúdo
         let pollContent;
         try {
+            // Tenta parsear JSON, se falhar assume que é objeto se já vier assim
             pollContent = typeof pollMsg.content === 'string' ? JSON.parse(pollMsg.content) : pollMsg.content;
         } catch (e) {
-            throw new Error("Conteúdo da enquete corrompido.");
+            console.error("Erro parse poll:", e);
+            throw new Error("Conteúdo da enquete corrompido ou inválido.");
         }
 
-        // Recupera o texto da opção baseada no ID
-        const selectedOptionText = pollContent.options?.[optionId];
-        if (!selectedOptionText) throw new Error(`Opção inválida (Index: ${optionId}).`);
+        // Validação da estrutura
+        if (!pollContent || !Array.isArray(pollContent.options)) {
+            throw new Error("Estrutura da enquete inválida no banco.");
+        }
 
-        // 3. Enviar voto pelo Socket com a chave correta
-        // O Baileys precisa que 'selectedOptions' contenha o VALOR (texto) da opção votada.
+        // 3. Extrair a Opção exata (Texto)
+        const selectedOptionText = pollContent.options[optionId];
+        
+        if (selectedOptionText === undefined || selectedOptionText === null) {
+            throw new Error(`Opção inválida (Index: ${optionId}). Opções disponíveis: ${pollContent.options.length}`);
+        }
+
+        console.log(`🗳️ [VOTE] Votando em: "${selectedOptionText}" (Index: ${optionId})`);
+
+        // 4. Enviar voto pelo Socket
+        // IMPORTANTE: selectableCount deve ser respeitado se for single select
         await session.sock.sendMessage(remoteJid, {
             poll: {
                 vote: {
@@ -87,12 +100,12 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
                         remoteJid: remoteJid,
                         fromMe: pollMsg.from_me
                     },
-                    selectedOptions: [selectedOptionText] // ARRAY COM O TEXTO DA OPÇÃO
+                    selectedOptions: [selectedOptionText] // O Baileys fará o hash internamente baseado neste texto
                 }
             }
         });
 
-        // 4. Salvar voto no banco localmente (Optimistic Update)
+        // 5. Salvar voto no banco localmente (Optimistic Update)
         const myJid = session.sock.user?.id.split(':')[0] + '@s.whatsapp.net';
         await savePollVote({
             companyId,
@@ -104,7 +117,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         return { success: true };
 
     } catch (error) {
-        console.error(`[Controller] Erro ao votar:`, error);
+        console.error(`[Controller] Erro ao votar:`, error.message);
         throw error;
     }
 };
