@@ -331,7 +331,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     console.log(`🗑️ [REVOKE] Mensagem apagada: ${keyToRevoke.id}`);
                     await supabase.from('messages')
                         .update({ 
-                            content: '🚫 Mensagem apagada', 
+                            content: '⊘ Mensagem apagada', 
                             message_type: 'text',
                             is_deleted: true 
                         })
