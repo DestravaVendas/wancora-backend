@@ -74,48 +74,51 @@ export const sendMessage = async ({
 
         switch (type) {
             case 'pix':
-                // FIX CRÍTICO PIX: Usando relayMessage para garantir estrutura Native Flow
-                // Isso resolve o erro "Invalid media type" pois montamos o proto manualmente
+                // FIX CRÍTICO PIX V2: Estrutura Interactive Message Native Flow
                 const pixKey = content || "CHAVE_NAO_INFORMADA";
-                
-                const msgContent = {
+                console.log(`💲 [PIX] Gerando payload Native Flow para: ${pixKey}`);
+
+                // Estrutura Proto Exata para Botão de Cópia
+                const buttonParams = JSON.stringify({
+                    display_text: "COPIAR CHAVE PIX",
+                    id: "copy_code",
+                    copy_code: pixKey
+                });
+
+                const interactiveMessage = {
+                    body: { text: "Copie a chave abaixo para realizar o pagamento." },
+                    footer: { text: "Wancora Secure Pay" },
+                    header: { title: "PAGAMENTO VIA PIX", subtitle: "Instantâneo", hasMediaAttachment: false },
+                    nativeFlowMessage: {
+                        buttons: [{
+                            name: "cta_copy",
+                            buttonParamsJson: buttonParams
+                        }]
+                    }
+                };
+
+                const messagePayload = {
                     viewOnceMessage: {
                         message: {
-                            interactiveMessage: {
-                                header: {
-                                    title: "PAGAMENTO VIA PIX",
-                                    subtitle: "Pagamento Instantâneo",
-                                    hasMediaAttachment: false
-                                },
-                                body: {
-                                    text: "Copie a chave abaixo e cole no seu aplicativo bancário para finalizar o pagamento."
-                                },
-                                footer: {
-                                    text: "Wancora Secure Pay"
-                                },
-                                nativeFlowMessage: {
-                                    buttons: [
-                                        {
-                                            name: "cta_copy",
-                                            buttonParamsJson: JSON.stringify({
-                                                display_text: "COPIAR CHAVE PIX",
-                                                id: "copy_pix_key",
-                                                copy_code: pixKey
-                                            })
-                                        }
-                                    ]
-                                }
-                            }
+                            interactiveMessage: interactiveMessage
                         }
                     }
                 };
 
-                // Gera a mensagem raw com ID correto e contexto da sessão
-                const waMessage = await generateWAMessageFromContent(jid, msgContent, { userJid: sock.user.id });
+                // Gera a mensagem raw usando o userJid da sessão conectada
+                const waMessage = await generateWAMessageFromContent(jid, messagePayload, { 
+                    userJid: sock.user.id 
+                });
                 
-                // Envia via Relay (Bypassa validações estritas de tipo do sendMessage)
-                await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
-                sentMsg = waMessage;
+                // Envia via Relay com tratamento de erro específico
+                try {
+                    await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
+                    sentMsg = waMessage;
+                    console.log(`✅ [PIX] Enviado com sucesso via Relay. ID: ${waMessage.key.id}`);
+                } catch (relayError) {
+                    console.error(`❌ [PIX] Erro no relayMessage:`, relayError);
+                    throw new Error(`Falha no envio do Card Pix: ${relayError.message}`);
+                }
                 break;
 
             case 'text':
@@ -140,8 +143,8 @@ export const sendMessage = async ({
 
             case 'poll':
                 if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
-                // FIX ENQUETE: Estrutura correta para Baileys
-                // O Baileys espera 'values' como array de strings, não options
+                console.log(`📊 [POLL] Criando Enquete: ${poll.name}`);
+                
                 sentMsg = await sock.sendMessage(jid, {
                     poll: {
                         name: poll.name,
