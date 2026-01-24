@@ -5,9 +5,9 @@ import { sendAppointmentConfirmation } from './controllers/appointmentController
 
 // Serviços Modulares
 import { startSession, deleteSession } from "./services/baileys/connection.js";
-import { sendMessage, sendPollVote } from "./controllers/whatsappController.js"; // Atualizado import
+import { sendMessage, sendPollVote, sendReaction } from "./controllers/whatsappController.js"; 
 
-// Controller de Campanhas (ATIVO)
+// Controller de Campanhas
 import { createCampaign } from "./controllers/campaignController.js"; 
 
 const router = express.Router();
@@ -108,18 +108,14 @@ router.post("/message/send", async (req, res) => {
     const sentMsg = await sendMessage(sessionId, to, payload);
     
     // 3. Salvamento Manual (Log Otimista/Idempotente)
-    // Usamos UPSERT aqui. Se o listener do Baileys já tiver salvado, atualizamos. Se não, inserimos.
-    // Isso evita o erro "duplicate key value violates unique constraint" em condições de corrida.
     if (companyId && sentMsg?.key) {
         const remoteJid = to.includes('@') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`;
         const phone = remoteJid.split('@')[0];
         
-        // Tenta vincular ao Lead se existir (mas não cria lead aqui, deixa o sync cuidar disso)
         let leadId = null;
         const { data: lead } = await supabase.from("leads").select("id").eq("phone", phone).eq("company_id", companyId).maybeSingle();
         if (lead) leadId = lead.id;
 
-        // Formatação visual do conteúdo para o banco
         let displayContent = text || caption || `[${payload.type}]`;
         
         if (payload.type === 'poll' && poll) displayContent = JSON.stringify(poll);
@@ -127,7 +123,6 @@ router.post("/message/send", async (req, res) => {
         else if (payload.type === 'contact' && contact) displayContent = JSON.stringify(contact);
         else if (payload.type === 'pix') displayContent = text; 
 
-        // CRÍTICO: Upsert baseado na constraint (remote_jid, whatsapp_id)
         await supabase.from("messages").upsert({
             company_id: companyId,
             lead_id: leadId,
@@ -138,11 +133,11 @@ router.post("/message/send", async (req, res) => {
             message_type: payload.type,
             content: displayContent,
             media_url: url,
-            status: "sent", // Assume sent, listener atualiza para delivered/read depois
+            status: "sent",
             created_at: new Date()
         }, { 
             onConflict: 'remote_jid, whatsapp_id',
-            ignoreDuplicates: false // Atualiza se existir
+            ignoreDuplicates: false 
         });
     }
 
@@ -154,7 +149,7 @@ router.post("/message/send", async (req, res) => {
   }
 });
 
-// --- NOVO: Votar em Enquete ---
+// --- Rota de Votação (Enquetes) ---
 router.post("/message/vote", async (req, res) => {
     const { companyId, sessionId, remoteJid, pollId, optionId } = req.body;
     
@@ -167,6 +162,23 @@ router.post("/message/vote", async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error("Erro ao votar:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- Rota de Reações (Emojis) ---
+router.post("/message/react", async (req, res) => {
+    const { sessionId, companyId, remoteJid, msgId, reaction } = req.body;
+
+    if (!sessionId || !remoteJid || !msgId) {
+         return res.status(400).json({ error: "Dados incompletos para reação (sessionId, remoteJid, msgId)." });
+    }
+
+    try {
+        await sendReaction(sessionId, companyId, remoteJid, msgId, reaction);
+        res.json({ success: true });
+    } catch (error) {
+        console.error("Erro ao reagir:", error);
         res.status(500).json({ error: error.message });
     }
 });
