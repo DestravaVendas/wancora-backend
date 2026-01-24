@@ -107,7 +107,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
     }
 };
 
-// --- NOVO: Enviar Reação (Emoji) ---
+// --- Enviar Reação (Emoji) ---
 export const sendReaction = async (sessionId, companyId, remoteJid, msgId, reaction) => {
     try {
         const session = sessions.get(sessionId);
@@ -139,6 +139,44 @@ export const sendReaction = async (sessionId, companyId, remoteJid, msgId, react
         return { success: true };
     } catch (error) {
         console.error(`[Controller] Erro ao reagir:`, error);
+        throw error;
+    }
+};
+
+// --- NOVO: Deletar Mensagem (Revoke) ---
+export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, everyone = false) => {
+    try {
+        // 1. Apagar do Banco (Delete for me & everyone)
+        // Marcamos como deletada visualmente primeiro
+        await supabase.from('messages')
+            .update({ is_deleted: true, content: '🚫 Mensagem apagada' })
+            .eq('id', msgId)
+            .eq('company_id', companyId);
+
+        // 2. Se for para todos, enviar protocolo de REVOKE no WhatsApp
+        if (everyone) {
+            const session = sessions.get(sessionId);
+            if (session?.sock) {
+                const { data: targetMsg } = await supabase
+                    .from('messages')
+                    .select('whatsapp_id, from_me')
+                    .eq('id', msgId)
+                    .single();
+
+                if (targetMsg) {
+                    const key = {
+                        remoteJid: remoteJid,
+                        id: targetMsg.whatsapp_id,
+                        fromMe: targetMsg.from_me 
+                    };
+                    await session.sock.sendMessage(remoteJid, { delete: key });
+                }
+            }
+        }
+
+        return { success: true };
+    } catch (error) {
+        console.error(`[Controller] Erro ao deletar:`, error);
         throw error;
     }
 };
