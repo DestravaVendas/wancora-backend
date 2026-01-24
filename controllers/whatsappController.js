@@ -73,11 +73,12 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error("Conteúdo da enquete corrompido.");
         }
 
+        // Recupera o texto da opção baseada no ID
         const selectedOptionText = pollContent.options?.[optionId];
         if (!selectedOptionText) throw new Error(`Opção inválida (Index: ${optionId}).`);
 
         // 3. Enviar voto pelo Socket com a chave correta
-        // ATENÇÃO: O formato do selectedOptions é crucial.
+        // O Baileys precisa que 'selectedOptions' contenha o VALOR (texto) da opção votada.
         await session.sock.sendMessage(remoteJid, {
             poll: {
                 vote: {
@@ -86,7 +87,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
                         remoteJid: remoteJid,
                         fromMe: pollMsg.from_me
                     },
-                    selectedOptions: [selectedOptionText] // Deve ser o array com o TEXTO da opção
+                    selectedOptions: [selectedOptionText] // ARRAY COM O TEXTO DA OPÇÃO
                 }
             }
         });
