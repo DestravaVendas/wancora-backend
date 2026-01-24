@@ -56,7 +56,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         const session = sessions.get(sessionId);
         if (!session?.sock) throw new Error("Sessão desconectada.");
 
-        // 1. Recuperar a mensagem original do banco para pegar o TEXTO da opção
+        // 1. Recuperar a mensagem original do banco para pegar o TEXTO da opção e a CHAVE original
         const { data: pollMsg } = await supabase
             .from('messages')
             .select('whatsapp_id, from_me, content')
@@ -77,6 +77,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         if (!selectedOptionText) throw new Error(`Opção inválida (Index: ${optionId}).`);
 
         // 3. Enviar voto pelo Socket com a chave correta
+        // ATENÇÃO: O formato do selectedOptions é crucial.
         await session.sock.sendMessage(remoteJid, {
             poll: {
                 vote: {
@@ -85,7 +86,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
                         remoteJid: remoteJid,
                         fromMe: pollMsg.from_me
                     },
-                    selectedOptions: [selectedOptionText] // CORREÇÃO: Envia array de strings
+                    selectedOptions: [selectedOptionText] // Deve ser o array com o TEXTO da opção
                 }
             }
         });
@@ -143,7 +144,7 @@ export const sendReaction = async (sessionId, companyId, remoteJid, msgId, react
     }
 };
 
-// --- NOVO: Deletar Mensagem (Revoke) ---
+// --- Deletar Mensagem (Revoke) ---
 export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, everyone = false) => {
     try {
         // 1. Apagar do Banco (Delete for me & everyone)
@@ -181,13 +182,8 @@ export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, ever
     }
 };
 
-/**
- * Recupera o sessionId ativo de uma empresa para uso em Workers/Background Jobs.
- * Prioriza sessões marcadas como 'connected'.
- */
 export const getSessionId = async (companyId) => {
     try {
-        // Busca sessão ativa no banco
         const { data, error } = await supabase
             .from('instances')
             .select('session_id')
@@ -198,7 +194,6 @@ export const getSessionId = async (companyId) => {
 
         if (error) throw error;
         
-        // Se não achar conectada, tenta pegar qualquer uma (fallback)
         if (!data) {
              const { data: anySession } = await supabase
                 .from('instances')
