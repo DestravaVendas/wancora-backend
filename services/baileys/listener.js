@@ -106,7 +106,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     let historyChunkCounter = 0;
 
     // -----------------------------------------------------------
-    // 1. PRESENÇA (ONLINE / LAST SEEN) - [FEATURE SOCIAL]
+    // 1. PRESENÇA (ONLINE / LAST SEEN)
     // -----------------------------------------------------------
     sock.ev.on('presence.update', async (presenceUpdate) => {
         const id = presenceUpdate.id;
@@ -129,7 +129,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // -----------------------------------------------------------
-    // 2. ATUALIZAÇÕES (POLLS) - [FEATURE SOCIAL]
+    // 2. ATUALIZAÇÕES (POLLS)
     // -----------------------------------------------------------
     sock.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
@@ -189,12 +189,30 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // 3. HISTÓRICO DE MENSAGENS (FAST SYNC) - [CORE FEATURE]
     // -----------------------------------------------------------
     sock.ev.on('messaging-history.set', async ({ contacts, messages, isLatest }) => {
+        
+        // --- TRAVA DE SEGURANÇA: RECONEXÃO ---
+        // Verifica se esta sessão já foi totalmente sincronizada antes.
+        // Se sim, pulamos o processamento pesado para evitar ETIMEDOUT e duplicação.
+        const { data: currentInstance } = await supabase
+            .from('instances')
+            .select('sync_status')
+            .eq('session_id', sessionId)
+            .eq('company_id', companyId)
+            .single();
+
+        if (currentInstance?.sync_status === 'completed') {
+            console.log(`⏩ [HISTÓRICO] Ignorando sincronização: Instância ${sessionId} já está 'completed'.`);
+            return;
+        }
+        // ---------------------------------------
+
         historyChunkCounter++;
         const itemCount = (contacts?.length || 0) + (messages?.length || 0);
-        console.log(`📚 [HISTÓRICO] Chunk ${historyChunkCounter}: ${itemCount} itens.`);
+        console.log(`📚 [HISTÓRICO] Lote ${historyChunkCounter} | Itens: ${itemCount} | isLatest: ${isLatest}`);
 
+        // Se o chunk vier vazio, finaliza se for o último
         if (itemCount === 0) {
-            if (isLatest || historyChunkCounter >= 2) await updateSyncStatus(sessionId, 'completed', 100);
+            if (isLatest) await updateSyncStatus(sessionId, 'completed', 100);
             return;
         }
 
@@ -217,9 +235,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     });
                 });
 
-                // Executa Upsert em Lotes de 20 para não estourar conexões
+                // Executa Upsert em Lotes menores para aliviar o banco
                 const uniqueJids = Array.from(contactsMap.keys());
-                const BATCH_SIZE = 20;
+                const BATCH_SIZE = 10; // Reduzido de 20 para 10 para evitar timeouts
                 
                 for (let i = 0; i < uniqueJids.length; i += BATCH_SIZE) {
                     const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
@@ -240,7 +258,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         
                         await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                     }));
-                    await new Promise(r => setTimeout(r, 10)); // Breve respiro
+                    
+                    // FIX: Pausa de 100ms a cada lote de contatos. 
+                    // Vital para evitar ETIMEDOUT no Redis/DB.
+                    await new Promise(r => setTimeout(r, 100)); 
                 }
             }
 
@@ -252,12 +273,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     if (!jid) return;
                     
                     const existing = contactsMap.get(jid);
-                    // Se não temos o contato mapeado OU ele não tem nome, mas a msg tem pushName
                     if ((!existing || !existing.name) && msg.pushName) {
                         if (existing) existing.name = msg.pushName; 
                         else contactsMap.set(jid, { name: msg.pushName, imgUrl: null, isFromBook: false, lid: null });
                         
-                        // Upsert assíncrono para salvar esse nome descoberto
                         upsertContact(jid, companyId, msg.pushName, null, false);
                     }
                 });
@@ -286,17 +305,16 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     return tB - tA; 
                 });
 
-                // Limita a importação para evitar Out of Memory em contas gigantes
-                // Pega os 300 chats mais recentes
-                const topChats = sortedChats.slice(0, 300); 
+                // PROCESSA TODOS OS CHATS (Sem limite de 300)
+                const topChats = sortedChats; 
                 
                 for (let i = 0; i < topChats.length; i++) {
                     const [chatJid, chatMsgs] = topChats[i];
                     // Ordena mensagens cronologicamente (antiga -> nova)
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                     
-                    // Salva apenas as últimas 15 mensagens de cada chat (Estratégia Fast Sync)
-                    const msgsToSave = chatMsgs.slice(-15); 
+                    // Salva apenas as últimas 10 mensagens de cada chat (Solicitado pelo usuário)
+                    const msgsToSave = chatMsgs.slice(-10); 
 
                     for (const msg of msgsToSave) {
                         const mapData = contactsMap.get(chatJid);
@@ -305,10 +323,14 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         // isRealtime = false (Não baixa mídia pesada no histórico para ser rápido)
                         await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName);
                     }
-                    await new Promise(r => setTimeout(r, 5));
+                    
+                    // FIX: Delay tático agressivo para evitar starvation do Event Loop
+                    // Pausa 200ms a cada 5 chats processados.
+                    if (i % 5 === 0) await new Promise(r => setTimeout(r, 200));
+                    else await new Promise(r => setTimeout(r, 10));
 
-                    // Atualiza progresso visualmente
-                    if (i % 10 === 0 || i === topChats.length - 1) {
+                    // Atualiza progresso visualmente a cada 20 chats
+                    if (i % 20 === 0) {
                         const progress = 30 + Math.floor((i / topChats.length) * 65);
                         await updateSyncStatus(sessionId, 'importing_messages', progress);
                     }
@@ -318,20 +340,23 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         } catch (e) {
             console.error("❌ [SYNC ERROR]", e);
         } finally {
-            if (isLatest || historyChunkCounter >= 2) {
+            // Se for o último chunk (isLatest), finaliza e marca como completed.
+            if (isLatest) {
                 await updateSyncStatus(sessionId, 'completed', 100);
+                console.log(`✅ [HISTÓRICO] Sincronização Total Concluída.`);
             } else {
                 await updateSyncStatus(sessionId, 'importing_messages', 99);
+                console.log(`⏳ [HISTÓRICO] Chunk finalizado, aguardando próximo...`);
             }
         }
     });
 
     // -----------------------------------------------------------
-    // 4. MENSAGENS EM TEMPO REAL (UPSERT) - [CORE FEATURE]
+    // 4. MENSAGENS EM TEMPO REAL (UPSERT)
     // -----------------------------------------------------------
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         for (const msg of messages) {
-            // 4.1 TRATAMENTO DE REVOKE (Apagar para todos)
+            // 4.1 REVOKE
             const protocolMsg = msg.message?.protocolMessage;
             if (protocolMsg && protocolMsg.type === 0) {
                 const keyToRevoke = protocolMsg.key;
@@ -349,29 +374,24 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 continue; 
             }
 
-            // 4.2 Ignora se não tiver mensagem
             if (!msg.message) continue;
-            
-            // 4.3 Cache para evitar duplicidade instantânea
             if (!addToCache(msg.key.id)) continue;
 
             const clean = unwrapMessage(msg);
             const jid = normalizeJid(clean.key.remoteJid);
             
-            // 4.4 Atualiza foto/nome se necessário (Background)
             if (jid && !clean.key.fromMe) { 
                  fetchProfilePicSafe(sock, jid).then(url => {
                      if(url) upsertContact(jid, companyId, clean.pushName, url, false);
                  });
             }
             
-            // 4.5 Processa mensagem (Realtime = True -> Baixa mídia)
             await processSingleMessage(clean, sock, companyId, sessionId, true, clean.pushName);
         }
     });
     
     // -----------------------------------------------------------
-    // 5. STATUS DE LEITURA (TICKS) - [CORE FEATURE]
+    // 5. STATUS DE LEITURA (TICKS)
     // -----------------------------------------------------------
     sock.ev.on('message-receipt.update', async (events) => {
         for (const event of events) {
@@ -381,7 +401,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 3: 'read',       // Azul
                 4: 'played'      // Azul (Áudio Ouvido)
             };
-            // Lógica Baileys: Se tem userJid, é status de grupo/individual específico
             const newStatus = statusMap[event.receipt.userJid ? 0 : event.receipt.status] || statusMap[event.receipt.status];
 
             if (!newStatus) continue;
@@ -398,7 +417,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // -----------------------------------------------------------
-    // 6. REAÇÕES (EMOJIS) - [FEATURE SOCIAL]
+    // 6. REAÇÕES (EMOJIS)
     // -----------------------------------------------------------
     sock.ev.on('messages.reaction', async (reactions) => {
         for (const reaction of reactions) {
@@ -417,10 +436,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
             if (msg) {
                 let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
-                // Remove reação anterior desse usuário
                 currentReactions = currentReactions.filter(r => r.actor !== reactorJid);
-                
-                // Se text existe, é uma nova reação (se null, foi removida)
                 if (text) {
                     currentReactions.push({ text, actor: reactorJid, ts: Date.now() });
                 }
@@ -471,10 +487,8 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         const body = getBody(msg.message);
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
         
-        // Mapeamento de Tipos de Mídia
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
-        // Ignora mensagens vazias e sem mídia
         if (!body && !isMedia && type !== 'pollCreationMessageV3') return;
 
         const fromMe = msg.key.fromMe;
@@ -482,18 +496,14 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
         // 2. Garantia de Lead (Anti-Ghost)
         let leadId = null;
-        // Se não for grupo, tenta criar/atualizar lead
         if (jid && !jid.includes('@g.us')) {
-            // Se for realtime, cria lead. Se for histórico, só cria se já existir contato (evita sujar base com lixo antigo)
             leadId = await ensureLeadExists(jid, companyId, forcedName, myJid);
             
-            // Se descobrimos um nome novo em realtime, atualiza o contato
             if (isRealtime && forcedName && jid !== myJid) {
                 await upsertContact(jid, companyId, forcedName, null, false);
             }
         }
         
-        // Em grupos, tenta salvar o nome do participante
         if (jid.includes('@g.us') && msg.key.participant && forcedName) {
              const partJid = normalizeJid(msg.key.participant);
              if (partJid !== myJid) {
@@ -501,9 +511,8 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
              }
         }
 
-        // 3. Processamento de Mídia (Download & Upload)
+        // 3. Processamento de Mídia
         let mediaUrl = null;
-        // Só baixa mídia em Realtime para economizar banda/espaço na importação inicial
         if (isMedia && isRealtime) {
             try {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger });
@@ -515,24 +524,22 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
                 else if (msg.message?.documentMessage) mimeType = msg.message.documentMessage.mimetype;
                 else if (msg.message?.stickerMessage) mimeType = 'image/webp';
 
-                // Upload para Supabase Storage
                 mediaUrl = await uploadMedia(buffer, mimeType);
             } catch (e) {
                 console.error("Erro download media:", e);
             }
         }
 
-        // 4. Detecção de PTT (Áudio Gravado na Hora)
+        // 4. Detecção de PTT
         let messageTypeClean = type?.replace('Message', '') || 'text';
         if (type === 'audioMessage' && msg.message.audioMessage.ptt) {
-            messageTypeClean = 'ptt'; // Marca como PTT para o frontend renderizar waveform
+            messageTypeClean = 'ptt'; 
         }
-        // Polls
         if (type === 'pollCreationMessageV3' || type === 'pollCreationMessage') {
             messageTypeClean = 'poll';
         }
 
-        // 5. Tratamento do Conteúdo (JSON para Polls/Locations)
+        // 5. Tratamento do Conteúdo
         let finalContent = body || (mediaUrl ? '[Mídia]' : '');
         
         if (messageTypeClean === 'poll') {
@@ -546,7 +553,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
             }
         }
 
-        // 6. Persistência (Upsert Message)
+        // 6. Persistência
         await upsertMessage({
             company_id: companyId,
             session_id: sessionId,
