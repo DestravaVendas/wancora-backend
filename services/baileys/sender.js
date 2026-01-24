@@ -35,7 +35,7 @@ export const sendMessage = async ({
     const sock = session.sock;
     const jid = formatJid(to);
 
-    // 1. Checagem de Segurança: O número existe? (Ignora grupos)
+    // 1. Checagem de Segurança
     if (!jid.includes('@g.us')) {
         try {
             const [result] = await sock.onWhatsApp(jid);
@@ -48,77 +48,63 @@ export const sendMessage = async ({
     try {
         console.log(`🤖 [HUMAN-SEND] Iniciando protocolo para: ${jid} (Tipo: ${type})`);
 
-        // 2. Delay Inicial (Simula tempo de reação)
-        await delay(randomDelay(500, 1500));
-
-        // 3. Simula "Digitando..." ou "Gravando..."
+        // 2. Delay e Presença
+        await delay(randomDelay(300, 800));
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
         await sock.sendPresenceUpdate(presenceType, jid);
 
-        // 4. Delay de Produção (Baseado no tamanho do conteúdo)
-        let typingTime = 2000; // Mínimo 2s
+        let typingTime = 1500; 
         if (type === 'text' && content) {
-            const textLen = content.length;
-            typingTime = Math.min(textLen * 100, 10000); 
-        } else if (type === 'audio') {
-            typingTime = randomDelay(3000, 6000); 
+            typingTime = Math.min(content.length * 50, 5000); 
         }
-
         await delay(typingTime);
-
-        // 5. Pausa (Momento antes de enviar)
         await sock.sendPresenceUpdate('paused', jid);
 
-        // 6. Montagem do Payload e Envio
         let sentMsg;
 
         switch (type) {
             case 'pix':
-                // FIX CRÍTICO PIX V2: Estrutura Interactive Message Native Flow
+                // CORREÇÃO CRÍTICA PIX: Usar viewOnceMessage com interactiveMessage (Native Flow)
+                // A estrutura precisa estar EXATAMENTE como abaixo para funcionar em Android/iOS
                 const pixKey = content || "CHAVE_NAO_INFORMADA";
                 console.log(`💲 [PIX] Gerando payload Native Flow para: ${pixKey}`);
 
-                // Estrutura Proto Exata para Botão de Cópia
-                const buttonParams = JSON.stringify({
-                    display_text: "COPIAR CHAVE PIX",
-                    id: "copy_code",
-                    copy_code: pixKey
-                });
-
-                const interactiveMessage = {
-                    body: { text: "Copie a chave abaixo para realizar o pagamento." },
-                    footer: { text: "Wancora Secure Pay" },
-                    header: { title: "PAGAMENTO VIA PIX", subtitle: "Instantâneo", hasMediaAttachment: false },
-                    nativeFlowMessage: {
-                        buttons: [{
-                            name: "cta_copy",
-                            buttonParamsJson: buttonParams
-                        }]
-                    }
-                };
-
-                const messagePayload = {
+                const msgParams = {
                     viewOnceMessage: {
                         message: {
-                            interactiveMessage: interactiveMessage
+                            messageContextInfo: {
+                                deviceListMetadata: {},
+                                deviceListMetadataVersion: 2
+                            },
+                            interactiveMessage: {
+                                body: { text: "Copie a chave abaixo para realizar o pagamento." },
+                                footer: { text: "Wancora Secure Pay" },
+                                header: { 
+                                    title: "PAGAMENTO VIA PIX", 
+                                    subtitle: "Instantâneo", 
+                                    hasMediaAttachment: false 
+                                },
+                                nativeFlowMessage: {
+                                    buttons: [{
+                                        name: "cta_copy",
+                                        buttonParamsJson: JSON.stringify({
+                                            display_text: "COPIAR CHAVE PIX",
+                                            id: "copy_code",
+                                            copy_code: pixKey
+                                        })
+                                    }]
+                                }
+                            }
                         }
                     }
                 };
 
-                // Gera a mensagem raw usando o userJid da sessão conectada
-                const waMessage = await generateWAMessageFromContent(jid, messagePayload, { 
+                const waMessage = await generateWAMessageFromContent(jid, msgParams, { 
                     userJid: sock.user.id 
                 });
                 
-                // Envia via Relay com tratamento de erro específico
-                try {
-                    await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
-                    sentMsg = waMessage;
-                    console.log(`✅ [PIX] Enviado com sucesso via Relay. ID: ${waMessage.key.id}`);
-                } catch (relayError) {
-                    console.error(`❌ [PIX] Erro no relayMessage:`, relayError);
-                    throw new Error(`Falha no envio do Card Pix: ${relayError.message}`);
-                }
+                await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
+                sentMsg = waMessage;
                 break;
 
             case 'text':
@@ -143,12 +129,10 @@ export const sendMessage = async ({
 
             case 'poll':
                 if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
-                console.log(`📊 [POLL] Criando Enquete: ${poll.name}`);
-                
                 sentMsg = await sock.sendMessage(jid, {
                     poll: {
                         name: poll.name,
-                        values: poll.options, // Array de strings simples
+                        values: poll.options,
                         selectableCount: Number(poll.selectableOptionsCount) || 1
                     }
                 });
@@ -182,9 +166,6 @@ export const sendMessage = async ({
 
     } catch (err) {
         console.error("❌ Erro no envio seguro:", err);
-        if (session && session.sock) {
-            await sock.sendPresenceUpdate('paused', jid).catch(() => {});
-        }
         throw err;
     }
 };
