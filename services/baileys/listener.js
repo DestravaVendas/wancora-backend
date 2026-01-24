@@ -1,4 +1,3 @@
-
 import {
     upsertContact,
     upsertMessage,
@@ -186,44 +185,36 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // -----------------------------------------------------------
-    // 3. HISTÓRICO DE MENSAGENS (FAST SYNC) - [CORE FEATURE]
+    // 3. HISTÓRICO DE MENSAGENS (FAST SYNC - LOTE ÚNICO)
     // -----------------------------------------------------------
     sock.ev.on('messaging-history.set', async ({ contacts, messages, isLatest }) => {
         
-        // --- TRAVA DE SEGURANÇA: RECONEXÃO ---
-        // Verifica se esta sessão já foi totalmente sincronizada antes.
-        // Se sim, pulamos o processamento pesado para evitar ETIMEDOUT e duplicação.
-        const { data: currentInstance } = await supabase
-            .from('instances')
-            .select('sync_status')
-            .eq('session_id', sessionId)
-            .eq('company_id', companyId)
-            .single();
-
+        // TRAVA DE SEGURANÇA: Se já está completed, ignora tudo.
+        const { data: currentInstance } = await supabase.from('instances').select('sync_status').eq('session_id', sessionId).eq('company_id', companyId).single();
         if (currentInstance?.sync_status === 'completed') {
-            console.log(`⏩ [HISTÓRICO] Ignorando sincronização: Instância ${sessionId} já está 'completed'.`);
+            console.log(`⏩ [HISTÓRICO] Sessão já sincronizada. Ignorando evento.`);
             return;
         }
-        // ---------------------------------------
 
         historyChunkCounter++;
-        const itemCount = (contacts?.length || 0) + (messages?.length || 0);
-        console.log(`📚 [HISTÓRICO] Lote ${historyChunkCounter} | Itens: ${itemCount} | isLatest: ${isLatest}`);
-
-        // Se o chunk vier vazio, finaliza se for o último
-        if (itemCount === 0) {
-            if (isLatest) await updateSyncStatus(sessionId, 'completed', 100);
+        
+        // REGRA: Apenas 1 lote. Se vier o segundo, ignoramos e forçamos 100%.
+        if (historyChunkCounter > 1) {
+            console.log(`⏩ [HISTÓRICO] Ignorando lote extra ${historyChunkCounter} (Regra Lote Único).`);
+            // FORÇA FINALIZAÇÃO PARA DESTRAVAR A TELA
+            await updateSyncStatus(sessionId, 'completed', 100);
             return;
         }
+
+        console.log(`📚 [HISTÓRICO] Processando Lote Único (Recentes)...`);
 
         try {
             const contactsMap = new Map();
 
-            // A. Processamento de Contatos (Batch)
+            // A. Processamento de Contatos (Batch 10)
             if (contacts && contacts.length > 0) {
                 await updateSyncStatus(sessionId, 'importing_contacts', 10);
                 
-                // Mapeia primeiro
                 contacts.forEach(c => {
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
@@ -235,22 +226,19 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     });
                 });
 
-                // Executa Upsert em Lotes menores para aliviar o banco
                 const uniqueJids = Array.from(contactsMap.keys());
-                const BATCH_SIZE = 10; // Reduzido de 20 para 10 para evitar timeouts
+                const BATCH_SIZE = 10; 
                 
                 for (let i = 0; i < uniqueJids.length; i += BATCH_SIZE) {
                     const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
                     await Promise.all(batchJids.map(async (jid) => {
                         let data = contactsMap.get(jid);
                         
-                        // Tenta enriquecer Grupos sem nome
                         if (jid.includes('@g.us') && !data.name) {
                             const groupName = await fetchGroupSubjectSafe(sock, jid);
                             if (groupName) data.name = groupName;
                         }
                         
-                        // Tenta foto se não tiver (bem leve)
                         if (!data.imgUrl) {
                             const freshPic = await fetchProfilePicSafe(sock, jid);
                             if (freshPic) data.imgUrl = freshPic;
@@ -259,34 +247,28 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                     }));
                     
-                    // FIX: Pausa de 100ms a cada lote de contatos. 
-                    // Vital para evitar ETIMEDOUT no Redis/DB.
-                    await new Promise(r => setTimeout(r, 100)); 
+                    // Delay para liberar o Event Loop e evitar ETIMEDOUT
+                    await new Promise(r => setTimeout(r, 150)); 
                 }
             }
 
-            // B. Name Hunter em Mensagens (Extrai nomes de quem não está na agenda)
+            // B. Name Hunter (Simplificado)
             if (messages && messages.length > 0) {
                 messages.forEach(msg => {
                     if (msg.key.fromMe) return;
                     const jid = normalizeJid(msg.key.remoteJid);
                     if (!jid) return;
-                    
                     const existing = contactsMap.get(jid);
                     if ((!existing || !existing.name) && msg.pushName) {
-                        if (existing) existing.name = msg.pushName; 
-                        else contactsMap.set(jid, { name: msg.pushName, imgUrl: null, isFromBook: false, lid: null });
-                        
                         upsertContact(jid, companyId, msg.pushName, null, false);
                     }
                 });
             }
 
-            // C. Processamento de Mensagens
+            // C. Mensagens (Regra: Max 10 por chat)
             if (messages && messages.length > 0) {
                 await updateSyncStatus(sessionId, 'importing_messages', 30);
                 
-                // Agrupa mensagens por Chat para processar ordenado
                 const messagesByChat = new Map();
                 messages.forEach(msg => {
                     const unwrapped = unwrapMessage(msg);
@@ -298,40 +280,29 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     messagesByChat.get(jid).push(unwrapped);
                 });
 
-                // Ordena chats pelos mais recentes primeiro
-                const sortedChats = Array.from(messagesByChat.entries()).sort(([, msgsA], [, msgsB]) => {
-                    const tA = Math.max(...msgsA.map(m => m.messageTimestamp || 0));
-                    const tB = Math.max(...msgsB.map(m => m.messageTimestamp || 0));
-                    return tB - tA; 
-                });
-
-                // PROCESSA TODOS OS CHATS (Sem limite de 300)
-                const topChats = sortedChats; 
+                const chats = Array.from(messagesByChat.entries());
                 
-                for (let i = 0; i < topChats.length; i++) {
-                    const [chatJid, chatMsgs] = topChats[i];
-                    // Ordena mensagens cronologicamente (antiga -> nova)
+                for (let i = 0; i < chats.length; i++) {
+                    const [chatJid, chatMsgs] = chats[i];
+                    
+                    // Ordena cronologicamente
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                     
-                    // Salva apenas as últimas 10 mensagens de cada chat (Solicitado pelo usuário)
+                    // CORTA: Apenas as últimas 10 mensagens (REGRA DE PERFORMANCE)
                     const msgsToSave = chatMsgs.slice(-10); 
 
                     for (const msg of msgsToSave) {
                         const mapData = contactsMap.get(chatJid);
                         const forcedName = msg.pushName || (mapData ? mapData.name : null);
-                        
-                        // isRealtime = false (Não baixa mídia pesada no histórico para ser rápido)
                         await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName);
                     }
                     
-                    // FIX: Delay tático agressivo para evitar starvation do Event Loop
-                    // Pausa 200ms a cada 5 chats processados.
+                    // Delay agressivo a cada 5 chats para manter conexão do banco viva
                     if (i % 5 === 0) await new Promise(r => setTimeout(r, 200));
-                    else await new Promise(r => setTimeout(r, 10));
+                    else await new Promise(r => setTimeout(r, 20));
 
-                    // Atualiza progresso visualmente a cada 20 chats
-                    if (i % 20 === 0) {
-                        const progress = 30 + Math.floor((i / topChats.length) * 65);
+                    if (i % 10 === 0) {
+                        const progress = 30 + Math.floor((i / chats.length) * 65);
                         await updateSyncStatus(sessionId, 'importing_messages', progress);
                     }
                 }
@@ -340,14 +311,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         } catch (e) {
             console.error("❌ [SYNC ERROR]", e);
         } finally {
-            // Se for o último chunk (isLatest), finaliza e marca como completed.
-            if (isLatest) {
-                await updateSyncStatus(sessionId, 'completed', 100);
-                console.log(`✅ [HISTÓRICO] Sincronização Total Concluída.`);
-            } else {
-                await updateSyncStatus(sessionId, 'importing_messages', 99);
-                console.log(`⏳ [HISTÓRICO] Chunk finalizado, aguardando próximo...`);
-            }
+            // FORCE COMPLETED: Garante que a barra de progresso vá para 100% e suma
+            // Independente de erro ou sucesso, liberamos a UI.
+            await updateSyncStatus(sessionId, 'completed', 100);
+            console.log(`✅ [HISTÓRICO] Sincronização Rápida Finalizada (100%).`);
         }
     });
 
