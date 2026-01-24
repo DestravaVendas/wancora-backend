@@ -50,45 +50,48 @@ export const sendMessage = async (sessionId, to, payload) => {
     }
 };
 
-// --- NOVO: Votar em Enquete ---
+// --- FIX: Votar em Enquete (Protocolo Baileys v6+) ---
 export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, optionId) => {
     try {
         const session = sessions.get(sessionId);
         if (!session?.sock) throw new Error("Sessão desconectada.");
 
-        // 1. Recuperar a mensagem original do banco para pegar os hashes das opções
-        // PORM, o Baileys exige a chave da mensagem original (pollCreationMessage).
+        // 1. Recuperar a mensagem original do banco para pegar o TEXTO da opção
         const { data: pollMsg } = await supabase
             .from('messages')
             .select('whatsapp_id, from_me, content')
-            .eq('id', pollId) // pollId aqui é o ID do Supabase da mensagem
+            .eq('id', pollId) 
             .single();
 
         if (!pollMsg) throw new Error("Enquete não encontrada no banco.");
 
-        // Reconstruir a chave original do Baileys
-        const originalKey = {
-            remoteJid: remoteJid,
-            id: pollMsg.whatsapp_id,
-            fromMe: pollMsg.from_me
-        };
+        // 2. Extrair o texto da opção selecionada (Baileys exige o valor, não o índice)
+        let pollContent;
+        try {
+            pollContent = typeof pollMsg.content === 'string' ? JSON.parse(pollMsg.content) : pollMsg.content;
+        } catch (e) {
+            throw new Error("Conteúdo da enquete corrompido.");
+        }
 
-        // Extrair o conteúdo da enquete para saber os metadados
-        const pollContent = JSON.parse(pollMsg.content);
-        
-        // Enviar voto pelo Socket
+        const selectedOptionText = pollContent.options?.[optionId];
+        if (!selectedOptionText) throw new Error(`Opção inválida (Index: ${optionId}).`);
+
+        // 3. Enviar voto pelo Socket com a chave correta
         await session.sock.sendMessage(remoteJid, {
             poll: {
-                key: originalKey,
                 vote: {
-                    singleSelect: pollContent.selectableOptionsCount === 1,
-                    selectedOptions: [optionId] // Baileys moderno lida com index se configurado corretamente ou tentamos hash
+                    key: {
+                        id: pollMsg.whatsapp_id,
+                        remoteJid: remoteJid,
+                        fromMe: pollMsg.from_me
+                    },
+                    selectedOptions: [selectedOptionText] // CORREÇÃO: Envia array de strings
                 }
             }
         });
 
-        // Salvar voto no banco localmente (Optimistic)
-        const myJid = session.sock.user.id.split(':')[0] + '@s.whatsapp.net';
+        // 4. Salvar voto no banco localmente (Optimistic Update)
+        const myJid = session.sock.user?.id.split(':')[0] + '@s.whatsapp.net';
         await savePollVote({
             companyId,
             msgId: pollMsg.whatsapp_id,
@@ -100,6 +103,42 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
 
     } catch (error) {
         console.error(`[Controller] Erro ao votar:`, error);
+        throw error;
+    }
+};
+
+// --- NOVO: Enviar Reação (Emoji) ---
+export const sendReaction = async (sessionId, companyId, remoteJid, msgId, reaction) => {
+    try {
+        const session = sessions.get(sessionId);
+        if (!session?.sock) throw new Error("Sessão desconectada.");
+
+        // Busca mensagem alvo para pegar a Key correta (ID + fromMe)
+        const { data: targetMsg } = await supabase
+            .from('messages')
+            .select('whatsapp_id, from_me')
+            .eq('id', msgId) // ID do Supabase
+            .single();
+
+        if (!targetMsg) throw new Error("Mensagem alvo não encontrada.");
+
+        const key = {
+            remoteJid: remoteJid,
+            id: targetMsg.whatsapp_id,
+            fromMe: targetMsg.from_me
+        };
+
+        // Envia reação via Socket
+        await session.sock.sendMessage(remoteJid, {
+            react: {
+                text: reaction, // Emoji ou '' para remover
+                key: key
+            }
+        });
+
+        return { success: true };
+    } catch (error) {
+        console.error(`[Controller] Erro ao reagir:`, error);
         throw error;
     }
 };
