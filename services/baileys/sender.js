@@ -5,6 +5,13 @@ import { delay } from '@whiskeysockets/baileys';
 // Helper: Delay Aleatório
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
 
+// Formata JID
+const formatJid = (to) => {
+    if (!to) throw new Error("Destinatário inválido");
+    if (to.includes('@')) return to;
+    return `${to.replace(/\D/g, '')}@s.whatsapp.net`;
+};
+
 /**
  * Envia mensagem via Baileys com Protocolo de Humanização
  */
@@ -170,14 +177,9 @@ export const sendMessage = async ({
     } catch (err) {
         console.error("❌ Erro no envio seguro:", err);
         // Garante que para de digitar se der erro
-        await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+        if (session && session.sock) {
+            await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+        }
         throw err;
     }
-};
-
-// Formata JID
-const formatJid = (to) => {
-    if (!to) throw new Error("Destinatário inválido");
-    if (to.includes('@')) return to;
-    return `${to.replace(/\D/g, '')}@s.whatsapp.net`;
 };
