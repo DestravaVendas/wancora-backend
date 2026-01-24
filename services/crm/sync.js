@@ -1,3 +1,4 @@
+
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
@@ -260,8 +261,39 @@ export const upsertMessage = async (msgData) => {
     }
 };
 
+// --- SAVE POLL VOTE (Real Implementation) ---
+export const savePollVote = async ({ companyId, msgId, voterJid, optionId }) => {
+    try {
+        const { data: msg } = await supabase
+            .from('messages')
+            .select('poll_votes')
+            .eq('whatsapp_id', msgId)
+            .eq('company_id', companyId)
+            .single();
+
+        if (msg) {
+            let currentVotes = Array.isArray(msg.poll_votes) ? msg.poll_votes : [];
+            // Remove voto anterior do mesmo usuário para evitar duplicidade lógica
+            currentVotes = currentVotes.filter(v => v.voterJid !== voterJid);
+            // Adiciona novo voto
+            currentVotes.push({
+                voterJid,
+                optionId,
+                ts: Date.now()
+            });
+
+            await supabase
+                .from('messages')
+                .update({ poll_votes: currentVotes })
+                .eq('whatsapp_id', msgId)
+                .eq('company_id', companyId);
+        }
+    } catch (e) {
+        console.error("Erro saving poll vote:", e);
+    }
+};
+
 // Placeholders para manter compatibilidade
-export const savePollVote = async (msg, companyId) => {};
 export const deleteSessionData = async (sessionId) => {
     await supabase.from('instances').update({ status: 'disconnected' }).eq('session_id', sessionId);
     await supabase.from('baileys_auth_state').delete().eq('session_id', sessionId);
