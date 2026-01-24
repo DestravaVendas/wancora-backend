@@ -241,18 +241,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // --- MENSAGENS EM TEMPO REAL (MENSAGEM NOVA) ---
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         for (const msg of messages) {
-            // Protocol Messages (Revoke/Edit) não têm content normal, mas precisam ser processadas
-            const isProtocol = msg.message?.protocolMessage;
-            
-            // Se não for Protocol e não tiver mensagem, pula
-            if (!msg.message && !isProtocol) continue;
-            
-            // Dedup
-            if (!addToCache(msg.key.id)) continue;
-
-            // 1. TRATAMENTO DE REVOKE (Apagar para todos)
-            if (isProtocol && isProtocol.type === 0) { // TYPE 0 = REVOKE
-                const keyToRevoke = isProtocol.key;
+            // TRATAMENTO DE REVOKE (Protocol Message type 0)
+            const protocolMsg = msg.message?.protocolMessage;
+            if (protocolMsg && protocolMsg.type === 0) {
+                const keyToRevoke = protocolMsg.key;
                 if (keyToRevoke && keyToRevoke.id) {
                     console.log(`🗑️ [REVOKE] Mensagem apagada: ${keyToRevoke.id}`);
                     await supabase.from('messages')
@@ -264,8 +256,12 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         .eq('whatsapp_id', keyToRevoke.id)
                         .eq('company_id', companyId);
                 }
-                continue; // Não processa como mensagem nova
+                continue; 
             }
+
+            if (!msg.message) continue;
+            // Evita processar a mesma mensagem duas vezes
+            if (!addToCache(msg.key.id)) continue;
 
             const clean = unwrapMessage(msg);
             const jid = normalizeJid(clean.key.remoteJid);
@@ -282,6 +278,30 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         }
     });
     
+    // --- STATUS DE LEITURA (TICKS AZUIS) ---
+    sock.ev.on('message-receipt.update', async (events) => {
+        for (const event of events) {
+            const statusMap = {
+                1: 'sent',       // Server Ack
+                2: 'delivered',  // Recebido no cel
+                3: 'read',       // Lido (Azul)
+                4: 'played'      // Áudio ouvido
+            };
+            const newStatus = statusMap[event.receipt.userJid ? 0 : event.receipt.status] || statusMap[event.receipt.status];
+
+            if (!newStatus) continue;
+
+            const updates = { status: newStatus };
+            if (newStatus === 'delivered') updates.delivered_at = new Date();
+            if (newStatus === 'read') updates.read_at = new Date();
+
+            await supabase.from('messages')
+                .update(updates)
+                .eq('whatsapp_id', event.key.id)
+                .eq('company_id', companyId);
+        }
+    });
+
     // --- REAÇÕES (EMOJIS) ---
     sock.ev.on('messages.reaction', async (reactions) => {
         for (const reaction of reactions) {
@@ -291,52 +311,30 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const myJid = normalizeJid(sock.user?.id);
             const reactorJid = normalizeJid(reaction.key.participant || reaction.key.remoteJid || myJid);
 
-            // Se text for null/vazio, é remoção de reação
-            if (!text) {
-                // Remove reação deste usuário (Lógica simplificada: lê array, filtra e salva)
-                // OBS: PostgreSQL suporta remoção em JSONB, mas leitura+escrita é mais seguro via JS aqui
-                const { data: msg } = await supabase.from('messages').select('reactions').eq('whatsapp_id', key.id).eq('company_id', companyId).single();
-                if (msg) {
-                    const newReactions = (msg.reactions || []).filter(r => r.actor !== reactorJid);
-                    await supabase.from('messages').update({ reactions: newReactions }).eq('whatsapp_id', key.id).eq('company_id', companyId);
+            // Busca reações atuais
+            const { data: msg } = await supabase
+                .from('messages')
+                .select('reactions')
+                .eq('whatsapp_id', key.id)
+                .eq('company_id', companyId)
+                .single();
+
+            if (msg) {
+                let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
+                // Remove reação anterior deste ator
+                currentReactions = currentReactions.filter(r => r.actor !== reactorJid);
+                
+                // Se text existe, é uma nova reação (se null, foi remoção)
+                if (text) {
+                    currentReactions.push({ text, actor: reactorJid, ts: Date.now() });
                 }
-            } else {
-                // Adiciona/Atualiza reação
-                const { data: msg } = await supabase.from('messages').select('reactions').eq('whatsapp_id', key.id).eq('company_id', companyId).single();
-                if (msg) {
-                    const currentReactions = msg.reactions || [];
-                    // Remove reação anterior desse ator se houver
-                    const others = currentReactions.filter(r => r.actor !== reactorJid);
-                    others.push({ text, actor: reactorJid, ts: Date.now() });
-                    
-                    await supabase.from('messages').update({ reactions: others }).eq('whatsapp_id', key.id).eq('company_id', companyId);
-                }
+                
+                await supabase
+                    .from('messages')
+                    .update({ reactions: currentReactions })
+                    .eq('whatsapp_id', key.id)
+                    .eq('company_id', companyId);
             }
-        }
-    });
-
-    // --- STATUS DE LEITURA (TICKS REAIS) ---
-    sock.ev.on('message-receipt.update', async (events) => {
-        for (const event of events) {
-            const statusMap = {
-                1: 'sent',       // Server Ack
-                2: 'delivered',  // Recebido no cel
-                3: 'read',       // Lido (Azul)
-                4: 'played'      // Áudio ouvido
-            };
-            const newStatus = statusMap[event.receipt.userJid ? 0 : event.receipt.status] || statusMap[event.receipt.status]; // Lógica de grupo vs privado
-
-            if (!newStatus) continue;
-
-            const updates = { status: newStatus };
-            // Atualiza timestamps para info
-            if (newStatus === 'delivered') updates.delivered_at = new Date();
-            if (newStatus === 'read') updates.read_at = new Date();
-
-            await supabase.from('messages')
-                .update(updates)
-                .eq('whatsapp_id', event.key.id)
-                .eq('company_id', companyId);
         }
     });
 
