@@ -62,6 +62,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         // 2. Resolve a opção selecionada (Precisa do texto da opção)
         let optionsList = [];
         if (Array.isArray(pollContent.options)) {
+            // Normaliza opções (se vierem como objetos ou strings)
             optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
         } else {
             throw new Error("Estrutura da enquete inválida (sem opções).");
