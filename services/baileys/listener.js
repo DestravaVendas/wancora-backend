@@ -103,7 +103,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         const { connection } = update;
         if (connection === 'open') {
             console.log(`⚡ [LISTENER] Conexão aberta! Forçando status 'importing' imediatamente.`);
-            // Força o status visual para o usuário não ficar esperando o evento 'messaging-history.set'
             await updateSyncStatus(sessionId, 'importing_contacts', 5);
         }
     });
@@ -188,7 +187,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // -----------------------------------------------------------
-    // 3. HISTÓRICO DE MENSAGENS (FAST SYNC)
+    // 3. HISTÓRICO DE MENSAGENS (GRANULAR PROGRESS)
     // -----------------------------------------------------------
     sock.ev.on('messaging-history.set', async ({ contacts, messages, isLatest }) => {
         
@@ -209,9 +208,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         try {
             const contactsMap = new Map();
 
-            // A. Contatos
+            // A. Contatos (Mantém lógica original eficiente)
             if (contacts && contacts.length > 0) {
-                await updateSyncStatus(sessionId, 'importing_contacts', 10);
+                await updateSyncStatus(sessionId, 'importing_contacts', 5);
                 
                 contacts.forEach(c => {
                     const jid = normalizeJid(c.id);
@@ -236,12 +235,14 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         }
                         await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                     }));
-                    await new Promise(r => setTimeout(r, 100)); 
+                    // Pequeno delay para não travar o loop de eventos
+                    await new Promise(r => setTimeout(r, 20)); 
                 }
             }
 
-            // B. Name Hunter
+            // B. Mensagens (Lógica Granular de Progresso)
             if (messages && messages.length > 0) {
+                // Name Hunter (Extração de nomes antes do processamento)
                 messages.forEach(msg => {
                     if (msg.key.fromMe) return;
                     const jid = normalizeJid(msg.key.remoteJid);
@@ -251,12 +252,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         upsertContact(jid, companyId, msg.pushName, null, false);
                     }
                 });
-            }
 
-            // C. Mensagens
-            if (messages && messages.length > 0) {
-                await updateSyncStatus(sessionId, 'importing_messages', 30);
-                
+                // Organização por Chat e Cálculo do Total Real
                 const messagesByChat = new Map();
                 messages.forEach(msg => {
                     const unwrapped = unwrapMessage(msg);
@@ -268,30 +265,54 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     messagesByChat.get(jid).push(unwrapped);
                 });
 
+                // Prepara a lista final aplicando o limite de "Fast Sync" (10 msgs por chat)
                 const chats = Array.from(messagesByChat.entries());
+                let finalMessagesToProcess = [];
                 
-                for (let i = 0; i < chats.length; i++) {
-                    const [chatJid, chatMsgs] = chats[i];
+                chats.forEach(([chatJid, chatMsgs]) => {
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-                    const msgsToSave = chatMsgs.slice(-10); 
+                    const msgsToSave = chatMsgs.slice(-10); // Regra Fast Sync
+                    
+                    // Anexa dados do contato para não precisar buscar depois
+                    const mapData = contactsMap.get(chatJid);
+                    msgsToSave.forEach(m => {
+                        m._forcedName = m.pushName || (mapData ? mapData.name : null);
+                    });
+                    
+                    finalMessagesToProcess.push(...msgsToSave);
+                });
 
-                    for (const msg of msgsToSave) {
-                        const mapData = contactsMap.get(chatJid);
-                        const forcedName = msg.pushName || (mapData ? mapData.name : null);
-                        await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName);
+                const totalMessages = finalMessagesToProcess.length;
+                let processedCount = 0;
+                let lastLoggedPercent = 0;
+
+                console.log(`📥 [SYNC] Total de mensagens para importar: ${totalMessages}`);
+                await updateSyncStatus(sessionId, 'importing_messages', 10); // Começa em 10%
+
+                // Itera sobre a lista plana para ter controle total do progresso
+                for (const msg of finalMessagesToProcess) {
+                    await processSingleMessage(msg, sock, companyId, sessionId, false, msg._forcedName);
+                    processedCount++;
+
+                    // Cálculo de porcentagem
+                    const percent = Math.min(99, Math.floor((processedCount / totalMessages) * 100));
+                    
+                    // Atualiza a cada 2%
+                    if (percent >= lastLoggedPercent + 2) {
+                        console.log(`📥 [SYNC] ${processedCount}/${totalMessages} mensagens ${percent}%`);
+                        await updateSyncStatus(sessionId, 'importing_messages', percent);
+                        lastLoggedPercent = percent;
                     }
                     
-                    if (i % 5 === 0) await new Promise(r => setTimeout(r, 100));
-                    if (i % 10 === 0) {
-                        const progress = 30 + Math.floor((i / chats.length) * 65);
-                        await updateSyncStatus(sessionId, 'importing_messages', progress);
-                    }
+                    // Respiro para o Event Loop a cada 20 mensagens
+                    if (processedCount % 20 === 0) await new Promise(r => setTimeout(r, 10));
                 }
             }
 
         } catch (e) {
             console.error("❌ [SYNC ERROR]", e);
         } finally {
+            // Força 100% no final
             await updateSyncStatus(sessionId, 'completed', 100);
             console.log(`✅ [HISTÓRICO] Sync Finalizado (100%).`);
         }
