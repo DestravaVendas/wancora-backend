@@ -25,7 +25,6 @@ export const sendAppointmentConfirmation = async (req, res) => {
       .select(`
         *,
         leads (name, phone),
-        profiles:user_id (name),
         companies (name)
       `)
       .eq('id', appointmentId)
