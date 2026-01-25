@@ -1,170 +1,140 @@
-import makeWASocket, { fetchLatestBaileysVersion, makeCacheableSignalKeyStore, DisconnectReason, Browsers } from '@whiskeysockets/baileys';
-import pino from 'pino';
+
+import makeWASocket, { 
+    DisconnectReason, 
+    fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore,
+    Browsers,
+    isJidBroadcast
+} from '@whiskeysockets/baileys';
 import { useSupabaseAuthState } from '../../auth/supabaseAuth.js';
 import { setupListeners } from './listener.js';
-import { deleteSessionData, updateInstance } from '../crm/sync.js';
+import { deleteSessionData, updateInstanceStatus } from '../crm/sync.js';
+import pino from 'pino';
 
+// Mapa em memória para manter os sockets ativos
+// Chave: sessionId, Valor: { sock, companyId }
 export const sessions = new Map();
-const retries = new Map();
-const reconnectTimers = new Map();
 
+// Logger silencioso para produção (mude para 'info' ou 'debug' se precisar debugar o Baileys)
 const logger = pino({ level: 'silent' });
 
 export const startSession = async (sessionId, companyId) => {
-    console.log(`[START] Sessão ${sessionId} (Empresa: ${companyId})`);
-
-    // Limpa sessão anterior da memória se existir
-    if (sessions.has(sessionId)) {
-        await deleteSession(sessionId);
-    }
-
+    // 1. Recupera estado de autenticação do Banco (PostgreSQL)
     const { state, saveCreds } = await useSupabaseAuthState(sessionId);
     
-    let version = [2, 3000, 1015901307];
-    try { 
-        const v = await fetchLatestBaileysVersion(); 
-        version = v.version; 
-    } catch (e) {
-        console.warn('⚠️ Falha ao buscar versão do Baileys, usando fallback.');
-    }
+    // Busca versão mais recente para evitar erro de "WhatsApp desatualizado"
+    const { version } = await fetchLatestBaileysVersion();
 
+    console.log(`🔌 [CONNECTION] Iniciando sessão ${sessionId} (v${version.join('.')}) - Empresa: ${companyId}`);
+
+    // 2. Configuração do Socket (Blindagem Anti-Ban e Performance)
     const sock = makeWASocket({
         version,
         logger,
-        printQRInTerminal: false, // OBRIGATÓRIO: false (pois salvamos no banco)
+        printQRInTerminal: false, // QR vai para o banco, não terminal
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
-        // CORREÇÃO PONTUAL: Usar Ubuntu resolve o Timeout 408 no Render
+        // TRUQUE CRÍTICO: Mimetiza um Linux Desktop para maior estabilidade no Render
+        // Isso evita o erro 408 Request Timeout durante o pareamento
         browser: Browsers.ubuntu("Chrome"), 
-        syncFullHistory: true, 
+        
+        // Configurações de Sync
+        syncFullHistory: true, // Necessário para importar conversas antigas
         markOnlineOnConnect: true,
-        connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 30000,
-        getMessage: async () => {
+        generateHighQualityLinkPreview: true,
+        
+        // Timeouts generosos para evitar quedas em conexões lentas
+        defaultQueryTimeoutMs: 60000,
+        retryRequestDelayMs: 2500,
+        keepAliveIntervalMs: 15000, 
+        
+        // Ignora mensagens de status/stories para economizar banda e evitar lixo no banco
+        shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter'),
+        
+        getMessage: async (key) => {
+            // Fallback para evitar erros de decriptação em mensagens antigas (Retry)
+            // Em produção real, você buscaria a mensagem no banco 'messages' se disponível
             return { conversation: 'hello' }; 
         }
     });
 
-    sock.companyId = companyId;
-    sock.sessionId = sessionId;
+    // Armazena referência em memória para acesso rápido pelos Controllers
     sessions.set(sessionId, { sock, companyId });
 
-    // Salva credenciais (tokens) sempre que atualizarem
-    sock.ev.on("creds.update", saveCreds);
+    // 3. Inicializa os Ouvintes de Eventos (O Cérebro)
+    // Passamos o sock para configurar os eventos (mensagens, presença, etc)
+    setupListeners({ sock, sessionId, companyId });
 
-    // --- LISTENER DE CONEXÃO (Responsável pelo QR Code) ---
-    sock.ev.on("connection.update", async (update) => {
+    // 4. Gestão de Eventos de Conexão (Ciclo de Vida)
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
-        // 1. SE RECEBER QR CODE, ATUALIZA O BANCO IMEDIATAMENTE
+
+        // A) QR CODE GERADO
         if (qr) {
-            console.log(`[QR CODE] Novo QR gerado para ${sessionId}`);
-            // Usamos try/catch para evitar crash se a instância tiver sido deletada
-            try {
-                await updateInstance(sessionId, { 
-                    qrcode_url: qr, 
-                    status: 'qrcode',
-                    updated_at: new Date()
-                });
-            } catch (e) {
-                console.error("Erro ao salvar QR:", e.message);
-            }
-        }
-
-        // 2. SE CONECTAR, LIMPA O QR CODE
-        if (connection === "open") {
-            console.log(`[CONECTADO] Sessão ${sessionId} online!`);
-            retries.set(sessionId, 0);
-            
-            await updateInstance(sessionId, { 
-                status: "connected", 
-                qrcode_url: null, 
-                updated_at: new Date() 
+            console.log(`📡 [QR CODE] Novo QR gerado para ${sessionId}`);
+            // Atualiza tabela para o Frontend exibir o QR
+            await updateInstanceStatus(sessionId, companyId, { 
+                status: 'qrcode', 
+                qrcode_url: qr,
+                sync_status: 'waiting', // Estado inicial
+                sync_percent: 0
             });
-            
-            // Tenta atualizar foto de perfil (Opcional)
-            try {
-               const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-               const pic = await sock.profilePictureUrl(userJid, 'image');
-               if(pic) await updateInstance(sessionId, { profile_pic_url: pic });
-            } catch(e) {}
         }
 
-      // 3. SE DESCONECTAR, TRATA RECONEXÃO
-        if (connection === "close") {
+        // B) CONEXÃO ESTABELECIDA
+        if (connection === 'open') {
+            console.log(`✅ [CONECTADO] Sessão ${sessionId} online!`);
+            
+            // Define status como 'connected' mas sync_status como 'importing'
+            // Isso dispara a barra de progresso GlobalSyncIndicator no Frontend
+            await updateInstanceStatus(sessionId, companyId, { 
+                status: 'connected', 
+                qrcode_url: null, // Limpa QR
+                sync_status: 'importing_contacts', 
+                sync_percent: 5,
+                profile_pic_url: sock.user?.imgUrl || null
+            });
+        }
+
+        // C) DESCONEXÃO / QUEDA
+        if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-
-            // --- CORREÇÃO AQUI ---
-            // Adicionamos '&& statusCode !== 440' para reconhecer que 440 também é fatal
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 440 && statusCode !== 403;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 403;
             
-            console.log(`[DESCONECTADO] Código: ${statusCode}. Reconectar? ${shouldReconnect}`);
-            
-            if (!shouldReconnect) {
-                // Se cair aqui (erros 401, 403 ou 440), entra no fluxo de limpeza
-                console.log(`⛔ Sessão invalidada definitivamente. Limpando dados...`);
-                
-                await updateInstance(sessionId, { status: "disconnected" });
+            console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}. Reconectar? ${shouldReconnect}`);
 
-                // Logout real -> Limpa tudo para permitir novo QR Code
-                await deleteSession(sessionId);
-                await deleteSessionData(sessionId);
+            if (shouldReconnect) {
+                // Estratégia de Backoff Simples: Tenta reconectar em 3s
+                // Apenas removemos o timer se existir para evitar duplicação
+                setTimeout(() => startSession(sessionId, companyId), 3000);
             } else {
-                // Se for queda de internet ou erro 500, tenta voltar
-                handleReconnect(sessionId, companyId);
+                // Logout Definitivo (Ex: Desconectado pelo celular ou Banido)
+                console.log(`🧹 [LOGOUT] Limpando dados da sessão ${sessionId}`);
+                await deleteSession(sessionId, companyId);
             }
         }
     });
-    
-    // Inicia os listeners de mensagens (listener.js)
-    setupListeners({
-        sock,
-        sessionId,
-        companyId
-    });
+
+    // Salva credenciais sempre que atualizarem (rotação de chaves de criptografia)
+    sock.ev.on('creds.update', saveCreds);
 
     return sock;
 };
 
-// Lógica de Reconexão (Backoff)
-const handleReconnect = (sessionId, companyId) => {
-    if (!sessions.has(sessionId)) return; 
-
-    const attempt = (retries.get(sessionId) || 0) + 1;
-    retries.set(sessionId, attempt);
-    
-    // Teto de 60s para evitar loops rápidos
-    const delayMs = Math.min(attempt * 2000, 60000); 
-    console.log(`🔄 [RETRY] ${sessionId} em ${delayMs}ms (Tentativa ${attempt})`);
-
-    const timeoutId = setTimeout(() => {
-        startSession(sessionId, companyId);
-    }, delayMs);
-    
-    reconnectTimers.set(sessionId, timeoutId);
-};
-
-export const deleteSession = async (sessionId) => {
-    console.log(`[DELETE] Parando sessão ${sessionId}`);
-    
-    if (reconnectTimers.has(sessionId)) {
-        clearTimeout(reconnectTimers.get(sessionId));
-        reconnectTimers.delete(sessionId);
-    }
-    retries.delete(sessionId);
-
+// Função para encerrar sessão
+export const deleteSession = async (sessionId, companyId) => {
     const session = sessions.get(sessionId);
-    if (session?.sock) {
+    if (session) {
         try {
-            session.sock.ev.removeAllListeners("connection.update");
-            session.sock.ev.removeAllListeners("creds.update");
-            session.sock.ev.removeAllListeners("messages.upsert");
-            session.sock.end(undefined);
-        } catch (e) {
-            console.error(`Erro ao fechar socket:`, e.message);
+            session.sock.ev.removeAllListeners("connection.update"); // Evita loops
+            session.sock.end(undefined); // Fecha socket graciosamente
+        } catch(e) {
+            console.error("Erro ao fechar socket:", e);
         }
+        sessions.delete(sessionId);
     }
-    sessions.delete(sessionId);
+    // Remove do banco e limpa auth
+    await deleteSessionData(sessionId, companyId);
 };

@@ -1,28 +1,27 @@
-import { initAuthCreds, BufferJSON, proto } from '@whiskeysockets/baileys';
-import { createClient } from "@supabase/supabase-js";
-import dotenv from "dotenv";
 
-dotenv.config();
+import { BufferJSON, initAuthCreds } from '@whiskeysockets/baileys';
+import { createClient } from '@supabase/supabase-js';
 
-// Criamos o cliente aqui para evitar dependência circular com sync.js
-// e garantir que o Auth funcione independente do resto do sistema.
-export const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+// Cliente Supabase Service Role (Acesso total para ler/gravar sessões)
+// É vital usar a Service Key aqui, pois sessões não pertencem a um usuário logado no contexto HTTP do backend
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
 
 // 🛡️ CORREÇÃO CRÍTICA (FIX BUFFER)
-// Transforma objetos { type: 'Buffer', data: [...] } de volta em Buffers reais.
-// Isso impede que o Baileys rejeite a sessão ao reiniciar.
+// O Baileys serializa Buffers como { type: 'Buffer', data: [...] }.
+// Ao ler do JSON do banco, precisamos converter de volta para Buffer nativo do Node.js,
+// caso contrário a criptografia falha silenciosamente.
 const fixBuffer = (data) => {
     return JSON.parse(JSON.stringify(data), BufferJSON.reviver);
 };
 
 export const useSupabaseAuthState = async (sessionId) => {
     
-    // 1. Carrega credenciais iniciais
+    // 1. Carrega credenciais principais (creds.json)
     const fetchCreds = async () => {
         try {
-            const { data } = await supabase
+            const { data, error } = await supabase
                 .from('baileys_auth_state')
                 .select('payload')
                 .eq('session_id', sessionId)
@@ -30,10 +29,15 @@ export const useSupabaseAuthState = async (sessionId) => {
                 .eq('key_id', 'creds')
                 .maybeSingle();
             
-            // APLICA O FIXBUFFER AQUI
+            if (error) {
+                console.error(`[AUTH] Erro ao buscar credenciais para ${sessionId}:`, error.message);
+                return null;
+            }
+            
+            // Aplica o fixBuffer imediatamente após o parse
             return data?.payload ? fixBuffer(JSON.parse(data.payload)) : null;
         } catch (e) {
-            console.error('[AUTH] Erro ao buscar credenciais:', e);
+            console.error('[AUTH] Exceção crítica ao ler credenciais:', e);
             return null;
         }
     };
@@ -44,6 +48,7 @@ export const useSupabaseAuthState = async (sessionId) => {
         state: {
             creds,
             keys: {
+                // Leitura de chaves (Pre-keys, Sessions, SenderKeys, etc.)
                 get: async (type, ids) => {
                     try {
                         const { data } = await supabase
@@ -55,7 +60,7 @@ export const useSupabaseAuthState = async (sessionId) => {
 
                         const result = {};
                         data?.forEach(row => {
-                            // APLICA O FIXBUFFER AQUI TAMBÉM
+                            // Vital: Converter string JSON -> Objeto com Buffers
                             result[row.key_id] = fixBuffer(JSON.parse(row.payload));
                         });
                         return result;
@@ -64,8 +69,9 @@ export const useSupabaseAuthState = async (sessionId) => {
                         return {};
                     }
                 },
+                // Escrita de chaves (Atomic Upsert)
                 set: async (data) => {
-                    const rows = [];
+                    const rowsToUpsert = [];
                     const idsToDelete = [];
 
                     for (const type in data) {
@@ -74,11 +80,11 @@ export const useSupabaseAuthState = async (sessionId) => {
                             
                             if (value) {
                                 // Se tem valor, prepara para salvar (Upsert)
-                                rows.push({
+                                rowsToUpsert.push({
                                     session_id: sessionId,
                                     data_type: type,
                                     key_id: id,
-                                    // BufferJSON.replacer garante que salva corretamente
+                                    // BufferJSON.replacer garante que Buffers virem arrays seguros para JSON
                                     payload: JSON.stringify(value, BufferJSON.replacer),
                                     updated_at: new Date()
                                 });
@@ -89,12 +95,12 @@ export const useSupabaseAuthState = async (sessionId) => {
                         }
                     }
 
-                    // 1. EXECUTA O UPSERT EM LOTE (Muito mais rápido e gera QR Code na hora)
-                    if (rows.length > 0) {
+                    // 1. EXECUTA O UPSERT EM LOTE (Muito mais rápido e gera menos I/O no banco)
+                    if (rowsToUpsert.length > 0) {
                         try {
                             const { error } = await supabase
                                 .from('baileys_auth_state')
-                                .upsert(rows, { onConflict: 'session_id, data_type, key_id' });
+                                .upsert(rowsToUpsert, { onConflict: 'session_id, data_type, key_id' });
                             
                             if (error) console.error('[AUTH DB] Erro ao salvar chaves:', error.message);
                         } catch (e) {
@@ -112,12 +118,15 @@ export const useSupabaseAuthState = async (sessionId) => {
                                     .eq('session_id', sessionId)
                                     .eq('data_type', item.type)
                                     .eq('key_id', item.id);
-                            } catch (e) {}
+                            } catch (e) {
+                                console.error('[AUTH] Erro ao deletar chave:', e);
+                            }
                         }
                     }
                 }
             }
         },
+        // Função para salvar especificamente o arquivo 'creds' (que muda com frequência)
         saveCreds: async () => {
             try {
                 await supabase.from('baileys_auth_state').upsert({

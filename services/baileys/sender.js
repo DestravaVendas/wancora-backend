@@ -2,32 +2,33 @@
 import { sessions } from './connection.js';
 import { delay, generateWAMessageFromContent, proto } from '@whiskeysockets/baileys';
 
-// Helper: Delay Aleatório
+// Helper: Delay Aleatório (Humanização)
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
 
-// Formata JID
+// Formata JID para garantir que @s.whatsapp.net esteja correto
 const formatJid = (to) => {
     if (!to) throw new Error("Destinatário inválido");
-    if (to.includes('@')) return to;
+    if (to.includes('@')) return to; // Já formatado ou Grupo
     return `${to.replace(/\D/g, '')}@s.whatsapp.net`;
 };
 
 /**
  * Envia mensagem via Baileys com Protocolo de Humanização
+ * Centraliza toda lógica de disparo para API e Workers
  */
 export const sendMessage = async ({
     sessionId,
     to,
     type = 'text',
-    content,
-    url,
-    caption,
-    fileName,
-    mimetype,
-    ptt = false,
-    poll,
-    location,
-    contact
+    content,   // Texto principal (ou chave pix, ou json location)
+    url,       // URL da mídia (Storage)
+    caption,   // Legenda da mídia
+    fileName,  // Nome do arquivo para docs
+    mimetype,  // MimeType forçado
+    ptt = false, // Se true, envia como "nota de voz" (onda verde)
+    poll,      // Objeto de enquete { name, options, count }
+    location,  // Objeto de localização { lat, lng }
+    contact    // Objeto de contato { vcard }
 }) => {
     const session = sessions.get(sessionId);
     if (!session || !session.sock) throw new Error(`Sessão ${sessionId} não encontrada ou desconectada.`);
@@ -35,37 +36,49 @@ export const sendMessage = async ({
     const sock = session.sock;
     const jid = formatJid(to);
 
-    // 1. Checagem de Segurança
+    // 1. Checagem de Segurança (Anti-Ban)
+    // Verifica se o número existe no WhatsApp antes de tentar enviar (exceto grupos)
     if (!jid.includes('@g.us')) {
         try {
             const [result] = await sock.onWhatsApp(jid);
             if (result && !result.exists) {
-                console.warn(`⚠️ [ANTI-BAN] Número ${jid} não verificado no WhatsApp.`);
+                console.warn(`⚠️ [ANTI-BAN] Número ${jid} não verificado no WhatsApp. Abortando envio.`);
+                throw new Error("Número não possui WhatsApp.");
             }
-        } catch (e) {}
+        } catch (e) {
+            // Se der erro na checagem (timeout), loga mas tenta enviar mesmo assim (fail-open strategy)
+            console.warn(`[ANTI-BAN] Falha ao verificar existência do número: ${e.message}`);
+        }
     }
 
     try {
         console.log(`🤖 [HUMAN-SEND] Iniciando protocolo para: ${jid} (Tipo: ${type})`);
 
-        // 2. Delay e Presença
+        // 2. Delay Inicial e Simulação de Presença
         await delay(randomDelay(300, 800));
+        
+        // Define se aparece "Digitando..." ou "Gravando áudio..."
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
         await sock.sendPresenceUpdate(presenceType, jid);
 
+        // 3. Tempo de Produção (Simula tempo para escrever/gravar)
         let typingTime = 1500; 
         if (type === 'text' && content) {
+            // ~50ms por caractere, máximo 5 segundos para não travar fila
             typingTime = Math.min(content.length * 50, 5000); 
         }
         await delay(typingTime);
+        
+        // Pausa a presença antes de enviar
         await sock.sendPresenceUpdate('paused', jid);
 
         let sentMsg;
 
+        // 4. Switch de Tipos de Mensagem
         switch (type) {
             case 'pix':
-                // CORREÇÃO CRÍTICA PIX: Usar viewOnceMessage com interactiveMessage (Native Flow)
-                // A estrutura precisa estar EXATAMENTE como abaixo para funcionar em Android/iOS
+                // --- PIX NATIVO (Button Flow) ---
+                // Cria um card visual com botão "COPIAR" nativo do Android/iOS
                 const pixKey = content || "CHAVE_NAO_INFORMADA";
                 console.log(`💲 [PIX] Gerando payload Native Flow para: ${pixKey}`);
 
@@ -99,6 +112,7 @@ export const sendMessage = async ({
                     }
                 };
 
+                // Relay Message é necessário para mensagens complexas não-padrão
                 const waMessage = await generateWAMessageFromContent(jid, msgParams, { 
                     userJid: sock.user.id 
                 });
@@ -120,11 +134,26 @@ export const sendMessage = async ({
                 break;
 
             case 'audio':
-                sentMsg = await sock.sendMessage(jid, { audio: { url }, ptt: !!ptt, mimetype: mimetype || 'audio/mp4' });
+                // ptt: true envia como nota de voz (onda verde)
+                // Se ptt for false, envia como arquivo de áudio (laranja)
+                sentMsg = await sock.sendMessage(jid, { 
+                    audio: { url }, 
+                    ptt: !!ptt, 
+                    mimetype: mimetype || 'audio/mp4' 
+                });
                 break;
 
             case 'document':
-                sentMsg = await sock.sendMessage(jid, { document: { url }, mimetype: mimetype || 'application/pdf', fileName: fileName || 'documento', caption: caption });
+                sentMsg = await sock.sendMessage(jid, { 
+                    document: { url }, 
+                    mimetype: mimetype || 'application/pdf', 
+                    fileName: fileName || 'documento', 
+                    caption: caption 
+                });
+                break;
+
+            case 'sticker':
+                sentMsg = await sock.sendMessage(jid, { sticker: { url } });
                 break;
 
             case 'poll':
@@ -132,7 +161,7 @@ export const sendMessage = async ({
                 sentMsg = await sock.sendMessage(jid, {
                     poll: {
                         name: poll.name,
-                        values: poll.options,
+                        values: poll.options, // Array de strings
                         selectableCount: Number(poll.selectableOptionsCount) || 1
                     }
                 });
@@ -159,13 +188,14 @@ export const sendMessage = async ({
                 break;
 
             default:
+                // Fallback seguro
                 sentMsg = await sock.sendMessage(jid, { text: content || "" });
         }
 
         return sentMsg;
 
     } catch (err) {
-        console.error("❌ Erro no envio seguro:", err);
+        console.error(`❌ [SENDER] Erro no envio seguro para ${jid}:`, err.message);
         throw err;
     }
 };

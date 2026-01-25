@@ -1,3 +1,4 @@
+
 import cron from 'node-cron';
 import { createClient } from '@supabase/supabase-js';
 import { sendMessage } from '../services/baileys/sender.js';
@@ -33,7 +34,6 @@ export const startAgendaWorker = () => {
         try {
             const now = new Date();
             // Busca agendamentos nas próximas 24h que ainda não foram notificados
-            // Isso cobre lembretes de "1 hora antes", "30 min antes", etc.
             const limit = new Date(now.getTime() + 24 * 60 * 60 * 1000); 
 
             // 1. Buscar agendamentos confirmados e pendentes de lembrete
@@ -45,7 +45,7 @@ export const startAgendaWorker = () => {
                     companies (name)
                 `)
                 .eq('status', 'confirmed')
-                .eq('reminder_sent', false) // Importante: Idempotência
+                .eq('reminder_sent', false) // Idempotência: Só processa se ainda não enviou
                 .gte('start_time', now.toISOString())
                 .lte('start_time', limit.toISOString());
 
@@ -76,7 +76,7 @@ export const startAgendaWorker = () => {
                 const config = rules.notification_config;
                 const leadNotifs = config.lead_notifications || [];
 
-                // 3. Verificar Gatilhos (before_event)
+                // 3. Verificar Gatilhos (type: before_event)
                 for (const trigger of leadNotifs) {
                     if (trigger.type === 'before_event' && trigger.active) {
                         const timeAmount = parseInt(trigger.time_amount);
@@ -85,28 +85,27 @@ export const startAgendaWorker = () => {
                         const appTime = new Date(app.start_time).getTime();
                         let triggerTime = appTime;
 
-                        // Calcula o momento do disparo
+                        // Calcula o momento exato do disparo
                         if (timeUnit === 'minutes') triggerTime -= timeAmount * 60 * 1000;
                         if (timeUnit === 'hours') triggerTime -= timeAmount * 60 * 60 * 1000;
                         if (timeUnit === 'days') triggerTime -= timeAmount * 24 * 60 * 60 * 1000;
 
-                        // Verifica janela de disparo (com tolerância de 15 min atrasado para não perder cron)
+                        // Verifica janela de disparo (com tolerância de 15 min atrasado para não perder o timing do cron)
                         const diff = now.getTime() - triggerTime;
                         
-                        // Lógica de janela: Deve ter passado da hora do trigger (diff >= 0)
-                        // MAS não pode ter passado muito tempo (ex: 15 min), senão é mensagem velha
+                        // Se já passou da hora do trigger (diff >= 0) E não passou muito tempo (15 min)
                         if (diff >= 0 && diff < 15 * 60 * 1000) {
                             
                             // A. Resolve Sessão WhatsApp
                             const sessionId = await getSessionId(app.company_id);
                             if (!sessionId) continue;
 
-                            // B. Formata Dados
+                            // B. Formata Dados para Template
                             const dateObj = new Date(app.start_time);
                             const dateStr = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(dateObj);
                             const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
 
-                            // C. Processa Template
+                            // C. Processa Template (Substituição de Variáveis)
                             let msg = trigger.template
                                 .replace('[lead_name]', app.leads.name.split(' ')[0])
                                 .replace('[lead_phone]', app.leads.phone)
@@ -114,20 +113,23 @@ export const startAgendaWorker = () => {
                                 .replace('[data]', dateStr)
                                 .replace('[hora]', timeStr);
 
-                            // D. Envia
+                            // D. Envia Mensagem
                             const leadPhone = cleanPhone(app.leads.phone);
                             console.log(`🚀 [Agenda Worker] Enviando lembrete para ${leadPhone}`);
                             
-                            await sendMessage(sessionId, `${leadPhone}@s.whatsapp.net`, {
-                                text: msg
+                            await sendMessage({
+                                sessionId,
+                                to: `${leadPhone}@s.whatsapp.net`,
+                                type: 'text',
+                                content: msg
                             });
 
-                            // E. Marca como Enviado
+                            // E. Marca como Enviado (Evita loop)
                             await supabase.from('appointments')
                                 .update({ reminder_sent: true })
                                 .eq('id', app.id);
                             
-                            break; // Evita múltiplos disparos para o mesmo evento no mesmo loop
+                            break; // Sai do loop de triggers para este appointment (1 lembrete por vez)
                         }
                     }
                 }

@@ -1,34 +1,14 @@
 
 import { Queue } from 'bullmq';
-import getRedisClient from '../services/redisClient.js';
-import pino from 'pino';
+import IORedis from 'ioredis';
 
-const logger = pino({ level: 'info' });
-const connection = getRedisClient();
-
-export const campaignQueue = new Queue('campaigns', {
-    connection,
-    defaultJobOptions: {
-        attempts: 3, 
-        backoff: { type: 'exponential', delay: 5000 },
-        removeOnComplete: 1000,
-        removeOnFail: 5000
-    }
+// Conexão Redis dedicada para o Produtor da Fila
+// BullMQ recomenda conexões separadas para filas e workers
+const connection = new IORedis(process.env.REDIS_URL, {
+    maxRetriesPerRequest: null
 });
 
-export const dispatchCampaign = async (companyId, campaignId, leads, messageTemplate) => {
-    logger.info({ companyId, campaignId, count: leads.length }, 'Enfileirando campanha...');
+export const campaignQueue = new Queue('campaign-sender', { connection });
 
-    const jobs = leads.map(lead => ({
-        name: 'send-message',
-        data: {
-            companyId,
-            campaignId,
-            lead, 
-            messageTemplate
-        }
-    }));
-
-    await campaignQueue.addBulk(jobs);
-    logger.info('✅ Jobs enfileirados com sucesso.');
-};
+connection.on('connect', () => console.log('✅ [REDIS] Conectado para fila de campanhas.'));
+connection.on('error', (err) => console.error('❌ [REDIS] Erro na conexão da fila:', err));

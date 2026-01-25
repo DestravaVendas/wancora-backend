@@ -1,3 +1,4 @@
+
 import { createClient } from "@supabase/supabase-js";
 import { sendMessage } from '../services/baileys/sender.js';
 
@@ -17,7 +18,7 @@ export const sendAppointmentConfirmation = async (req, res) => {
   }
 
   try {
-    console.log(`[AGENDA] 📅 Processando confirmação ID: ${appointmentId}`);
+    console.log(`[AGENDA] 📅 Processando confirmação imediata ID: ${appointmentId}`);
 
     // 1. Buscar dados do agendamento
     const { data: app, error } = await supabase
@@ -34,7 +35,7 @@ export const sendAppointmentConfirmation = async (req, res) => {
       return res.status(404).json({ error: 'Agendamento não encontrado.' });
     }
 
-    // 2. Resolução de Sessão (Se não veio no body)
+    // 2. Resolução de Sessão (Se não veio no body, busca a ativa)
     if (!sessionId) {
       const { data: instance } = await supabase
         .from('instances')
@@ -45,13 +46,12 @@ export const sendAppointmentConfirmation = async (req, res) => {
         .maybeSingle();
       
       if (!instance) {
-        return res.status(503).json({ error: 'WhatsApp desconectado.' });
+        return res.status(503).json({ error: 'Nenhuma conexão WhatsApp ativa para enviar a confirmação.' });
       }
       sessionId = instance.session_id;
     }
 
-    // 3. Buscar Regras de Notificação (Engine)
-    // Pega a regra ativa do dono da agenda para saber O QUE enviar
+    // 3. Buscar Regras de Notificação
     const { data: rules } = await supabase
         .from('availability_rules')
         .select('notification_config')
@@ -61,7 +61,6 @@ export const sendAppointmentConfirmation = async (req, res) => {
         .limit(1)
         .maybeSingle();
 
-    // Se não tiver regra configurada, encerra sem erro (é opcional)
     if (!rules?.notification_config) {
         return res.json({ message: "Sem regras de notificação configuradas." });
     }
@@ -69,7 +68,7 @@ export const sendAppointmentConfirmation = async (req, res) => {
     const config = rules.notification_config;
     const tasks = [];
 
-    // Preparar Variáveis do Template
+    // Preparar Variáveis
     const dateObj = new Date(app.start_time);
     const dateStr = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(dateObj);
     const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
@@ -89,7 +88,6 @@ export const sendAppointmentConfirmation = async (req, res) => {
         if (onBookingAdmin) {
             const adminMsg = replaceVars(onBookingAdmin.template);
             const adminPhone = cleanPhone(config.admin_phone);
-            // Payload unificado conforme sender.js
             tasks.push(sendMessage({ 
                 sessionId, 
                 to: `${adminPhone}@s.whatsapp.net`, 
@@ -99,7 +97,7 @@ export const sendAppointmentConfirmation = async (req, res) => {
         }
     }
 
-    // B. Notificar Lead (Cliente) - Confirmação Imediata
+    // B. Notificar Lead (Cliente)
     if (app.leads?.phone && config.lead_notifications) {
         const onBookingLead = config.lead_notifications.find(n => n.type === 'on_booking' && n.active);
         if (onBookingLead) {
@@ -117,14 +115,14 @@ export const sendAppointmentConfirmation = async (req, res) => {
     // 4. Executar Envios
     await Promise.all(tasks);
 
-    // 5. Atualizar flag
+    // 5. Marcar confirmação como enviada
     await supabase.from('appointments').update({ confirmation_sent: true }).eq('id', appointmentId);
 
-    console.log(`[AGENDA] ✅ Confirmações enviadas: ${tasks.length}`);
+    console.log(`[AGENDA] ✅ ${tasks.length} confirmações enviadas.`);
     return res.status(200).json({ success: true, count: tasks.length });
 
   } catch (error) {
-    console.error('[AGENDA] ❌ Erro crítico:', error);
+    console.error('[AGENDA] ❌ Erro no envio de confirmação:', error);
     return res.status(500).json({ error: error.message });
   }
 };

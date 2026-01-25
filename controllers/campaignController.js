@@ -1,72 +1,87 @@
 
 import { createClient } from "@supabase/supabase-js";
-import { dispatchCampaign } from "../workers/campaignQueue.js";
+import { campaignQueue } from "../workers/campaignQueue.js";
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 export const createCampaign = async (req, res) => {
-    const { companyId, name, message, selectedTags } = req.body;
+    const { companyId, name, message, selectedTags, scheduledAt } = req.body;
 
-    if (!companyId || !message || !name) {
-        return res.status(400).json({ error: "Dados incompletos." });
+    if (!companyId || !message || !selectedTags || selectedTags.length === 0) {
+        return res.status(400).json({ error: "Dados inválidos: Tags e Mensagem são obrigatórios." });
     }
 
     try {
-        // 1. Registra Campanha
+        console.log(`🚀 [CAMPAIGN] Iniciando criação: "${name}" Tags: [${selectedTags.join(', ')}]`);
+
+        // 1. Criar Registro da Campanha (Cabeçalho)
         const { data: campaign, error: campError } = await supabase
             .from('campaigns')
-            .insert({
+            .upsert({
                 company_id: companyId,
                 name,
                 message_template: message,
-                target_tags: selectedTags || [],
-                status: 'processing',
-                created_at: new Date()
+                target_tags: selectedTags,
+                status: 'processing', // Já inicia processando
+                scheduled_at: scheduledAt || new Date().toISOString()
             })
             .select()
             .single();
 
         if (campError) throw campError;
 
-        // 2. Busca Leads (Com filtro de Tags)
-        let query = supabase
+        // 2. Buscar Leads Alvo (Intersection)
+        // Busca leads que tenham pelo menos uma das tags selecionadas
+        const { data: leads, error: leadsError } = await supabase
             .from('leads')
-            .select('id, phone, name, tags')
-            .eq('company_id', companyId);
+            .select('id, name, phone')
+            .eq('company_id', companyId)
+            .contains('tags', selectedTags);
 
-        if (selectedTags && selectedTags.length > 0) {
-            // Postgres 'overlaps': Se tiver qualquer uma das tags
-            query = query.overlaps('tags', selectedTags);
-        }
-
-        const { data: leads, error: leadsError } = await query;
         if (leadsError) throw leadsError;
 
-        // 3. Sanitiza Lista
-        const validLeads = leads
-            .filter(l => l.phone && l.phone.length > 8)
-            .map(l => ({
-                id: l.id,
-                name: l.name || 'Cliente',
-                phone: l.phone.replace(/\D/g, '') // Garante apenas números
-            }));
-
-        if (validLeads.length === 0) {
+        if (!leads || leads.length === 0) {
             await supabase.from('campaigns').update({ status: 'completed' }).eq('id', campaign.id);
-            return res.status(400).json({ error: "Nenhum lead encontrado para os filtros." });
+            return res.json({ success: true, message: "Nenhum lead encontrado com as tags selecionadas.", campaignId: campaign.id });
         }
 
-        // 4. Dispara
-        await dispatchCampaign(companyId, campaign.id, validLeads, message);
+        // 3. Adicionar Jobs na Fila (Bulk Insert no Redis)
+        const jobs = leads.map(lead => ({
+            name: `campaign-${campaign.id}-${lead.id}`,
+            data: {
+                campaignId: campaign.id,
+                companyId,
+                leadId: lead.id,
+                phone: lead.phone,
+                leadName: lead.name,
+                messageTemplate: message
+            },
+            opts: {
+                removeOnComplete: true, // Limpa o Redis após sucesso
+                removeOnFail: 500 // Mantém histórico de erro
+            }
+        }));
 
-        return res.status(200).json({ 
+        await campaignQueue.addBulk(jobs);
+
+        // 4. Registrar itens na tabela de controle para a UI acompanhar
+        const campaignLeadsData = leads.map(lead => ({
+            campaign_id: campaign.id,
+            lead_id: lead.id,
+            status: 'pending'
+        }));
+        
+        await supabase.from('campaign_leads').insert(campaignLeadsData);
+
+        res.json({ 
             success: true, 
-            message: `Campanha iniciada para ${validLeads.length} contatos.`,
-            campaignId: campaign.id 
+            campaignId: campaign.id, 
+            leadsCount: leads.length,
+            message: `Campanha iniciada! ${leads.length} mensagens na fila.` 
         });
 
     } catch (error) {
-        console.error("Erro campanha:", error);
-        res.status(500).json({ error: "Erro interno: " + error.message });
+        console.error("❌ Erro ao criar campanha:", error);
+        res.status(500).json({ error: error.message });
     }
 };

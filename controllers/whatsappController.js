@@ -1,3 +1,4 @@
+
 import { createClient } from "@supabase/supabase-js";
 import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
 import { sendMessage as sendService } from '../services/baileys/sender.js';
@@ -20,17 +21,17 @@ export const startSession = async (sessionId, companyId) => {
 export const deleteSession = async (sessionId, companyId) => {
     try {
         console.log(`[Controller] Solicitando remoção da sessão ${sessionId}`);
-        return await deleteService(sessionId);
+        return await deleteService(sessionId, companyId);
     } catch (error) {
         console.error(`[Controller] Erro ao deletar sessão:`, error);
         throw error;
     }
 };
 
-export const sendMessage = async (sessionId, to, payload) => {
+export const sendMessage = async (payload) => {
     try {
-        const unifiedPayload = { sessionId, to, ...payload };
-        return await sendService(unifiedPayload);
+        // O payload já vem normalizado do route.js
+        return await sendService(payload);
     } catch (error) {
         console.error(`[Controller] Erro ao enviar mensagem:`, error);
         throw error; 
@@ -43,6 +44,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         if (!session || !session.sock) throw new Error("Sessão desconectada.");
 
         // 1. Busca dados da enquete original para saber a chave e as opções
+        // O Baileys exige o TEXTO da opção para votar, não o índice numérico
         const { data: pollMsg } = await supabase
             .from('messages')
             .select('whatsapp_id, from_me, content')
@@ -59,10 +61,10 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error("Conteúdo da enquete corrompido.");
         }
 
-        // 2. Resolve a opção selecionada (Precisa do texto da opção)
+        // 2. Resolve a opção selecionada
         let optionsList = [];
         if (Array.isArray(pollContent.options)) {
-            // Normaliza opções (se vierem como objetos ou strings)
+            // Normaliza opções (podem vir como array de strings ou array de objetos)
             optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
         } else {
             throw new Error("Estrutura da enquete inválida (sem opções).");
@@ -83,17 +85,17 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             vote: {
                 key: {
                     remoteJid: chatJid,
-                    id: pollMsg.whatsapp_id,
+                    id: pollMsg.whatsapp_id, // ID da mensagem original da enquete
                     fromMe: pollMsg.from_me,
                 },
-                selectedOptions: [String(selectedOptionText)]
+                selectedOptions: [String(selectedOptionText)] // O Baileys exige o hash/texto da opção
             }
         };
 
         // Envia usando a chave 'poll' com payload de voto
         await session.sock.sendMessage(chatJid, { poll: votePayload });
 
-        // 4. Salva no banco (Optimistic Update)
+        // 4. Salva no banco (Optimistic Update Local)
         const myJid = normalizeJid(session.sock.user?.id);
         await savePollVote({ companyId, msgId: pollMsg.whatsapp_id, voterJid: myJid, optionId });
 
@@ -134,11 +136,13 @@ export const sendReaction = async (sessionId, companyId, remoteJid, msgId, react
 
 export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, everyone = false) => {
     try {
+        // 1. Atualiza no Banco (Soft Delete Visual)
         await supabase.from('messages')
-            .update({ is_deleted: true, content: '⊘ Mensagem apagada' }) // Símbolo atualizado
+            .update({ is_deleted: true, content: '⊘ Mensagem apagada' }) 
             .eq('id', msgId)
             .eq('company_id', companyId);
 
+        // 2. Se for para todos, envia comando de Revoke para o Baileys
         if (everyone) {
             const session = sessions.get(sessionId);
             if (session?.sock) {
@@ -158,9 +162,11 @@ export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, ever
 
 export const getSessionId = async (companyId) => {
     try {
+        // Tenta pegar a sessão CONECTADA
         const { data } = await supabase.from('instances').select('session_id').eq('company_id', companyId).eq('status', 'connected').limit(1).maybeSingle();
         if (data) return data.session_id;
         
+        // Fallback: Tenta qualquer sessão da empresa (ex: connecting)
         const { data: anySession } = await supabase.from('instances').select('session_id').eq('company_id', companyId).limit(1).maybeSingle();
         return anySession?.session_id || null;
     } catch (error) {

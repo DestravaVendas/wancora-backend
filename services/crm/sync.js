@@ -2,268 +2,206 @@
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
-// Service Role Key é obrigatória aqui para ignorar RLS e garantir escrita
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const logger = pino({ level: 'info' }); // Nível Info para ver operações críticas
+// Cliente com privilégios totais (Service Role)
+// Necessário para ignorar RLS e garantir escrita em background
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+    auth: { persistSession: false }
+});
 
-const leadLock = new Set(); 
+const logger = pino({ level: 'error' });
 
-// --- HELPER: NAME VALIDATION (Name Hunter V5) ---
-// Função crítica para evitar que leads fiquem com nomes como "+551199..." ou "Null"
-const isGenericName = (name, phone) => {
-    if (!name) return true;
-    const cleanName = name.toString().trim();
-    if (cleanName.length < 1) return true;
-    const lower = cleanName.toLowerCase();
-    
-    // Lista negra de nomes genéricos
-    if (lower === 'null' || lower === 'undefined' || lower === 'unknown' || lower === 'usuario' || lower === 'contato') return true;
-    
-    // Se o nome for igual ao telefone (com ou sem formatação)
-    if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true;
+// MUTEX: Evita criar leads duplicados se receber 10 mensagens simultâneas do mesmo número novo
+const leadCreationLock = new Set();
 
-    // Deve conter pelo menos uma letra para ser considerado nome válido
-    const hasLetters = /[a-zA-Z\u00C0-\u00FF]/.test(cleanName);
-    return !hasLetters; 
-};
+// --- HELPERS ---
 
-// --- HELPER: JID NORMALIZATION ---
+// Normaliza JID (Remove sufixos extras, trata grupos e LIDs)
 export const normalizeJid = (jid) => {
     if (!jid) return null;
     if (jid.includes('@g.us')) return jid.split('@')[0] + '@g.us';
-    if (jid.includes('@lid')) return jid; // Mantém LID para o mapa de identidade
-    return jid.split('@')[0].split(':')[0] + '@s.whatsapp.net';
+    if (jid.includes('status@broadcast')) return 'status@broadcast';
+    
+    // Tratamento de LID (Identidade Oculta) vs Phone
+    // Se for LID, mantemos para mapeamento.
+    if (jid.includes('@lid')) return jid;
+    
+    const user = jid.split('@')[0].split(':')[0];
+    return `${user}@s.whatsapp.net`;
 };
 
-export const updateSyncStatus = async (sessionId, status, percent = 0) => {
+// Valida se um nome é útil (Name Hunter)
+const isValidName = (name, phone) => {
+    if (!name) return false;
+    const clean = name.toString().trim();
+    if (clean.length < 1) return false;
+    // Lista negra de nomes genéricos que não queremos no CRM
+    if (['null', 'undefined', 'unknown', 'usuario', 'contato', 'whatsapp'].includes(clean.toLowerCase())) return false;
+    // Se o nome for igual ao telefone, não é um nome válido
+    if (phone && clean.replace(/\D/g, '') === phone.replace(/\D/g, '')) return false;
+    return true;
+};
+
+// --- CORE FUNCTIONS ---
+
+// Atualiza status da instância (QR Code, Sync Bar)
+export const updateInstanceStatus = async (sessionId, companyId, data) => {
     try {
-        // Atualiza status da instância para feedback visual no frontend
         await supabase.from('instances')
-            .update({ sync_status: status, sync_percent: percent, updated_at: new Date() })
+            .update({ ...data, updated_at: new Date() })
+            .eq('session_id', sessionId)
+            .eq('company_id', companyId);
+    } catch (e) {
+        console.error("Erro updateInstanceStatus:", e.message);
+    }
+};
+
+// Limpa sessão do banco (Logout)
+export const deleteSessionData = async (sessionId, companyId) => {
+    try {
+        await supabase.from('instances')
+            .update({ status: 'disconnected', qrcode_url: null, sync_status: 'waiting' })
+            .eq('session_id', sessionId)
+            .eq('company_id', companyId);
+            
+        await supabase.from('baileys_auth_state')
+            .delete()
             .eq('session_id', sessionId);
     } catch (e) {
-        console.error(`❌ [SYNC] Erro ao atualizar status:`, e.message);
+        console.error("Erro deleteSessionData:", e.message);
     }
 };
 
-// Resolve ID real (Phone JID) a partir de um LID ou JID sujo
-const resolveRealPhone = async (jid, companyId) => {
-    if (!jid) return null;
+// UPSERT CONTATO (Agenda Inteligente + Identity Map)
+export const upsertContact = async ({ jid, companyId, name, pushName, imgUrl, isFromAddressBook }) => {
+    if (!jid || !companyId) return;
     
-    // Se já é formato padrão, retorna limpo
-    if (jid.includes('@s.whatsapp.net') && !jid.includes('@lid')) {
-        return jid.split('@')[0];
-    }
-    
-    // Se é LID, busca no mapa de identidade
-    if (jid.includes('@lid')) {
-        const { data } = await supabase.from('identity_map')
-            .select('phone_jid')
-            .eq('lid_jid', jid)
-            .eq('company_id', companyId)
-            .maybeSingle();
-        if (data?.phone_jid) {
-            return data.phone_jid.split('@')[0];
-        }
-    }
-    return jid.split('@')[0];
-};
-
-// --- CORE: UPSERT CONTACT (Com lógica de LID) ---
-export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false, lidJid = null) => {
     try {
-        if (!jid || !companyId) return;
-        if (jid.includes('status@broadcast')) return;
-
         const cleanJid = normalizeJid(jid);
-        const isGroup = cleanJid.includes('@g.us');
+        const phone = cleanJid.split('@')[0].replace(/\D/g, '');
         
-        // 1. Identity Resolution: Mapeia LID -> Phone JID
-        if (lidJid && !isGroup) {
-            await supabase.from('identity_map').upsert({
-                lid_jid: normalizeJid(lidJid),
-                phone_jid: cleanJid, 
-                company_id: companyId
-            }, { onConflict: 'lid_jid' });
-        }
-
-        // Define o telefone para salvar na coluna 'phone'
-        let phoneColumnValue = cleanJid.split('@')[0].replace(/\D/g, '');
-        if (cleanJid.includes('@lid')) {
-            const realPhone = await resolveRealPhone(cleanJid, companyId);
-            if (realPhone && !realPhone.includes('@lid')) {
-                phoneColumnValue = realPhone.replace(/\D/g, '');
-            }
-        }
-
-        // 2. Validação de Nome (Name Hunter)
-        const nameIsValid = !isGenericName(incomingName, phoneColumnValue);
-        
-        const updateData = {
+        const payload = {
             jid: cleanJid,
-            phone: phoneColumnValue,
             company_id: companyId,
             updated_at: new Date()
         };
 
-        if (nameIsValid) {
-            updateData.push_name = incomingName;
-            // Se veio da agenda (isFromBook), tem autoridade máxima
-            if (isFromBook) {
-                updateData.name = incomingName;
-            }
+        // Lógica de Prioridade de Nome
+        if (isValidName(pushName, phone)) payload.push_name = pushName;
+        
+        // Se veio da agenda (sync inicial) OU se temos um nome forte manual
+        if (isFromAddressBook && isValidName(name, phone)) {
+            payload.name = name;
         }
 
-        if (profilePicUrl) updateData.profile_pic_url = profilePicUrl;
+        if (imgUrl) payload.profile_pic_url = imgUrl;
 
         // Se não temos nome válido, fazemos um upsert "light" para não apagar dados existentes
-        if (!nameIsValid && !profilePicUrl) {
-             delete updateData.name;
-             delete updateData.push_name;
-             delete updateData.profile_pic_url;
-        }
+        // (Ex: Se o usuário já editou o nome no CRM, não queremos sobrescrever com NULL)
+        const { error } = await supabase.from('contacts').upsert(payload, { onConflict: 'company_id, jid' });
 
-        // 3. Upsert Tabela Contacts
-        const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
-
-        // 4. Propagação para Leads (Self-Healing)
-        if (!error && !isGroup) {
-            const realPhoneJid = await resolveRealPhone(cleanJid, companyId);
-            const realPhoneNum = realPhoneJid ? realPhoneJid.replace(/\D/g, '') : phoneColumnValue;
-
-            if (realPhoneNum.length < 15) { 
-                const { data: lead } = await supabase.from('leads')
-                    .select('id, name')
-                    .eq('company_id', companyId)
-                    .eq('phone', realPhoneNum)
-                    .limit(1)
-                    .maybeSingle();
-
-                if (lead) {
-                    const currentNameIsBad = !lead.name || isGenericName(lead.name, realPhoneNum);
-                    // Só atualiza o lead se o nome novo for BOM e o atual for RUIM (ou se for da agenda)
-                    if (nameIsValid && (currentNameIsBad || isFromBook)) {
-                        await supabase.from('leads').update({ name: incomingName }).eq('id', lead.id);
-                    }
-                } else if (isFromBook && nameIsValid) {
-                    // Se veio da agenda e não é lead, cria automaticamente
-                    await ensureLeadExists(cleanJid, companyId, incomingName);
-                }
+        // PROPAGAÇÃO PARA LEADS (Self-Healing)
+        // Se descobrimos um nome novo para um contato que já é lead, atualizamos o lead
+        if (!error && (isValidName(name, phone) || isValidName(pushName, phone))) {
+            const betterName = name || pushName;
+            
+            // Busca lead que possa estar com nome ruim (apenas número)
+            const { data: lead } = await supabase
+                .from('leads')
+                .select('id, name')
+                .eq('company_id', companyId)
+                .eq('phone', phone)
+                .single();
+            
+            if (lead && !isValidName(lead.name, phone)) {
+                await supabase.from('leads').update({ name: betterName }).eq('id', lead.id);
             }
         }
+
     } catch (e) {
-        logger.error({ err: e.message }, 'Erro upsertContact');
+        // Silencioso para não spammar logs em sync massivo
     }
 };
 
-// --- CORE: ENSURE LEAD (Com Mutex) ---
-export const ensureLeadExists = async (jid, companyId, pushName, myBotJid = null) => {
-    if (!jid || jid.endsWith('@g.us') || jid.includes('status@broadcast')) return null; 
-
-    const cleanJid = normalizeJid(jid);
-    
-    // Proteção Anti Self-Lead (Bot não cria lead dele mesmo)
-    if (myBotJid) {
-        const cleanBot = normalizeJid(myBotJid);
-        if (cleanJid === cleanBot) return null;
-        
-        const phoneA = await resolveRealPhone(cleanJid, companyId);
-        const phoneB = await resolveRealPhone(cleanBot, companyId);
-        if (phoneA && phoneB && phoneA === phoneB) return null;
-    }
-
-    const realPhone = await resolveRealPhone(cleanJid, companyId);
-    
-    // Validação mínima de telefone
-    if (!realPhone || (realPhone.length > 14 && !realPhone.startsWith('55'))) {
-        return null;
-    }
-
-    // MUTEX: Evita criar leads duplicados se receber 10 mensagens simultâneas
-    const lockKey = `${companyId}:${realPhone}`;
-    if (leadLock.has(lockKey)) return null;
-    
+// UPSERT MENSAGEM (Histórico)
+export const upsertMessage = async (msgData) => {
     try {
-        leadLock.add(lockKey);
+        const cleanRemote = normalizeJid(msgData.remote_jid);
+        
+        // Evita salvar mensagens de status broadcast no histórico de chat
+        if (cleanRemote === 'status@broadcast') return;
 
-        const { data: existing } = await supabase.from('leads')
-            .select('id, name')
-            .eq('phone', realPhone)
+        const payload = {
+            ...msgData,
+            remote_jid: cleanRemote
+        };
+
+        await supabase.from('messages').upsert(payload, { onConflict: 'remote_jid, whatsapp_id' });
+    } catch (e) {
+        console.error("Erro upsertMessage:", e.message);
+    }
+};
+
+// GARANTIA DE LEAD (Smart Lead Guard com Mutex)
+// Cria lead automaticamente se não existir, mas com bloqueio de concorrência
+export const ensureLeadExists = async ({ companyId, phone, name, pushName }) => {
+    if (!phone || phone.length < 8) return null;
+    
+    const lockKey = `${companyId}:${phone}`;
+    if (leadCreationLock.has(lockKey)) return null; // Já está sendo criado, aborta para evitar duplicata
+
+    try {
+        leadCreationLock.add(lockKey);
+
+        // 1. Verifica se já existe
+        const { data: existing } = await supabase
+            .from('leads')
+            .select('id')
             .eq('company_id', companyId)
+            .eq('phone', phone)
             .maybeSingle();
 
-        const nameIsValid = !isGenericName(pushName, realPhone);
-        
-        if (existing) {
-            // Cura nomes ruins se chegar um nome bom
-            if (nameIsValid && (!existing.name || isGenericName(existing.name, realPhone))) {
-                await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
-            }
-            return existing.id;
-        }
+        if (existing) return existing.id;
 
-        // Tenta buscar nome na tabela de contatos se pushName for ruim
-        let finalName = nameIsValid ? pushName : null;
-        if (!finalName) {
-            const { data: contact } = await supabase.from('contacts')
-                .select('name, push_name')
-                .eq('phone', realPhone)
-                .eq('company_id', companyId)
-                .limit(1)
-                .maybeSingle();
-                
-            if (contact) {
-                if (!isGenericName(contact.name, realPhone)) finalName = contact.name;
-                else if (!isGenericName(contact.push_name, realPhone)) finalName = contact.push_name;
-            }
-        }
+        // 2. Determina melhor nome
+        const displayName = isValidName(name, phone) ? name : (isValidName(pushName, phone) ? pushName : `Lead ${phone}`);
 
-        // Busca o primeiro estágio do funil
-        const { data: stage } = await supabase.from('pipeline_stages')
+        // 3. Busca estágio inicial do funil padrão
+        const { data: stage } = await supabase
+            .from('pipeline_stages')
             .select('id')
             .eq('company_id', companyId)
             .order('position', { ascending: true })
             .limit(1)
             .maybeSingle();
 
-        // Cria o Lead
-        const { data: newLead } = await supabase.from('leads').insert({
+        if (!stage) return null; // Não cria se não tiver funil configurado
+
+        // 4. Cria o Lead
+        const { data: newLead, error } = await supabase.from('leads').insert({
             company_id: companyId,
-            phone: realPhone,
-            name: finalName,
+            name: displayName,
+            phone: phone,
             status: 'new',
-            pipeline_stage_id: stage?.id
+            pipeline_stage_id: stage.id,
+            created_at: new Date()
         }).select('id').single();
 
-        return newLead?.id;
+        if (error) throw error;
+        return newLead.id;
+
     } catch (e) {
+        console.error("Erro ensureLeadExists:", e.message);
         return null;
     } finally {
-        // Libera o lock após 1 segundo
-        setTimeout(() => leadLock.delete(lockKey), 1000);
+        // Libera lock após 2s (tempo seguro para replicação do banco)
+        setTimeout(() => leadCreationLock.delete(lockKey), 2000);
     }
 };
 
-// --- CORE: UPSERT MESSAGE ---
-export const upsertMessage = async (msgData) => {
-    try {
-        // Delay tático para garantir que o contato/lead já exista (Integridade FK)
-        await new Promise(resolve => setTimeout(resolve, 50)); 
-        
-        const cleanRemoteJid = normalizeJid(msgData.remote_jid);
-        const finalData = { ...msgData, remote_jid: cleanRemoteJid };
-        
-        const { error } = await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
-        if (error) throw error;
-    } catch (e) {
-        // Silencioso em produção, mas logado se for erro grave
-        // console.error("Msg Error", e.message);
-    }
-};
-
-// --- SAVE POLL VOTE (Real Implementation) ---
+// Salva voto de enquete (JSONB Append)
 export const savePollVote = async ({ companyId, msgId, voterJid, optionId }) => {
     try {
+        // Busca votos atuais
         const { data: msg } = await supabase
             .from('messages')
             .select('poll_votes')
@@ -272,32 +210,21 @@ export const savePollVote = async ({ companyId, msgId, voterJid, optionId }) => 
             .single();
 
         if (msg) {
-            let currentVotes = Array.isArray(msg.poll_votes) ? msg.poll_votes : [];
-            // Remove voto anterior do mesmo usuário para evitar duplicidade lógica
-            currentVotes = currentVotes.filter(v => v.voterJid !== voterJid);
-            // Adiciona novo voto
-            currentVotes.push({
-                voterJid,
-                optionId,
-                ts: Date.now()
-            });
+            let votes = Array.isArray(msg.poll_votes) ? msg.poll_votes : [];
+            
+            // Remove voto anterior desse usuário (Lógica de mudança de voto)
+            votes = votes.filter(v => v.voterJid !== voterJid);
+            
+            // Adiciona novo
+            votes.push({ voterJid, optionId, ts: Date.now() });
 
             await supabase
                 .from('messages')
-                .update({ poll_votes: currentVotes })
+                .update({ poll_votes: votes })
                 .eq('whatsapp_id', msgId)
                 .eq('company_id', companyId);
         }
     } catch (e) {
-        console.error("Erro saving poll vote:", e);
+        console.error("Erro savePollVote:", e);
     }
-};
-
-// Placeholders para manter compatibilidade
-export const deleteSessionData = async (sessionId) => {
-    await supabase.from('instances').update({ status: 'disconnected' }).eq('session_id', sessionId);
-    await supabase.from('baileys_auth_state').delete().eq('session_id', sessionId);
-};
-export const updateInstance = async (sessionId, data) => {
-    await supabase.from('instances').update(data).eq('session_id', sessionId);
 };

@@ -1,119 +1,160 @@
-import { supabase } from '../../auth/supabaseAuth.js';
-import { sendMessage } from '../baileys/sender.js';
 
-// Configuração
-const CHECK_INTERVAL = 60 * 1000; // Roda a cada 1 minuto
-const REMINDER_WINDOW_HOURS = 24; // Avisar 24h antes
+import { createClient } from "@supabase/supabase-js";
+import { GoogleGenAI } from "@google/genai";
+import { sendMessage } from "../baileys/sender.js";
+import { getSessionId } from "../../controllers/whatsappController.js";
 
-// Função para limpar JID (Garante apenas números antes do sufixo)
-const formatJid = (phone) => {
-  if (!phone) return null;
-  const clean = phone.replace(/\D/g, ''); // Remove tudo que não é número
-  return `${clean}@s.whatsapp.net`;
+// Cliente Supabase Service Role (Realtime)
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+    auth: { persistSession: false }
+});
+
+// Mapa para evitar respostas duplicadas em curto prazo (Debounce)
+const processingLock = new Set();
+
+// Cache de clientes IA para evitar recriar a cada mensagem
+// Key: apiKey, Value: GoogleGenAI Instance
+const aiInstances = new Map();
+
+/**
+ * Factory Dinâmica de IA
+ * Instancia ou recupera um cliente Gemini baseado na chave fornecida.
+ */
+const getAIClient = (apiKey) => {
+    if (!apiKey) return null;
+    if (!aiInstances.has(apiKey)) {
+        // console.log("⚡ [SENTINEL] Instanciando novo cliente Gemini (BYOK).");
+        aiInstances.set(apiKey, new GoogleGenAI({ apiKey }));
+    }
+    return aiInstances.get(apiKey);
+};
+
+const processAIResponse = async (payload) => {
+    const { id, content, remote_jid, company_id, from_me, message_type } = payload.new;
+
+    // 1. Filtros de Segurança Básicos
+    if (from_me) return; // Não responde a si mesmo
+    if (message_type !== 'text') return; // MVP: Apenas texto
+    if (!content) return;
+
+    // Debounce: Evita processar a mesma mensagem duas vezes
+    const lockKey = `${remote_jid}-${id}`;
+    if (processingLock.has(lockKey)) return;
+    processingLock.add(lockKey);
+    setTimeout(() => processingLock.delete(lockKey), 10000); // Libera memória
+
+    // 2. Verificar se o Lead existe e tem Bot Ativo
+    const phone = remote_jid.split('@')[0];
+    const { data: lead } = await supabase
+        .from('leads')
+        .select('id, name, bot_status')
+        .eq('company_id', company_id)
+        .eq('phone', phone)
+        .maybeSingle();
+
+    if (!lead || lead.bot_status !== 'active') return;
+
+    // 3. Buscar Configuração do Agente E Configuração da Empresa (Chaves)
+    // Fazemos um Promise.all para otimizar tempo
+    const [agentRes, companyRes] = await Promise.all([
+        supabase.from('agents').select('*').eq('company_id', company_id).eq('is_active', true).maybeSingle(),
+        supabase.from('companies').select('ai_config').eq('id', company_id).single()
+    ]);
+
+    const agent = agentRes.data;
+    const companyConfig = companyRes.data?.ai_config;
+
+    if (!agent) return; // Se não tem agente configurado, não faz nada
+
+    try {
+        console.log(`🤖 [SENTINEL] IA Acionada para ${lead.name} (${phone})...`);
+
+        // RESOLUÇÃO DE API KEY (BYOK Logic)
+        // 1. Tenta a chave da empresa
+        // 2. Fallback para a chave do sistema (.env)
+        let activeApiKey = companyConfig?.apiKey || process.env.API_KEY;
+        let activeModel = companyConfig?.model || agent.model || 'gemini-3-flash-preview';
+
+        if (!activeApiKey) {
+            console.error("❌ [SENTINEL] Erro: Nenhuma API Key encontrada (Nem empresa, nem sistema).");
+            return;
+        }
+
+        const ai = getAIClient(activeApiKey);
+
+        // 4. Carregar Contexto (Histórico Recente)
+        const { data: history } = await supabase
+            .from('messages')
+            .select('content, from_me')
+            .eq('company_id', company_id)
+            .eq('remote_jid', remote_jid)
+            .order('created_at', { ascending: false })
+            .limit(10); // Contexto das últimas 10 mensagens
+
+        // Formata histórico para o Gemini (Do mais antigo para o mais novo)
+        const chatHistory = (history || []).reverse().map(m => ({
+            role: m.from_me ? 'model' : 'user',
+            parts: [{ text: m.content || "" }]
+        }));
+
+        // 5. Montagem do Prompt de Sistema
+        const systemInstruction = `
+        ${agent.prompt_instruction}
+        
+        INFORMAÇÕES DO CLIENTE ATUAL:
+        Nome: ${lead.name}
+        Telefone: ${lead.phone}
+        
+        BASE DE CONHECIMENTO DA EMPRESA:
+        ${agent.knowledge_base}
+        
+        DIRETRIZES TÉCNICAS:
+        - Responda APENAS com o texto da mensagem. Sem JSON, sem markdown excessivo.
+        - Mantenha o tom natural de WhatsApp (pode usar emojis, seja breve).
+        - Se não souber a resposta com base no conhecimento fornecido, diga que vai chamar um humano.
+        `;
+
+        // 6. Geração da Resposta
+        const response = await ai.models.generateContent({
+            model: activeModel,
+            contents: chatHistory,
+            config: {
+                systemInstruction: systemInstruction,
+                maxOutputTokens: 300, // Limite seguro
+                temperature: 0.7 // Criatividade moderada
+            }
+        });
+
+        const replyText = response.text;
+
+        if (replyText) {
+            // 7. Envio da Resposta
+            const sessionId = await getSessionId(company_id);
+            if (sessionId) {
+                // Pequeno delay "thinking" para parecer humano (Humanização)
+                await new Promise(r => setTimeout(r, 2000));
+                
+                await sendMessage({
+                    sessionId,
+                    to: remote_jid,
+                    type: 'text',
+                    content: replyText
+                });
+                console.log(`✅ [SENTINEL] Resposta enviada para ${lead.name}.`);
+            }
+        }
+
+    } catch (error) {
+        console.error("❌ [SENTINEL] Erro na geração de resposta IA:", error.message);
+    }
 };
 
 export const startSentinel = () => {
-  console.log('🤖 [SENTINELA] Sistema de Monitoramento Iniciado.');
-
-  setInterval(async () => {
-    await runSentinelCycle();
-  }, CHECK_INTERVAL);
-};
-
-async function runSentinelCycle() {
-  try {
-    const now = new Date();
+    console.log("🛡️ [SENTINEL] Agente de IA iniciado (BYOK Enabled). Monitorando canal 'messages'...");
     
-    // Definindo a Janela de Tempo:
-    // Queremos agendamentos que ocorrem entre AGORA e (AGORA + 24h)
-    const windowEnd = new Date(now.getTime() + (REMINDER_WINDOW_HOURS * 60 * 60 * 1000));
-
-    // Busca agendamentos pendentes de lembrete
-    // CORREÇÃO: Removemos 'profiles:user_id (name)' pois não estava sendo usado e causava erro de relação
-    const { data: appointments, error } = await supabase
-      .from('appointments')
-      .select(`
-        id, start_time, company_id,
-        leads (name, phone)
-      `)
-      .gte('start_time', now.toISOString()) // Apenas futuros
-      .lte('start_time', windowEnd.toISOString()) // Dentro da janela
-      .eq('reminder_sent', false)
-      .eq('status', 'confirmed') // Apenas confirmados. Se quiser todos, remova esta linha ou mude para 'pending'
-      .not('leads', 'is', null); // Garante que o lead existe para não quebrar o código
-
-    if (error) throw error;
-
-    if (!appointments || appointments.length === 0) return;
-
-    console.log(`🤖 [SENTINELA] Processando ${appointments.length} lembretes pendentes...`);
-
-    // Cache de sessões para não bater no banco repetidamente para a mesma empresa
-    const sessionCache = {};
-
-    for (const appt of appointments) {
-      await processReminder(appt, sessionCache);
-    }
-
-  } catch (err) {
-    console.error('🤖 [SENTINELA] Erro no ciclo:', err.message);
-  }
-}
-
-async function processReminder(appt, sessionCache) {
-  try {
-    const { company_id, leads, start_time } = appt;
-
-    // Validação de Segurança
-    if (!leads || !leads.phone) {
-      console.warn(`[SENTINELA] Agendamento ${appt.id} sem telefone vinculado. Ignorando.`);
-      return;
-    }
-
-    // 1. Resolver Sessão (Com Cache Local)
-    let sessionId = sessionCache[company_id];
-
-    if (!sessionId) {
-      const { data: instance } = await supabase
-        .from('instances')
-        .select('session_id')
-        .eq('company_id', company_id)
-        .eq('status', 'connected') // Apenas sessões ativas
-        .limit(1)
-        .maybeSingle();
-
-      if (instance) {
-        sessionId = instance.session_id;
-        sessionCache[company_id] = sessionId;
-      } else {
-        // Log silencioso para evitar spam no console se a empresa desconectou
-        return;
-      }
-    }
-
-    // 2. Preparar Dados
-    const clientName = leads.name ? leads.name.split(' ')[0] : 'Cliente';
-    const dateObj = new Date(start_time);
-    const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
-    const remoteJid = formatJid(leads.phone);
-
-    // 3. Texto do Lembrete
-    const text = `🔔 *Lembrete Automático*\n\nOlá ${clientName}, passando para lembrar da nossa reunião amanhã às *${timeStr}*.\n\nEstá tudo certo para nosso encontro?`;
-
-    // 4. Enviar Mensagem
-    await sendMessage(sessionId, remoteJid, { text });
-
-    // 5. Marcar como Enviado (Crítico para não spamar)
-    const { error: updateError } = await supabase
-      .from('appointments')
-      .update({ reminder_sent: true })
-      .eq('id', appt.id);
-
-    if (updateError) throw updateError;
-
-    console.log(`[SENTINELA] 📨 Lembrete enviado para ${clientName} (ID: ${appt.id})`);
-
-  } catch (error) {
-    console.error(`[SENTINELA] ❌ Falha no agendamento ${appt.id}:`, error.message);
-  }
-}
+    // Inicia listener do Supabase Realtime
+    supabase
+        .channel('ai-sentinel-global')
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
+        .subscribe();
+};

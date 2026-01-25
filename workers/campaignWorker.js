@@ -1,128 +1,95 @@
 
 import { Worker } from 'bullmq';
-import getRedisClient from '../services/redisClient.js';
-import { createClient } from "@supabase/supabase-js";
-import pino from 'pino';
-import { sendMessage, getSessionId } from '../controllers/whatsappController.js'; 
+import IORedis from 'ioredis';
+import { createClient } from '@supabase/supabase-js';
+import { sendMessage } from '../services/baileys/sender.js';
+import { getSessionId } from '../controllers/whatsappController.js';
+import spintax from 'spintax';
 
-// Inicializa Supabase (Service Role é ideal aqui para não ser barrado por RLS)
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
-    auth: { persistSession: false }
-});
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, { auth: { persistSession: false }});
+const connection = new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
 
-const logger = pino({ level: 'info' });
-const connection = getRedisClient();
+// Helper: Delay Assíncrono
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-// --- HELPER: Spintax ---
-const spinText = (text) => {
-    if (!text) return "";
-    return text.replace(/{([^{}]+)}/g, (match, choices) => {
-        const options = choices.split('|');
-        return options[Math.floor(Math.random() * options.length)];
-    });
-};
+// O Worker processa os jobs da fila 'campaign-sender'
+const worker = new Worker('campaign-sender', async (job) => {
+    const { campaignId, companyId, leadId, phone, leadName, messageTemplate } = job.data;
 
-// --- HELPER: Delay ---
-const randomDelay = (min, max) => new Promise(resolve => setTimeout(resolve, Math.random() * (max - min) + min));
-
-// --- HELPER: Atualizar Contadores da Campanha ---
-const incrementCampaignStats = async (campaignId, status) => {
-    // status: 'success' | 'failed'
-    const column = status === 'success' ? 'processed_count' : 'failed_count';
-    
-    // Chamada RPC atômica seria ideal, mas query direta funciona para MVP
-    // Pegamos o valor atual e somamos 1 (Otimista)
-    // Nota: Em alta escala, recomenda-se criar uma função RPC 'increment_campaign_counter' no Postgres.
     try {
-        const { data } = await supabase.rpc('increment_campaign_count', { 
-            p_campaign_id: campaignId, 
-            p_field: column 
+        console.log(`📤 [WORKER] Processando envio para ${phone} (Job: ${job.id})`);
+
+        // 1. Obter Sessão Ativa
+        // Resolvemos o ID da sessão no momento do envio para garantir que usaremos uma conectada
+        const sessionId = await getSessionId(companyId);
+        if (!sessionId) throw new Error("Sem conexão WhatsApp ativa para esta empresa.");
+
+        // 2. Processar Spintax e Variáveis
+        // Ex: {Olá|Oi}, tudo bem? -> Oi, tudo bem?
+        let finalMessage = spintax.unspin(messageTemplate);
+        
+        // Variáveis Dinâmicas
+        const firstName = leadName ? leadName.split(' ')[0] : 'Cliente';
+        finalMessage = finalMessage.replace(/{{name}}/g, firstName);
+        finalMessage = finalMessage.replace(/{{nome}}/g, firstName);
+
+        // 3. Delay de Segurança (Anti-Ban Humanizado)
+        // Gera um delay aleatório entre 15s e 45s entre cada mensagem
+        // Isso evita padrões mecânicos detectáveis pelo WhatsApp
+        const waitTime = Math.floor(Math.random() * (45000 - 15000 + 1) + 15000);
+        console.log(`⏳ [WORKER] Aguardando ${waitTime}ms para humanização...`);
+        await delay(waitTime);
+
+        // 4. Enviar Mensagem
+        await sendMessage({
+            sessionId,
+            to: phone,
+            type: 'text',
+            content: finalMessage
         });
-        
-        // Fallback se RPC não existir: (Lento, mas funciona)
-        if (!data) {
-             const { data: current } = await supabase.from('campaigns').select(column).eq('id', campaignId).single();
-             if (current) {
-                 await supabase.from('campaigns').update({ [column]: (current[column] || 0) + 1 }).eq('id', campaignId);
-             }
-        }
-    } catch (e) {
-        // Silencioso para não parar o worker
-        console.error("Erro ao atualizar stats da campanha:", e.message);
-    }
-};
 
-const worker = new Worker('campaigns', async job => {
-    const { companyId, campaignId, lead, messageTemplate } = job.data;
-
-    // 1. Resolve Session ID (Async/Await Critical Fix)
-    const sessionId = await getSessionId(companyId);
-
-    if (!sessionId) {
-        const errorMsg = `Sessão desconectada para empresa ${companyId}.`;
-        await incrementCampaignStats(campaignId, 'failed');
-        throw new Error(errorMsg);
-    }
-
-    try {
-        // 2. Anti-Ban Delay (Smart Throttling)
-        // Calcula delay baseado no tamanho da mensagem anterior (simulação simples)
-        // Mínimo 15s, Máximo 40s
-        const delayMs = Math.floor(Math.random() * (40000 - 15000 + 1) + 15000);
-        
-        logger.info({ lead: lead.phone, delayMs: delayMs/1000 }, `⏳ Aguardando...`);
-        await new Promise(r => setTimeout(r, delayMs));
-
-        // 3. Processa Conteúdo
-        let content = spinText(messageTemplate);
-        content = content.replace('{{name}}', lead.name || 'Cliente');
-
-        // 4. Envio
-        const payload = { type: 'text', text: content };
-        await sendMessage(sessionId, lead.phone, payload);
-
-        // 5. Logs e Stats (Sucesso)
-        await Promise.all([
-            supabase.from('campaign_logs').insert({
-                company_id: companyId,
-                campaign_id: campaignId,
-                lead_id: lead.id,
-                phone: lead.phone,
-                status: 'sent',
-                sent_at: new Date()
-            }),
-            incrementCampaignStats(campaignId, 'success')
-        ]);
-
-        logger.info({ lead: lead.phone }, '✅ Enviado');
+        // 5. Atualizar Status no Banco
+        await supabase.from('campaign_leads')
+            .update({ status: 'sent', sent_at: new Date() })
+            .eq('campaign_id', campaignId)
+            .eq('lead_id', leadId);
 
     } catch (error) {
-        const errorMessage = error?.message || "Erro desconhecido";
-        logger.error({ err: errorMessage, phone: lead.phone }, '❌ Falha');
+        console.error(`❌ [WORKER] Falha para ${phone}:`, error.message);
         
-        // 6. Logs e Stats (Falha)
-        await Promise.all([
-            supabase.from('campaign_logs').insert({
-                company_id: companyId,
-                campaign_id: campaignId,
-                lead_id: lead.id,
-                phone: lead.phone,
-                status: 'failed',
-                error_message: errorMessage
-            }),
-            incrementCampaignStats(campaignId, 'failed')
-        ]);
-
-        throw error; 
+        await supabase.from('campaign_leads')
+            .update({ status: 'failed', error_log: error.message })
+            .eq('campaign_id', campaignId)
+            .eq('lead_id', leadId);
+            
+        throw error;
     }
 
 }, { 
-    connection, 
-    concurrency: 1, // CRÍTICO: Um envio por vez para evitar banimento
+    connection,
+    concurrency: 1, // SERIAL: Processa 1 por vez para segurança máxima da conta
     limiter: {
-        max: 1,
-        duration: 10000 // Rate limit adicional do BullMQ (1 a cada 10s min)
+        max: 10, // Máximo 10 jobs
+        duration: 10000 // por 10 segundos (Fallback limiter)
     }
 });
 
-export default worker;
+// Evento de Conclusão do Job
+worker.on('completed', async (job) => {
+    // Verifica se a campanha inteira acabou
+    const { campaignId } = job.data;
+    
+    // Conta quantos ainda estão pendentes
+    const { count } = await supabase.from('campaign_leads')
+        .select('*', { count: 'exact', head: true })
+        .eq('campaign_id', campaignId)
+        .eq('status', 'pending');
+    
+    // Se não há mais pendentes, marca campanha como concluída
+    if (count === 0) {
+        await supabase.from('campaigns').update({ status: 'completed' }).eq('id', campaignId);
+        console.log(`🏁 [CAMPAIGN] Campanha ${campaignId} finalizada com sucesso.`);
+    }
+});
+
+console.log("👷 [WORKER] Campaign Worker iniciado e aguardando jobs.");
