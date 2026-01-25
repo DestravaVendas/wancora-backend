@@ -1,3 +1,4 @@
+
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
@@ -262,10 +263,18 @@ export const upsertMessage = async (msgData) => {
 
 // Placeholders para manter compatibilidade
 export const savePollVote = async (msg, companyId) => {};
-export const deleteSessionData = async (sessionId) => {
-    await supabase.from('instances').update({ status: 'disconnected' }).eq('session_id', sessionId);
-    await supabase.from('baileys_auth_state').delete().eq('session_id', sessionId);
+export const deleteSessionData = async (sessionId, companyId) => {
+    // Atualiza status para desconectado
+    await supabase.from('instances')
+        .update({ status: 'disconnected', sync_status: null, qrcode_url: null })
+        .eq('session_id', sessionId)
+        .eq('company_id', companyId);
+        
+    // Limpa credenciais
+    await supabase.from('baileys_auth_state')
+        .delete()
+        .eq('session_id', sessionId);
 };
-export const updateInstance = async (sessionId, data) => {
-    await supabase.from('instances').update(data).eq('session_id', sessionId);
+export const updateInstanceStatus = async (sessionId, companyId, data) => {
+    await supabase.from('instances').update(data).eq('session_id', sessionId).eq('company_id', companyId);
 };
