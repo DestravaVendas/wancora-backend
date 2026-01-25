@@ -5,7 +5,7 @@ import routes from './routes.js';
 import { createClient } from "@supabase/supabase-js";
 import { startSession } from './services/baileys/connection.js';
 import { startSentinel } from './services/scheduler/sentinel.js';
-import { startAgendaWorker } from './workers/agendaWorker.js'; // NOVO IMPORT
+import { startAgendaWorker } from './workers/agendaWorker.js';
 
 // 🔥 INICIALIZAÇÃO DOS WORKERS 🔥
 import './workers/campaignWorker.js';
@@ -82,7 +82,7 @@ app.listen(PORT, () => {
     // Inicia serviços
     restoreSessions();
     startSentinel();
-    startAgendaWorker(); // INICIA O WORKER DE NOTIFICAÇÕES
+    startAgendaWorker();
 });
 
 export default app;
