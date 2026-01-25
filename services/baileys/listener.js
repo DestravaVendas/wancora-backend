@@ -18,6 +18,7 @@ import mime from 'mime-types';
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'silent' });
 
+// --- CACHE DE DEDUPLICAÇÃO (MEMÓRIA) ---
 const msgCache = new Set();
 const addToCache = (id) => {
     if (msgCache.has(id)) return false;
@@ -26,7 +27,7 @@ const addToCache = (id) => {
     return true;
 };
 
-// Utilitário para desenrolar mensagens complexas
+// --- HELPERS ---
 const unwrapMessage = (msg) => {
     if (!msg.message) return msg;
     let content = msg.message;
@@ -92,15 +93,18 @@ const fetchGroupSubjectSafe = async (sock, jid) => {
     } catch (e) { return null; }
 };
 
+// ==============================================================================
+// SETUP LISTENERS (FUSÃO DEFINITIVA)
+// ==============================================================================
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
     // -----------------------------------------------------------
-    // 0. GATILHO IMEDIATO DE SYNC (ZERO GAP)
+    // 0. GATILHO DE CONEXÃO
     // -----------------------------------------------------------
     sock.ev.on('connection.update', async (update) => {
         const { connection } = update;
         if (connection === 'open') {
-            console.log(`⚡ [LISTENER] Conexão aberta! Forçando status 'importing' imediatamente.`);
+            console.log(`⚡ [LISTENER] Conexão aberta! Preparando importação.`);
             await updateSyncStatus(sessionId, 'importing_contacts', 5);
         }
     });
@@ -125,11 +129,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // -----------------------------------------------------------
-    // 2. ATUALIZAÇÕES (ENQUETES V6)
+    // 2. ATUALIZAÇÕES (ENQUETES)
     // -----------------------------------------------------------
     sock.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
-            // Tratamento de Votos em Enquete
             if (update.pollUpdates) {
                 const pollCreationKey = update.key;
                 if (!pollCreationKey) continue;
@@ -141,7 +144,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     const voterJid = normalizeJid(pollUpdate.pollUpdateMessageKey?.participant || pollUpdate.pollUpdateMessageKey?.remoteJid);
                     const selectedOptions = vote.selectedOptions || [];
                     
-                    // Recupera mensagem original
                     const { data: originalMsg } = await supabase
                         .from('messages')
                         .select('content, poll_votes')
@@ -180,16 +182,16 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // -----------------------------------------------------------
-    // 3. HISTÓRICO DE MENSAGENS (SYNC COMPLETO E ROBUSTO)
+    // 3. HISTÓRICO DE MENSAGENS (MASTER SYNC LOGIC)
     // -----------------------------------------------------------
     sock.ev.on('messaging-history.set', async ({ contacts, messages, isLatest }) => {
         
-        console.log(`📚 [HISTÓRICO] Processando lote de histórico... (isLatest: ${isLatest})`);
+        console.log(`📚 [HISTÓRICO] Processando lote... (isLatest: ${isLatest})`);
 
         try {
             const contactsMap = new Map();
 
-            // A. Contatos (AGENDA PRIORITY - Fusão da lógica do Arq 4)
+            // A. Contatos da Agenda (Prioridade Máxima)
             if (contacts && contacts.length > 0) {
                 await updateSyncStatus(sessionId, 'importing_contacts', 10);
                 
@@ -197,55 +199,57 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
                     
-                    // Lógica vital: Se c.name existe, é um contato salvo na agenda do celular
-                    const isBook = !!c.name;
-                    
-                    contactsMap.set(jid, { 
-                        name: c.name || c.verifiedName || c.notify, 
-                        imgUrl: c.imgUrl, 
-                        isFromBook: isBook, 
-                        lid: c.lid || null 
-                    });
+                    // Se 'c.name' existe, é nome salvo na agenda do celular (Book)
+                    const isBook = !!c.name; 
+                    const bestName = c.name || c.verifiedName || c.notify;
+
+                    if (bestName) {
+                        contactsMap.set(jid, { 
+                            name: bestName, 
+                            imgUrl: c.imgUrl, 
+                            isFromBook: isBook, 
+                            lid: c.lid || null 
+                        });
+                    }
                 });
 
                 const uniqueJids = Array.from(contactsMap.keys());
                 const BATCH_SIZE = 25; 
                 
-                // Processa contatos em lotes para não travar
                 for (let i = 0; i < uniqueJids.length; i += BATCH_SIZE) {
                     const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
                     await Promise.all(batchJids.map(async (jid) => {
                         let data = contactsMap.get(jid);
                         
-                        // Se for grupo e não tiver nome, tenta buscar metadata
+                        // Se for grupo sem nome, tenta buscar
                         if (jid.includes('@g.us') && !data.name) {
                             const groupName = await fetchGroupSubjectSafe(sock, jid);
                             if (groupName) data.name = groupName;
                         }
                         
-                        // Passa isFromBook para o sync.js garantir a autoridade do nome
+                        // Upsert com a flag correta
                         await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                     }));
                     await new Promise(r => setTimeout(r, 10)); 
                 }
             }
 
-            // B. Mensagens (Processamento Total sem pular lotes)
+            // B. Mensagens (Com limite de 10 por chat e barra de progresso)
             if (messages && messages.length > 0) {
-                // Name Hunter (Extrai nomes de pushName de quem não está na agenda)
+                // Name Hunter (Busca nomes em pushName se não tiver na agenda)
                 messages.forEach(msg => {
                     if (msg.key.fromMe) return;
                     const jid = normalizeJid(msg.key.remoteJid);
                     if (!jid) return;
                     
-                    // Só atualiza pushName se não tivermos um nome oficial da agenda
                     const existing = contactsMap.get(jid);
+                    // Se não temos o contato mapeado OU ele não veio da agenda, aceitamos o pushName
                     if ((!existing || !existing.isFromBook) && msg.pushName) {
                         upsertContact(jid, companyId, msg.pushName, null, false);
                     }
                 });
 
-                // Organização por Chat para aplicar o limite de "10 últimas"
+                // Organização por Chat
                 const messagesByChat = new Map();
                 messages.forEach(msg => {
                     const unwrapped = unwrapMessage(msg);
@@ -257,17 +261,17 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     messagesByChat.get(jid).push(unwrapped);
                 });
 
-                // Flattening com Limite de 10 por chat (Regra de Performance)
+                // Flattening com Limite de 10 (Fast Sync)
                 let finalMessagesToProcess = [];
                 const chats = Array.from(messagesByChat.entries());
                 
                 chats.forEach(([chatJid, chatMsgs]) => {
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-                    const msgsToSave = chatMsgs.slice(-10); // Mantém apenas as recentes
+                    const msgsToSave = chatMsgs.slice(-10); // Mantém apenas 10 recentes
                     
                     const mapData = contactsMap.get(chatJid);
                     msgsToSave.forEach(m => {
-                        // Anexa o nome forçado se vier da agenda
+                        // Força o nome se já tivermos mapeado (evita queries extras no sync)
                         m._forcedName = mapData ? mapData.name : (m.pushName || null);
                     });
                     
@@ -278,21 +282,20 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 let processedInBatch = 0;
                 let lastLoggedPercent = 0;
 
-                console.log(`📥 [SYNC] Salvando ${totalInBatch} mensagens recentes.`);
+                console.log(`📥 [SYNC] Importando ${totalInBatch} mensagens recentes.`);
                 await updateSyncStatus(sessionId, 'importing_messages', 20);
 
                 for (const msg of finalMessagesToProcess) {
-                    // CRUCIAL: createLead = true (conversas viram leads),
-                    // mas a função barra Grupos e Self internamente.
+                    // createLead = true, mas a função processSingleMessage filtra grupos/self internamente
                     await processSingleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, true);
                     
                     processedInBatch++;
 
-                    // Log Visual a cada 2% para feedback no frontend
+                    // Log Visual (0-100% relativo ao lote, mas a UI lida com isso)
                     const percent = Math.floor((processedInBatch / totalInBatch) * 100);
                     
-                    if (percent >= lastLoggedPercent + 2) {
-                        console.log(`📥 [SYNC] ${processedInBatch}/${totalInBatch} mensagens ${percent}%`);
+                    if (percent >= lastLoggedPercent + 5) {
+                        console.log(`📥 [SYNC] Progresso: ${percent}%`);
                         await updateSyncStatus(sessionId, 'importing_messages', percent);
                         lastLoggedPercent = percent;
                     }
@@ -304,13 +307,12 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         } catch (e) {
             console.error("❌ [SYNC ERROR]", e);
         } finally {
-            // Se isLatest for true, significa que o Baileys terminou de mandar o histórico.
-            // Forçamos o 100% para o componente GlobalSyncIndicator fechar.
+            // Se o Baileys disse que é o último lote, finalizamos
             if (isLatest) {
                 await updateSyncStatus(sessionId, 'completed', 100);
-                console.log(`✅ [HISTÓRICO] Sincronização Finalizada Completamente.`);
+                console.log(`✅ [HISTÓRICO] Sincronização Finalizada (100%).`);
             } else {
-                // Se ainda tem mais lotes vindo, mantém em 99% para mostrar atividade
+                // Se não, mantém 99% para dar sensação de continuidade
                 await updateSyncStatus(sessionId, 'importing_messages', 99);
             }
         }
@@ -321,12 +323,11 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // -----------------------------------------------------------
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         for (const msg of messages) {
-            // REVOKE
+            // REVOKE (Mensagem apagada)
             const protocolMsg = msg.message?.protocolMessage;
             if (protocolMsg && protocolMsg.type === 0) {
                 const keyToRevoke = protocolMsg.key;
                 if (keyToRevoke && keyToRevoke.id) {
-                    console.log(`🗑️ [REVOKE] Mensagem apagada: ${keyToRevoke.id}`);
                     await supabase.from('messages')
                         .update({ 
                             content: '⊘ Mensagem apagada', 
@@ -345,13 +346,14 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const clean = unwrapMessage(msg);
             const jid = normalizeJid(clean.key.remoteJid);
             
+            // Name Hunter Realtime
             if (jid && !clean.key.fromMe) { 
                  fetchProfilePicSafe(sock, jid).then(url => {
                      if(url) upsertContact(jid, companyId, clean.pushName, url, false);
                  });
             }
             
-            // Mensagens em tempo real também tentam criar Lead (sujeito às regras de exclusão)
+            // Realtime sempre tenta criar Lead (createLead=true), sujeito aos filtros
             await processSingleMessage(clean, sock, companyId, sessionId, true, clean.pushName, true);
         }
     });
@@ -415,7 +417,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // -----------------------------------------------------------
-    // 7. EVENTOS DE CONTATO (Agenda Pura - Atualizações em Realtime)
+    // 7. EVENTOS DE CONTATO (Agenda Realtime)
     // -----------------------------------------------------------
     sock.ev.on('contacts.upsert', async (contacts) => {
         for (const c of contacts) {
@@ -423,7 +425,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             if (!jid) continue;
             const bestName = c.name || c.verifiedName || c.notify;
             
-            // Se tiver nome, assumimos que é uma atualização da agenda
+            // Se tem nome, é da agenda. Se não tem, pode ser só metadado.
             if (bestName || c.imgUrl) {
                 await upsertContact(jid, companyId, bestName, c.imgUrl || null, !!c.name, c.lid);
             }
@@ -456,10 +458,10 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         const fromMe = msg.key.fromMe;
         const myJid = normalizeJid(sock.user?.id); 
 
-        // === REGRA DE OURO PARA LEADS ===
-        // 1. Grupos não viram Leads.
-        // 2. Mensagens "Eu comigo mesmo" não viram Leads.
-        // 3. Se createLead for false (ex: vindo de um loop de histórico específico), respeita.
+        // === LÓGICA DE FILTRO DE LEADS (A REGRA DE OURO) ===
+        // 1. Se for Grupo (@g.us), NÃO cria lead.
+        // 2. Se for Self (Eu comigo mesmo), NÃO cria lead.
+        // 3. Se createLead já veio false (do histórico), respeita.
         let shouldCreateLead = createLead;
         if (jid.includes('@g.us') || jid === myJid) {
             shouldCreateLead = false;
@@ -467,16 +469,16 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
         let leadId = null;
         if (shouldCreateLead) {
-            // Cria ou recupera Lead se for conversa válida
+            // Cria Lead apenas se não for grupo e não for self
             leadId = await ensureLeadExists(jid, companyId, forcedName, myJid);
             
-            // Se for mensagem em tempo real, atualiza foto e dados do contato
+            // Atualiza foto e nome do contato se for mensagem realtime
             if (isRealtime && forcedName && jid !== myJid) {
                 await upsertContact(jid, companyId, forcedName, null, false);
             }
         }
         
-        // Atualiza participantes de grupo se houver nome disponível (Name Hunter em grupos)
+        // Em grupos, ainda queremos atualizar o nome dos participantes (Name Hunter)
         if (jid.includes('@g.us') && msg.key.participant && forcedName) {
              const partJid = normalizeJid(msg.key.participant);
              if (partJid !== myJid) {
@@ -528,7 +530,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
             media_url: mediaUrl,
             message_type: messageTypeClean,
             status: fromMe ? 'sent' : 'received',
-            lead_id: leadId, // Pode ser null se não for para criar lead
+            lead_id: leadId, // Null se não criou lead (ex: grupo)
             created_at: new Date((msg.messageTimestamp || Date.now() / 1000) * 1000)
         });
 
