@@ -1,4 +1,3 @@
-
 import 'dotenv/config'; 
 import express from 'express';
 import cors from 'cors';
@@ -6,10 +5,9 @@ import routes from './routes.js';
 import { createClient } from "@supabase/supabase-js";
 import { startSession } from './services/baileys/connection.js';
 import { startSentinel } from './services/scheduler/sentinel.js';
+import { startAgendaWorker } from './workers/agendaWorker.js'; // NOVO IMPORT
 
-
-
-// 🔥 INICIALIZAÇÃO DO WORKER DE CAMPANHAS 🔥
+// 🔥 INICIALIZAÇÃO DOS WORKERS 🔥
 import './workers/campaignWorker.js';
 
 const app = express();
@@ -79,11 +77,12 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
     console.log(`🚀 Wancora Backend rodando na porta ${PORT}`);
     console.log(`🔗 Endpoint: http://localhost:${PORT}/api/v1`);
-    console.log(`👷 Worker de Campanhas: ATIVO`);
+    console.log(`👷 Workers Ativos: Campanhas, Sentinela, Agenda`);
     
-    // Inicia restauração
+    // Inicia serviços
     restoreSessions();
     startSentinel();
+    startAgendaWorker(); // INICIA O WORKER DE NOTIFICAÇÕES
 });
 
 export default app;
