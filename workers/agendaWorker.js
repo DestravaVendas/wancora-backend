@@ -42,7 +42,6 @@ export const startAgendaWorker = () => {
                 .select(`
                     id, start_time, title, company_id, user_id,
                     leads (id, name, phone),
-                    profiles:user_id (name),
                     companies (name)
                 `)
                 .eq('status', 'confirmed')
@@ -91,10 +90,11 @@ export const startAgendaWorker = () => {
                         if (timeUnit === 'hours') triggerTime -= timeAmount * 60 * 60 * 1000;
                         if (timeUnit === 'days') triggerTime -= timeAmount * 24 * 60 * 60 * 1000;
 
-                        // Verifica janela de disparo (com tolerância de 10 min atrasado para não perder cron)
+                        // Verifica janela de disparo (com tolerância de 15 min atrasado para não perder cron)
                         const diff = now.getTime() - triggerTime;
-                        // diff >= 0 significa que já passou da hora de disparar
-                        // diff < 15 min significa que não estamos muito atrasados
+                        
+                        // Lógica de janela: Deve ter passado da hora do trigger (diff >= 0)
+                        // MAS não pode ter passado muito tempo (ex: 15 min), senão é mensagem velha
                         if (diff >= 0 && diff < 15 * 60 * 1000) {
                             
                             // A. Resolve Sessão WhatsApp
