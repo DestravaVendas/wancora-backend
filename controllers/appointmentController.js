@@ -1,13 +1,14 @@
-import { supabase } from '../auth/supabaseAuth.js';
+import { createClient } from "@supabase/supabase-js";
 import { sendMessage } from '../services/baileys/sender.js';
 
-// Helper simples para limpar telefone
-const cleanPhone = (phone) => {
-  return phone.replace(/\D/g, '');
-};
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+    auth: { persistSession: false }
+});
+
+// Helper
+const cleanPhone = (phone) => phone.replace(/\D/g, '');
 
 export const sendAppointmentConfirmation = async (req, res) => {
-  // Recebe dados. Se sessionId não vier (chamada via webhook), tentamos descobrir.
   const { appointmentId, companyId } = req.body;
   let { sessionId } = req.body;
 
@@ -18,63 +19,99 @@ export const sendAppointmentConfirmation = async (req, res) => {
   try {
     console.log(`[AGENDA] 📅 Processando confirmação ID: ${appointmentId}`);
 
-    // 1. Buscar dados do agendamento com Leads e Profile
-    const { data: appointment, error } = await supabase
+    // 1. Buscar dados do agendamento
+    const { data: app, error } = await supabase
       .from('appointments')
       .select(`
         *,
         leads (name, phone),
-        profiles:user_id (name) 
+        profiles:user_id (name),
+        companies (name)
       `)
       .eq('id', appointmentId)
       .single();
 
-    if (error || !appointment) {
-      console.error('[AGENDA] Agendamento não encontrado no banco.');
+    if (error || !app) {
       return res.status(404).json({ error: 'Agendamento não encontrado.' });
     }
 
-    // 2. Resolução de Sessão (Se não foi passada explicitamente)
+    // 2. Resolução de Sessão (Se não veio no body)
     if (!sessionId) {
       const { data: instance } = await supabase
         .from('instances')
         .select('session_id')
-        .eq('company_id', appointment.company_id)
+        .eq('company_id', app.company_id)
         .eq('status', 'connected')
         .limit(1)
         .maybeSingle();
       
       if (!instance) {
-        return res.status(503).json({ error: 'Nenhuma conexão de WhatsApp ativa para esta empresa.' });
+        return res.status(503).json({ error: 'WhatsApp desconectado.' });
       }
       sessionId = instance.session_id;
     }
 
-    const clientPhone = cleanPhone(appointment.leads.phone);
-    const clientName = appointment.leads.name.split(' ')[0]; // Primeiro nome
-    const agentName = appointment.profiles?.name || 'Consultor';
-    
-    // Formatar data/hora (Intl é mais seguro que toLocaleString dependendo do Node locale)
-    const dateObj = new Date(appointment.start_time);
+    // 3. Buscar Regras de Notificação (Engine)
+    // Pega a regra ativa do dono da agenda para saber O QUE enviar
+    const { data: rules } = await supabase
+        .from('availability_rules')
+        .select('notification_config')
+        .eq('user_id', app.user_id)
+        .eq('company_id', app.company_id)
+        .eq('is_active', true)
+        .limit(1)
+        .maybeSingle();
+
+    // Se não tiver regra configurada, encerra sem erro (é opcional)
+    if (!rules?.notification_config) {
+        return res.json({ message: "Sem regras de notificação configuradas." });
+    }
+
+    const config = rules.notification_config;
+    const tasks = [];
+
+    // Preparar Variáveis do Template
+    const dateObj = new Date(app.start_time);
     const dateStr = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(dateObj);
     const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
-
-    // 3. Montar Mensagem
-    const messageText = `✅ *Confirmação de Agendamento*\n\nOlá ${clientName}, sua reunião com *${agentName}* está agendada!\n\n📅 Data: ${dateStr}\n⏰ Horário: ${timeStr}\n🔗 Link: ${appointment.meet_link || 'A ser enviado'}\n\nResponda esta mensagem se precisar reagendar.`;
-
-    // 4. Enviar via WhatsApp
-    const remoteJid = `${clientPhone}@s.whatsapp.net`;
     
-    await sendMessage(sessionId, remoteJid, { text: messageText });
+    const replaceVars = (tpl) => {
+        return tpl
+            .replace('[lead_name]', app.leads?.name || 'Cliente')
+            .replace('[lead_phone]', app.leads?.phone || '')
+            .replace('[empresa]', app.companies?.name || '')
+            .replace('[data]', dateStr)
+            .replace('[hora]', timeStr);
+    };
 
-    // 5. Atualizar flag no banco para evitar reenvio
-    await supabase
-      .from('appointments')
-      .update({ confirmation_sent: true })
-      .eq('id', appointmentId);
+    // A. Notificar Admin (Dono da Agenda)
+    if (config.admin_phone && config.admin_notifications) {
+        const onBookingAdmin = config.admin_notifications.find(n => n.type === 'on_booking' && n.active);
+        if (onBookingAdmin) {
+            const adminMsg = replaceVars(onBookingAdmin.template);
+            const adminPhone = cleanPhone(config.admin_phone);
+            tasks.push(sendMessage(sessionId, `${adminPhone}@s.whatsapp.net`, { text: adminMsg }));
+        }
+    }
 
-    console.log(`[AGENDA] ✅ Confirmação enviada para ${clientName} (${clientPhone})`);
-    return res.status(200).json({ success: true, message: 'Confirmação enviada com sucesso' });
+    // B. Notificar Lead (Cliente) - Confirmação Imediata
+    if (app.leads?.phone && config.lead_notifications) {
+        const onBookingLead = config.lead_notifications.find(n => n.type === 'on_booking' && n.active);
+        if (onBookingLead) {
+            const leadMsg = replaceVars(onBookingLead.template);
+            const leadPhone = cleanPhone(app.leads.phone);
+            tasks.push(sendMessage(sessionId, `${leadPhone}@s.whatsapp.net`, { text: leadMsg }));
+        }
+    }
+
+    // 4. Executar Envios
+    await Promise.all(tasks);
+
+    // 5. Atualizar flag
+    await supabase.from('appointments').update({ confirmation_sent: true }).eq('id', appointmentId);
+
+    console.log(`[AGENDA] ✅ Confirmações enviadas: ${tasks.length}`);
+    return res.status(200).json({ success: true, count: tasks.length });
 
   } catch (error) {
     console.error('[AGENDA] ❌ Erro crítico:', error);
