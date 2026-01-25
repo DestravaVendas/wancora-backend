@@ -180,7 +180,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // -----------------------------------------------------------
-    // 3. HISTÓRICO DE MENSAGENS (SYNC COMPLETO - SEM IGNORAR LOTES)
+    // 3. HISTÓRICO DE MENSAGENS (SYNC COMPLETO)
     // -----------------------------------------------------------
     sock.ev.on('messaging-history.set', async ({ contacts, messages, isLatest }) => {
         
@@ -189,31 +189,39 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         try {
             const contactsMap = new Map();
 
-            // A. Contatos (Apenas salva em contacts, NÃO cria lead aqui)
+            // A. Contatos (Apenas salva em contacts, PRIORIDADE MÁXIMA PARA NOMES DA AGENDA)
             if (contacts && contacts.length > 0) {
                 await updateSyncStatus(sessionId, 'importing_contacts', 10);
                 
                 contacts.forEach(c => {
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
-                    contactsMap.set(jid, { name: c.name || c.verifiedName || c.notify, imgUrl: c.imgUrl, isFromBook: !!c.name, lid: c.lid || null });
+                    // Mapeia o nome que veio da agenda (c.name)
+                    contactsMap.set(jid, { 
+                        name: c.name || c.verifiedName || c.notify, 
+                        imgUrl: c.imgUrl, 
+                        // SE c.name existe, é da agenda (Book). 
+                        isFromBook: !!c.name, 
+                        lid: c.lid || null 
+                    });
                 });
 
                 const uniqueJids = Array.from(contactsMap.keys());
-                const BATCH_SIZE = 20; // Aumentado para performance
+                const BATCH_SIZE = 25; 
                 
+                // Processa contatos em paralelo controlado
                 for (let i = 0; i < uniqueJids.length; i += BATCH_SIZE) {
                     const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
                     await Promise.all(batchJids.map(async (jid) => {
                         let data = contactsMap.get(jid);
+                        
+                        // Se for grupo e não tiver nome, tenta buscar
                         if (jid.includes('@g.us') && !data.name) {
                             const groupName = await fetchGroupSubjectSafe(sock, jid);
                             if (groupName) data.name = groupName;
                         }
-                        if (!data.imgUrl) {
-                            const freshPic = await fetchProfilePicSafe(sock, jid);
-                            if (freshPic) data.imgUrl = freshPic;
-                        }
+                        
+                        // upsertContact com a flag isFromBook correta garante que o nome da agenda prevaleça
                         await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                     }));
                     await new Promise(r => setTimeout(r, 10)); 
@@ -222,12 +230,13 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
             // B. Mensagens (Processamento Total com Limite por Conversa)
             if (messages && messages.length > 0) {
-                // Name Hunter
+                // Name Hunter - Extrai nomes de pushName das mensagens para contatos desconhecidos
                 messages.forEach(msg => {
                     if (msg.key.fromMe) return;
                     const jid = normalizeJid(msg.key.remoteJid);
                     if (!jid) return;
                     const existing = contactsMap.get(jid);
+                    // Só atualiza se NÃO tivermos um nome da agenda (existing.name)
                     if ((!existing || !existing.name) && msg.pushName) {
                         upsertContact(jid, companyId, msg.pushName, null, false);
                     }
@@ -257,7 +266,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     
                     const mapData = contactsMap.get(chatJid);
                     msgsToSave.forEach(m => {
-                        m._forcedName = m.pushName || (mapData ? mapData.name : null);
+                        // Força o nome da agenda se disponível
+                        m._forcedName = mapData ? mapData.name : (m.pushName || null);
                     });
                     
                     finalMessagesToProcess.push(...msgsToSave);
@@ -271,14 +281,16 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 await updateSyncStatus(sessionId, 'importing_messages', 20);
 
                 for (const msg of finalMessagesToProcess) {
-                    // CRUCIAL: Aqui 'createLead' é TRUE (conversas viram leads),
+                    // CRUCIAL: 'createLead' é TRUE (conversas viram leads),
                     // MAS a função processSingleMessage tem lógica para barrar Grupos e Self.
                     await processSingleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, true);
                     
                     processedInBatch++;
 
                     // Log Visual a cada 2%
-                    const percent = Math.min(99, Math.floor((processedInBatch / totalInBatch) * 100));
+                    // REMOVIDO o Math.min(99) para permitir chegar a 100% no log
+                    const percent = Math.floor((processedInBatch / totalInBatch) * 100);
+                    
                     if (percent >= lastLoggedPercent + 2) {
                         console.log(`📥 [SYNC] ${processedInBatch}/${totalInBatch} mensagens ${percent}%`);
                         await updateSyncStatus(sessionId, 'importing_messages', percent);
@@ -292,9 +304,15 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         } catch (e) {
             console.error("❌ [SYNC ERROR]", e);
         } finally {
+            // Se for o último lote OU se chegamos aqui com sucesso, forçamos 'completed'
+            // Isso garante que o spinner feche no frontend
             if (isLatest) {
                 await updateSyncStatus(sessionId, 'completed', 100);
                 console.log(`✅ [HISTÓRICO] Sincronização Finalizada Completamente.`);
+            } else {
+                // Se não é o último lote, mas terminou este, garante que o progresso visual fique em alta
+                // O próximo lote vai continuar ou o isLatest virá em seguida
+                await updateSyncStatus(sessionId, 'importing_messages', 99);
             }
         }
     });
