@@ -90,7 +90,13 @@ export const sendAppointmentConfirmation = async (req, res) => {
         if (onBookingAdmin) {
             const adminMsg = replaceVars(onBookingAdmin.template);
             const adminPhone = cleanPhone(config.admin_phone);
-            tasks.push(sendMessage(sessionId, `${adminPhone}@s.whatsapp.net`, { text: adminMsg }));
+            // Payload unificado conforme sender.js
+            tasks.push(sendMessage({ 
+                sessionId, 
+                to: `${adminPhone}@s.whatsapp.net`, 
+                type: 'text', 
+                content: adminMsg 
+            }));
         }
     }
 
@@ -100,7 +106,12 @@ export const sendAppointmentConfirmation = async (req, res) => {
         if (onBookingLead) {
             const leadMsg = replaceVars(onBookingLead.template);
             const leadPhone = cleanPhone(app.leads.phone);
-            tasks.push(sendMessage(sessionId, `${leadPhone}@s.whatsapp.net`, { text: leadMsg }));
+            tasks.push(sendMessage({ 
+                sessionId, 
+                to: `${leadPhone}@s.whatsapp.net`, 
+                type: 'text', 
+                content: leadMsg 
+            }));
         }
     }
 
