@@ -207,7 +207,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         const mapData = contactsMap.get(chatJid);
                         const forcedName = msg.pushName || (mapData ? mapData.name : null);
                         // Mensagens históricas não baixam mídia (isRealtime = false)
-                        await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName);
+                        // ADICIONADO: ignoreConflict = true (Não processa se já existe)
+                        await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName, true);
                     }
                     processedCount += msgsToSave.length;
 
@@ -274,7 +275,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             }
             
             // isRealtime = true (Baixa mídia, dispara gatilhos de automação)
-            await processSingleMessage(clean, sock, companyId, sessionId, true, clean.pushName);
+            // ignoreConflict = false (Queremos garantir que a mensagem nova seja salva)
+            await processSingleMessage(clean, sock, companyId, sessionId, true, clean.pushName, false);
         }
     });
 
@@ -439,7 +441,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 };
 
-const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime, forcedName = null) => {
+const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime, forcedName = null, ignoreConflict = false) => {
     try {
         if (!msg.message) return;
         const jid = normalizeJid(msg.key.remoteJid);
@@ -519,7 +521,7 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
             status: fromMe ? 'sent' : 'received',
             lead_id: leadId,
             created_at: new Date((msg.messageTimestamp || Date.now() / 1000) * 1000)
-        });
+        }, ignoreConflict);
 
     } catch (e) {
         console.error("Erro processSingleMessage:", e);
