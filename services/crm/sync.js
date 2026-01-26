@@ -1,4 +1,3 @@
-
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
@@ -244,8 +243,8 @@ export const ensureLeadExists = async (jid, companyId, pushName, myBotJid = null
     }
 };
 
-// --- CORE: UPSERT MESSAGE ---
-export const upsertMessage = async (msgData) => {
+// --- CORE: UPSERT MESSAGE (MODO BLINDADO) ---
+export const upsertMessage = async (msgData, ignoreConflict = false) => {
     try {
         // Delay tático para garantir que o contato/lead já exista (Integridade FK)
         await new Promise(resolve => setTimeout(resolve, 50)); 
@@ -253,7 +252,16 @@ export const upsertMessage = async (msgData) => {
         const cleanRemoteJid = normalizeJid(msgData.remote_jid);
         const finalData = { ...msgData, remote_jid: cleanRemoteJid };
         
-        const { error } = await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
+        // MODIFICAÇÃO CRÍTICA: Se for histórico (ignoreConflict=true), usamos
+        // a opção ignoreDuplicates do Supabase. Isso faz com que, se o ID já existir,
+        // o banco não faça NADA (0 CPU, 0 I/O de escrita).
+        const { error } = await supabase
+            .from('messages')
+            .upsert(finalData, { 
+                onConflict: 'remote_jid, whatsapp_id',
+                ignoreDuplicates: ignoreConflict 
+            });
+
         if (error) throw error;
     } catch (e) {
         // Silencioso em produção, mas logado se for erro grave
