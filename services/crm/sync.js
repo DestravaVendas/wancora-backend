@@ -1,3 +1,4 @@
+
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 
@@ -219,10 +220,20 @@ export const upsertMessage = async (msgData) => {
 };
 
 export const savePollVote = async (msg, companyId) => {};
-export const deleteSessionData = async (sessionId) => {
-    await supabase.from('instances').update({ status: 'disconnected' }).eq('session_id', sessionId);
+
+// Atualizado para aceitar companyId e limpar corretamente
+export const deleteSessionData = async (sessionId, companyId) => {
+    await supabase.from('instances')
+        .update({ status: 'disconnected', qrcode_url: null })
+        .eq('session_id', sessionId); // companyId opcional aqui pois sessionId é único
+        
     await supabase.from('baileys_auth_state').delete().eq('session_id', sessionId);
 };
-export const updateInstance = async (sessionId, data) => {
-    await supabase.from('instances').update(data).eq('session_id', sessionId);
+
+// FIX DO ERRO DE DEPLOY: Esta função estava faltando
+export const updateInstanceStatus = async (sessionId, companyId, data) => {
+    await supabase.from('instances')
+        .update({ ...data, updated_at: new Date() })
+        .eq('session_id', sessionId)
+        .eq('company_id', companyId);
 };
