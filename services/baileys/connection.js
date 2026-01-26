@@ -1,4 +1,3 @@
-
 import makeWASocket, { 
     DisconnectReason, 
     fetchLatestBaileysVersion,
@@ -101,16 +100,24 @@ export const startSession = async (sessionId, companyId) => {
         // C) DESCONEXÃO / QUEDA
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 403;
+            
+            // PATCH CRÍTICO 440: Adicionado statusCode 440 e 401 na lista de NÃO RECONECTAR
+            // 440 = Session Replaced (Conflito) | 401 = Unauthorized (Sessão Inválida) | 403 = Forbidden (Banido/Logout)
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut 
+                && statusCode !== 403 
+                && statusCode !== 440 
+                && statusCode !== 401;
             
             console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}. Reconectar? ${shouldReconnect}`);
 
             if (shouldReconnect) {
                 // Estratégia de Backoff Simples: Tenta reconectar em 3s
-                // Apenas removemos o timer se existir para evitar duplicação
                 setTimeout(() => startSession(sessionId, companyId), 3000);
             } else {
-                // Logout Definitivo (Ex: Desconectado pelo celular ou Banido)
+                // Logout Definitivo (Ex: Desconectado pelo celular, Banido ou Conflito 440)
+                if (statusCode === 440) {
+                    console.warn(`⚠️ [CONFLITO] Sessão ${sessionId} derrubada por conflito (440). Limpando dados para forçar novo pareamento.`);
+                }
                 console.log(`🧹 [LOGOUT] Limpando dados da sessão ${sessionId}`);
                 await deleteSession(sessionId, companyId);
             }
