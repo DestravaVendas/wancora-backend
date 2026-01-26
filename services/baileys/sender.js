@@ -45,7 +45,7 @@ export const sendMessage = async ({
                 throw new Error("Número não possui WhatsApp.");
             }
         } catch (e) {
-            // Se der erro na checagem (timeout), loga mas tenta enviar mesmo assim (fail-open strategy)
+            // Se der erro na checagem, loga mas tenta enviar (fail-open)
             console.warn(`[ANTI-BAN] Falha ao verificar existência do número: ${e.message}`);
         }
     }
@@ -56,19 +56,16 @@ export const sendMessage = async ({
         // 2. Delay Inicial e Simulação de Presença
         await delay(randomDelay(300, 800));
         
-        // Define se aparece "Digitando..." ou "Gravando áudio..."
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
         await sock.sendPresenceUpdate(presenceType, jid);
 
         // 3. Tempo de Produção (Simula tempo para escrever/gravar)
         let typingTime = 1500; 
         if (type === 'text' && content) {
-            // ~50ms por caractere, máximo 5 segundos para não travar fila
             typingTime = Math.min(content.length * 50, 5000); 
         }
         await delay(typingTime);
         
-        // Pausa a presença antes de enviar
         await sock.sendPresenceUpdate('paused', jid);
 
         let sentMsg;
@@ -76,11 +73,10 @@ export const sendMessage = async ({
         // 4. Switch de Tipos de Mensagem
         switch (type) {
             case 'pix':
-                // --- ESTRATÉGIA DUAL-SEND (MAXIMUM COMPATIBILITY) ---
+                // --- PIX NATIVE FLOW (BOTÃO DE CÓPIA) ---
                 const pixKey = content || "CHAVE_NAO_INFORMADA";
                 console.log(`💲 [PIX] Gerando payload Native Flow para: ${pixKey}`);
 
-                // A. Envia Card Interativo (Bonito, mas falha no Web/Desktop)
                 try {
                     const msgParams = {
                         viewOnceMessage: {
@@ -111,18 +107,16 @@ export const sendMessage = async ({
                             }
                         }
                     };
+                    // Relay Message é necessário para payloads complexos
                     const waMessage = await generateWAMessageFromContent(jid, msgParams, { userJid: sock.user.id });
                     await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
+                    sentMsg = waMessage;
                 } catch (e) {
-                    console.error("Erro ao enviar botão Pix (Ignorado):", e);
+                    console.error("Erro ao enviar botão Pix (Fallback para texto):", e);
+                    sentMsg = await sock.sendMessage(jid, { 
+                        text: `Chave Pix:\n\n${pixKey}\n\n_(Caso o botão acima não funcione)_` 
+                    });
                 }
-                
-                // B. Envia Texto Puro (Fallback Garantido)
-                // Pequeno delay para garantir ordem de chegada
-                await delay(300);
-                sentMsg = await sock.sendMessage(jid, { 
-                    text: `Chave Pix:\n\n${pixKey}\n\n_(Caso o botão acima não funcione)_` 
-                });
                 break;
 
             case 'text':
@@ -139,7 +133,6 @@ export const sendMessage = async ({
 
             case 'audio':
                 // ptt: true envia como nota de voz (onda verde)
-                // Se ptt for false, envia como arquivo de áudio (laranja)
                 sentMsg = await sock.sendMessage(jid, { 
                     audio: { url }, 
                     ptt: !!ptt, 
