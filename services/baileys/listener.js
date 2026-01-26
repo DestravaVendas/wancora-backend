@@ -87,7 +87,39 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // Contador de Lotes para Fast Sync (Limita a 2 pacotes)
     let historyChunkCounter = 0;
 
-    // --- EVENTO CRÍTICO: HISTÓRICO DE MENSAGENS ---
+    // --- 1. PRESENÇA (ONLINE / DIGITANDO / VISTO POR ÚLTIMO) ---
+    // Vital para a experiência social do usuário. Atualiza a tabela contacts.
+    sock.ev.on('presence.update', async ({ id, presences }) => {
+        try {
+            const jid = normalizeJid(id);
+            // Ignoramos atualizações de presença em grupos para não spammar o banco com updates
+            if (!jid || jid.includes('@g.us')) return; 
+
+            // Pega o status do participante
+            const participant = Object.values(presences)[0]; 
+            if (!participant) return;
+
+            // 'available' = Online
+            // 'composing'/'recording' = Digitando/Gravando (Consideramos online também)
+            const isOnline = participant.lastKnownPresence === 'available' 
+                             || participant.lastKnownPresence === 'composing' 
+                             || participant.lastKnownPresence === 'recording';
+            
+            // Atualiza tabela contacts para o Frontend mostrar a bolinha verde
+            await supabase.from('contacts')
+                .update({ 
+                    is_online: isOnline,
+                    last_seen_at: new Date().toISOString()
+                })
+                .eq('jid', jid)
+                .eq('company_id', companyId);
+
+        } catch (e) {
+            // Silencioso para não poluir logs com eventos frequentes
+        }
+    });
+
+    // --- 2. HISTÓRICO DE MENSAGENS (SYNC ROBUSTO) ---
     sock.ev.on('messaging-history.set', async ({ contacts, messages, isLatest }) => {
         historyChunkCounter++;
         const itemCount = (contacts?.length || 0) + (messages?.length || 0);
@@ -103,12 +135,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             // Mapa em memória para evitar queries repetitivas durante o processamento do lote
             const contactsMap = new Map();
 
-            // 1. Processamento de Contatos (Upsert em Batch Controlado)
+            // A. Processamento de Contatos
             if (contacts && contacts.length > 0) {
-                console.log(`📇 [HISTÓRICO] Mapeando ${contacts.length} contatos...`);
                 await updateSyncStatus(sessionId, 'importing_contacts', 10);
                 
-                // Popula mapa
                 contacts.forEach(c => {
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
@@ -121,17 +151,14 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     });
                 });
 
-                // Executa upserts
                 const uniqueJids = Array.from(contactsMap.keys());
-                const BATCH_SIZE = 20; // Tamanho do lote para não afogar o banco
+                const BATCH_SIZE = 20; 
                 
                 for (let i = 0; i < uniqueJids.length; i += BATCH_SIZE) {
                     const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
                     
                     await Promise.all(batchJids.map(async (jid) => {
                         let data = contactsMap.get(jid);
-                        
-                        // Enriquece dados se for grupo ou sem foto
                         if (jid.includes('@g.us') && !data.name) {
                             const groupName = await fetchGroupSubjectSafe(sock, jid);
                             if (groupName) data.name = groupName;
@@ -142,23 +169,17 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         }
                         await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                     }));
-
-                    // Libera Event Loop por 10ms para o Node respirar
                     await new Promise(r => setTimeout(r, 10));
-                    
-                    // Log de Progresso (Visível no Render)
-                    if (i % 100 === 0) console.log(`📇 [SYNC CONTATOS] Processados ${Math.min(i + BATCH_SIZE, uniqueJids.length)}/${uniqueJids.length}`);
                 }
             }
 
-            // 2. Scan de Mensagens (Name Hunter - Tenta achar nomes nos metadados das mensagens)
+            // B. Scan de Mensagens (Name Hunter)
             if (messages && messages.length > 0) {
                 messages.forEach(msg => {
                     if (msg.key.fromMe) return;
                     const jid = normalizeJid(msg.key.remoteJid);
                     if (!jid) return;
                     const existing = contactsMap.get(jid);
-                    // Se não temos nome ainda, mas a mensagem tem pushName, usamos ele
                     if (!existing || !existing.name) {
                         if (msg.pushName) {
                             if (existing) existing.name = msg.pushName; 
@@ -168,12 +189,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                 });
             }
 
-            // 3. Processamento de Mensagens (O mais pesado)
+            // C. Processamento de Mensagens
             if (messages && messages.length > 0) {
-                console.log(`💬 [HISTÓRICO] Processando ${messages.length} mensagens...`);
                 await updateSyncStatus(sessionId, 'importing_messages', 30);
                 
-                // Agrupa por Chat para manter ordem cronológica e consistência de contexto
                 const messagesByChat = new Map();
                 messages.forEach(msg => {
                     const unwrapped = unwrapMessage(msg);
@@ -184,42 +203,31 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     messagesByChat.get(jid).push(unwrapped);
                 });
 
-                // Ordena chats por atividade recente (Mais recentes primeiro)
                 const sortedChats = Array.from(messagesByChat.entries()).sort(([, msgsA], [, msgsB]) => {
                     const tA = Math.max(...msgsA.map(m => m.messageTimestamp || 0));
                     const tB = Math.max(...msgsB.map(m => m.messageTimestamp || 0));
                     return tB - tA; 
                 });
 
-                // Limita a 300 chats mais recentes para não estourar memória na importação inicial
                 const topChats = sortedChats.slice(0, 300); 
                 
-                let processedCount = 0;
                 for (let i = 0; i < topChats.length; i++) {
                     const [chatJid, chatMsgs] = topChats[i];
-                    // Ordena mensagens dentro do chat (Antigas -> Novas)
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                     
-                    // FAST BOOT: Reduzido de 50 para 10 mensagens por chat
-                    const msgsToSave = chatMsgs.slice(-10); 
+                    const msgsToSave = chatMsgs.slice(-10); // Mantém apenas as 10 últimas para Fast Boot
 
                     for (const msg of msgsToSave) {
                         const mapData = contactsMap.get(chatJid);
                         const forcedName = msg.pushName || (mapData ? mapData.name : null);
-                        // Mensagens históricas não baixam mídia (isRealtime = false)
-                        // ADICIONADO: ignoreConflict = true (Não processa se já existe)
                         await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName, true);
                     }
-                    processedCount += msgsToSave.length;
 
-                    // Unblock Event Loop
                     await new Promise(r => setTimeout(r, 5));
 
-                    // Atualiza status a cada 10 chats
-                    if (i % 10 === 0 || i === topChats.length - 1) {
-                        const progress = 30 + Math.floor((i / topChats.length) * 65); // 30% a 95%
+                    if (i % 10 === 0) {
+                        const progress = 30 + Math.floor((i / topChats.length) * 65);
                         await updateSyncStatus(sessionId, 'importing_messages', progress);
-                        console.log(`💬 [SYNC MSGS] Chat ${i}/${topChats.length} (${processedCount} msgs salvas)`);
                     }
                 }
             }
@@ -227,27 +235,23 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         } catch (e) {
             console.error("❌ [CRITICAL SYNC ERROR]", e);
         } finally {
-            // LÓGICA DE FAST BOOT: Se for o último pacote OU se já processamos 2 pacotes, força 100%.
             if (isLatest || historyChunkCounter >= 2) {
-                console.log(`✅ [SYNC] Fast Boot completo (Chunk ${historyChunkCounter}). Liberando UI (100%).`);
                 await updateSyncStatus(sessionId, 'completed', 100);
             } else {
-                console.log(`⏳ [SYNC] Chunk ${historyChunkCounter} processado. Aguardando próximo...`);
-                // Mantém em 99% visualmente
                 await updateSyncStatus(sessionId, 'importing_messages', 99);
             }
         }
     });
 
-    // --- MENSAGENS EM TEMPO REAL (MENSAGEM NOVA) ---
+    // --- 3. MENSAGENS EM TEMPO REAL ---
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         for (const msg of messages) {
-            // TRATAMENTO DE REVOKE (Protocol Message type 0)
             const protocolMsg = msg.message?.protocolMessage;
+            
+            // Tratamento de Revoke (Mensagem Apagada)
             if (protocolMsg && protocolMsg.type === 0) {
                 const keyToRevoke = protocolMsg.key;
                 if (keyToRevoke && keyToRevoke.id) {
-                    console.log(`🗑️ [REVOKE] Mensagem apagada: ${keyToRevoke.id}`);
                     await supabase.from('messages')
                         .update({ 
                             content: '🚫 Mensagem apagada', 
@@ -261,67 +265,31 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             }
 
             if (!msg.message) continue;
-            // Evita processar a mesma mensagem duas vezes
             if (!addToCache(msg.key.id)) continue;
 
             const clean = unwrapMessage(msg);
             const jid = normalizeJid(clean.key.remoteJid);
             
-            // Em tempo real, tentamos buscar a foto e nome imediatamente para atualizar o CRM
+            // Atualiza foto do contato se possível
             if (jid && !clean.key.fromMe) { 
                  fetchProfilePicSafe(sock, jid).then(url => {
                      if(url) upsertContact(jid, companyId, clean.pushName, url, false);
                  });
             }
             
-            // isRealtime = true (Baixa mídia, dispara gatilhos de automação)
-            // ignoreConflict = false (Queremos garantir que a mensagem nova seja salva)
             await processSingleMessage(clean, sock, companyId, sessionId, true, clean.pushName, false);
         }
     });
 
-    // --- PROCESSAMENTO DE VOTOS DE ENQUETE (messages.update) ---
-    // Este evento é disparado pelo Baileys quando há votos em uma enquete
+    // --- 4. VOTOS DE ENQUETE (REALTIME) ---
     sock.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
-            // Se houver atualizações de enquete
             if (update.pollUpdates) {
-                const pollUpdates = update.pollUpdates;
-                for (const pollUpdate of pollUpdates) {
-                    console.log(`🗳️ [ENQUETE] Voto recebido na msg ${update.key.id}`);
-                    
-                    const pollCreationKey = update.key;
-                    const vote = pollUpdate.vote; // Contém a chave do voto criptografada
-                    
-                    // Como não podemos decriptar facilmente a chave do voto aqui para pegar o texto,
-                    // O Baileys já nos dá o estado agregado se tivermos a mensagem original.
-                    // Porém, para simplificar e garantir persistência, vamos buscar a mensagem no banco
-                    // e atualizar o campo poll_votes.
-                    
-                    // Estrutura simplificada de salvamento:
-                    // Salvamos quem votou e o timestamp. Para saber "Em que", o frontend ou uma lógica 
-                    // mais complexa de decriptação seria necessária, mas o Baileys emite um evento "aggregated".
-                    // Vamos tentar simplificar: Se a mensagem existe, atualizamos o array de votos.
+                for (const pollUpdate of update.pollUpdates) {
+                    const messageId = update.key.id;
+                    const voterJid = normalizeJid(pollUpdate.senderTimestampMs ? update.key.remoteJid : undefined);
                     
                     try {
-                        const messageId = pollCreationKey.id;
-                        const voterJid = normalizeJid(pollUpdate.senderTimestampMs ? update.key.remoteJid : undefined); // Simplificação
-                        
-                        // NOTA: O Baileys é complexo com enquetes. A melhor forma de persistir
-                        // votos completos é usar o getMessage do socket se disponível, mas aqui
-                        // vamos focar em capturar que HOUVE um voto e atualizar a mensagem.
-                        
-                        // Melhor abordagem: Ler a mensagem do banco, e adicionar o voto.
-                        // O payload pollUpdates contém { vote: { selectedOptions: [...] } } se decriptado
-                        // ou hashes. 
-                        
-                        // Para este patch, vamos buscar a mensagem e atualizar com dados brutos do evento
-                        // para que o frontend possa ao menos mostrar que houve interação.
-                        
-                        // EM PRODUÇÃO: O ideal é implementar a lógica de agregação do Baileys.
-                        // Aqui faremos um "Append" seguro no JSONB.
-                        
-                        // Recupera votos atuais
                         const { data: currentMsg } = await supabase
                             .from('messages')
                             .select('poll_votes')
@@ -330,26 +298,20 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                             .single();
                             
                         if (currentMsg) {
-                            // Mapeia o voto. O baileys manda 'pollUpdate' com 'vote'
-                            // Se for criptografado, é difícil saber a opção exata sem chaves.
-                            // Mas se usarmos a pollCreationMessage, podemos tentar bater hashes.
-                            // Assumindo que o pollUpdate já venha processado pelo Baileys se tiver chaves.
+                            let votes = Array.isArray(currentMsg.poll_votes) ? currentMsg.poll_votes : [];
                             
-                            // Formato de poll_votes no banco: [{ voterJid, optionId, ts }]
-                            // Como não temos optionId fácil aqui sem lógica pesada, vamos salvar o update bruto
-                            // e deixar o frontend (PollBubble) se virar ou apenas mostrar contagem.
-                            
-                            // WORKAROUND: O Baileys emite um novo 'messages.upsert' quando a enquete muda? 
-                            // Não, ele emite messages.update.
-                            
-                            // Vamos salvar os dados disponíveis para debug e contagem
-                            // Na próxima versão, implementar 'getAggregateVotes' do baileys.
-                            
-                            // Para 'Ver quem votou', precisamos do JID de quem enviou o voto.
-                            // O evento messages.update muitas vezes não traz o sender explícito no topo.
-                            // Vamos assumir que em chats 1:1 é o remoteJid. Em grupos, precisamos do participant.
-                            
-                            // TODO: Refinar lógica de votos para grupos.
+                            // Adiciona voto bruto. A lógica de decriptação exata é complexa no Baileys,
+                            // mas o evento garante que houve uma interação.
+                            votes.push({
+                                voterJid,
+                                ts: Date.now(),
+                                raw: pollUpdate.vote
+                            });
+
+                            await supabase.from('messages')
+                                .update({ poll_votes: votes, updated_at: new Date() }) 
+                                .eq('whatsapp_id', messageId)
+                                .eq('company_id', companyId);
                         }
                     } catch(err) {
                         console.error("Erro ao processar voto:", err);
@@ -359,31 +321,31 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         }
     });
     
-    // --- STATUS DE LEITURA (TICKS AZUIS) ---
+    // --- 5. STATUS DE LEITURA (TICKS AZUIS) ---
     sock.ev.on('message-receipt.update', async (events) => {
         for (const event of events) {
             const statusMap = {
-                1: 'sent',       // Server Ack
-                2: 'delivered',  // Recebido no cel
-                3: 'read',       // Lido (Azul)
-                4: 'played'      // Áudio ouvido
+                1: 'sent',       // Clock/One Check
+                2: 'delivered',  // Two Checks Gray
+                3: 'read',       // Two Checks Blue
+                4: 'played'      // Microphone Blue
             };
-            const newStatus = statusMap[event.receipt.userJid ? 0 : event.receipt.status] || statusMap[event.receipt.status];
+            const newStatus = statusMap[event.receipt.status];
 
-            if (!newStatus) continue;
+            if (newStatus) {
+                const updates = { status: newStatus };
+                if (newStatus === 'delivered') updates.delivered_at = new Date();
+                if (newStatus === 'read') updates.read_at = new Date();
 
-            const updates = { status: newStatus };
-            if (newStatus === 'delivered') updates.delivered_at = new Date();
-            if (newStatus === 'read') updates.read_at = new Date();
-
-            await supabase.from('messages')
-                .update(updates)
-                .eq('whatsapp_id', event.key.id)
-                .eq('company_id', companyId);
+                await supabase.from('messages')
+                    .update(updates)
+                    .eq('whatsapp_id', event.key.id)
+                    .eq('company_id', companyId);
+            }
         }
     });
 
-    // --- REAÇÕES (EMOJIS) ---
+    // --- 6. REAÇÕES (EMOJIS) ---
     sock.ev.on('messages.reaction', async (reactions) => {
         for (const reaction of reactions) {
             const { key, text } = reaction;
@@ -392,9 +354,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const myJid = normalizeJid(sock.user?.id);
             const reactorJid = normalizeJid(reaction.key.participant || reaction.key.remoteJid || myJid);
 
-            // Busca reações atuais
-            const { data: msg } = await supabase
-                .from('messages')
+            const { data: msg } = await supabase.from('messages')
                 .select('reactions')
                 .eq('whatsapp_id', key.id)
                 .eq('company_id', companyId)
@@ -402,16 +362,16 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
 
             if (msg) {
                 let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
-                // Remove reação anterior deste ator
+                
+                // Remove reação anterior deste usuário (para evitar duplicatas ou permitir troca)
                 currentReactions = currentReactions.filter(r => r.actor !== reactorJid);
                 
-                // Se text existe, é uma nova reação (se null, foi remoção)
+                // Se 'text' existe, é uma nova reação. Se for null/undefined, foi uma remoção.
                 if (text) {
                     currentReactions.push({ text, actor: reactorJid, ts: Date.now() });
                 }
                 
-                await supabase
-                    .from('messages')
+                await supabase.from('messages')
                     .update({ reactions: currentReactions })
                     .eq('whatsapp_id', key.id)
                     .eq('company_id', companyId);
@@ -419,14 +379,12 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         }
     });
 
-    // --- ATUALIZAÇÃO DE CONTATOS (MUDANÇA DE FOTO/NOME) ---
+    // --- 7. ATUALIZAÇÃO DE CONTATOS ---
     sock.ev.on('contacts.upsert', async (contacts) => {
         for (const c of contacts) {
             const jid = normalizeJid(c.id);
-            if (!jid) continue;
-            const bestName = c.name || c.verifiedName || c.notify;
-            if (bestName || c.imgUrl) {
-                await upsertContact(jid, companyId, bestName, c.imgUrl || null, !!c.name, c.lid);
+            if (jid && (c.name || c.notify || c.imgUrl)) {
+                await upsertContact(jid, companyId, c.name || c.notify, c.imgUrl || null, !!c.name, c.lid);
             }
         }
     });
@@ -451,26 +409,21 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
-        // Ignora mensagens vazias e sem mídia
         if (!body && !isMedia) return;
 
         const fromMe = msg.key.fromMe;
         const myJid = normalizeJid(sock.user?.id); 
 
         // 1. GARANTE ESTRUTURA (LEAD/CONTATO)
-        // Se a mensagem chegou, garantimos que o Lead exista no banco
         let leadId = null;
         if (jid && !jid.includes('@g.us')) {
-            // ensureLeadExists cuida da criação e do "Anti-Ghost" (is_ignored)
             leadId = await ensureLeadExists(jid, companyId, forcedName, myJid);
-            
-            // Se for realtime e tivermos um nome novo, forçamos atualização do contato
             if (isRealtime && forcedName && jid !== myJid) {
                 await upsertContact(jid, companyId, forcedName, null, false);
             }
         }
         
-        // Suporte para Grupos: Atualiza quem mandou a mensagem dentro do grupo
+        // Atualiza quem mandou a mensagem no grupo
         if (jid.includes('@g.us') && msg.key.participant && forcedName) {
              const partJid = normalizeJid(msg.key.participant);
              if (partJid !== myJid) {
@@ -478,12 +431,10 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
              }
         }
 
-        // 2. DOWNLOAD E UPLOAD DE MÍDIA (APENAS REALTIME + PROTEÇÃO DE MEMÓRIA)
+        // 2. DOWNLOAD E UPLOAD DE MÍDIA
         let mediaUrl = null;
         if (isMedia && isRealtime) {
             try {
-                // VERIFICAÇÃO DE TAMANHO DO ARQUIVO (SAFEGUARD)
-                // Se for maior que 32MB, não baixa para RAM.
                 const mediaContent = msg.message[type];
                 const fileLength = Number(mediaContent?.fileLength || 0);
                 const MAX_SIZE_BYTES = 32 * 1024 * 1024; // 32MB
@@ -500,7 +451,6 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
                     else if (msg.message?.documentMessage) mimeType = msg.message.documentMessage.mimetype;
                     else if (msg.message?.stickerMessage) mimeType = 'image/webp';
 
-                    // Salva no Supabase Storage e pega URL pública
                     mediaUrl = await uploadMedia(buffer, mimeType);
                 }
             } catch (e) {
