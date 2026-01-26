@@ -1,11 +1,10 @@
-
 {
   "name": "wancora-backend-service",
   "version": "5.0.0",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node --max-old-space-size=4096 server.js",
+    "start": "node --max-old-space-size=512 server.js",
     "dev": "node --watch server.js"
   },
   "keywords": [
