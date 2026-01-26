@@ -14,11 +14,15 @@ import pino from 'pino';
 import { createClient } from '@supabase/supabase-js';
 import mime from 'mime-types';
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-// Logger configurado para silenciar logs internos do Baileys e focar nos nossos
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+    auth: {
+        persistSession: false // Importante para Backend
+    }
+});
+
 const logger = pino({ level: 'silent' });
 
-// Cache simples para evitar processamento duplo de mensagens em milissegundos (debounce)
+// Cache de deduplicação em memória (curta duração)
 const msgCache = new Set();
 const addToCache = (id) => {
     if (msgCache.has(id)) return false;
@@ -27,7 +31,6 @@ const addToCache = (id) => {
     return true;
 };
 
-// Utilitário para desenrolar mensagens complexas (ViewOnce, Editadas, etc)
 const unwrapMessage = (msg) => {
     if (!msg.message) return msg;
     let content = msg.message;
@@ -39,7 +42,6 @@ const unwrapMessage = (msg) => {
     return { ...msg, message: content };
 };
 
-// Upload de Mídia para Supabase Storage (Bucket: chat-media)
 const uploadMedia = async (buffer, type) => {
     try {
         const ext = mime.extension(type) || 'bin';
@@ -51,7 +53,6 @@ const uploadMedia = async (buffer, type) => {
     } catch { return null; }
 };
 
-// Extração segura do texto da mensagem
 const getBody = (msg) => {
     if (!msg) return '';
     if (msg.conversation) return msg.conversation;
@@ -61,15 +62,13 @@ const getBody = (msg) => {
     return ''; 
 };
 
-// Fetch seguro de Foto de Perfil com Jitter para evitar Rate Limit (429)
+// Jitter para evitar Rate Limit ao baixar fotos
 const fetchProfilePicSafe = async (sock, jid) => {
     try {
-        await new Promise(r => setTimeout(r, Math.random() * 200 + 100)); 
+        await new Promise(r => setTimeout(r, Math.random() * 500 + 200)); 
         const url = await sock.profilePictureUrl(jid, 'image'); 
         return url;
-    } catch (e) {
-        return null; 
-    }
+    } catch (e) { return null; }
 };
 
 const fetchGroupSubjectSafe = async (sock, jid) => {
@@ -77,68 +76,54 @@ const fetchGroupSubjectSafe = async (sock, jid) => {
         await new Promise(r => setTimeout(r, 300)); 
         const metadata = await sock.groupMetadata(jid);
         return metadata.subject;
-    } catch (e) {
-        return null;
-    }
+    } catch (e) { return null; }
 };
 
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
-    // Contador de Lotes para Fast Sync (Limita a 2 pacotes)
-    let historyChunkCounter = 0;
-
-    // --- 1. PRESENÇA (ONLINE / DIGITANDO / VISTO POR ÚLTIMO) ---
-    // Vital para a experiência social do usuário. Atualiza a tabela contacts.
+    // --- 1. PRESENÇA (ONLINE / DIGITANDO) ---
     sock.ev.on('presence.update', async ({ id, presences }) => {
         try {
             const jid = normalizeJid(id);
-            // Ignoramos atualizações de presença em grupos para não spammar o banco com updates
             if (!jid || jid.includes('@g.us')) return; 
 
-            // Pega o status do participante
             const participant = Object.values(presences)[0]; 
             if (!participant) return;
 
-            // 'available' = Online
-            // 'composing'/'recording' = Digitando/Gravando (Consideramos online também)
-            const isOnline = participant.lastKnownPresence === 'available' 
-                             || participant.lastKnownPresence === 'composing' 
-                             || participant.lastKnownPresence === 'recording';
+            // Define se está online baseado no status do protocolo
+            const isOnline = participant.lastKnownPresence === 'available' || 
+                             participant.lastKnownPresence === 'composing' || 
+                             participant.lastKnownPresence === 'recording';
             
-            // Atualiza tabela contacts para o Frontend mostrar a bolinha verde
-            await supabase.from('contacts')
+            // Atualiza tabela contacts (Fire and Forget)
+            supabase.from('contacts')
                 .update({ 
                     is_online: isOnline,
                     last_seen_at: new Date().toISOString()
                 })
                 .eq('jid', jid)
-                .eq('company_id', companyId);
-
-        } catch (e) {
-            // Silencioso para não poluir logs com eventos frequentes
-        }
+                .eq('company_id', companyId)
+                .then(); // .then() vazio para não bloquear a thread
+        } catch (e) {}
     });
 
-    // --- 2. HISTÓRICO DE MENSAGENS (SYNC ROBUSTO) ---
+    // --- 2. HISTÓRICO DE MENSAGENS (SINGLE PASS MODE) ---
+    // Alterado para processar tudo de uma vez, garantindo ordem: Contatos -> Mensagens
     sock.ev.on('messaging-history.set', async ({ contacts, messages, isLatest }) => {
-        historyChunkCounter++;
-        const itemCount = (contacts?.length || 0) + (messages?.length || 0);
-        console.log(`📚 [HISTÓRICO] Pacote ${historyChunkCounter} recebido: ${itemCount} itens. Processando Fast Sync...`);
-
-        if (itemCount === 0) {
-            // Se vier vazio OU se já passamos de 2 lotes, libera o frontend
-            if (isLatest || historyChunkCounter >= 2) await updateSyncStatus(sessionId, 'completed', 100);
-            return;
-        }
+        const msgCount = messages?.length || 0;
+        const contactCount = contacts?.length || 0;
+        
+        console.log(`📚 [HISTÓRICO] Recebido: ${contactCount} contatos, ${msgCount} mensagens. Processando...`);
 
         try {
-            // Mapa em memória para evitar queries repetitivas durante o processamento do lote
-            const contactsMap = new Map();
+            await updateSyncStatus(sessionId, 'importing_contacts', 10);
 
-            // A. Processamento de Contatos
+            // 1. MAPA DE CONTATOS (Prioridade Absoluta)
+            // Processamos todos os contatos PRIMEIRO para garantir que o 'ensureLeadExists' encontre nomes.
+            const contactsMap = new Map();
+            
             if (contacts && contacts.length > 0) {
-                await updateSyncStatus(sessionId, 'importing_contacts', 10);
-                
+                // Prepara mapa local
                 contacts.forEach(c => {
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
@@ -146,100 +131,96 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     contactsMap.set(jid, { 
                         name: bestName, 
                         imgUrl: c.imgUrl, 
-                        isFromBook: !!c.name,
+                        isFromBook: !!c.name, // Se tem 'name', veio da agenda do celular
                         lid: c.lid || null 
                     });
                 });
 
+                // Upsert em Lote Controlado (Para não estourar conexões do banco)
                 const uniqueJids = Array.from(contactsMap.keys());
-                const BATCH_SIZE = 20; 
+                const BATCH_SIZE = 50; 
                 
                 for (let i = 0; i < uniqueJids.length; i += BATCH_SIZE) {
                     const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
-                    
                     await Promise.all(batchJids.map(async (jid) => {
                         let data = contactsMap.get(jid);
+                        
+                        // Enriquecimento de Dados (Grupos e Fotos)
                         if (jid.includes('@g.us') && !data.name) {
                             const groupName = await fetchGroupSubjectSafe(sock, jid);
                             if (groupName) data.name = groupName;
                         }
-                        if (!data.imgUrl) {
-                            const freshPic = await fetchProfilePicSafe(sock, jid);
-                            if (freshPic) data.imgUrl = freshPic;
-                        }
+                        // Opcional: Baixar foto se não tiver (pode demorar, então talvez pular no histórico massivo)
+                        // if (!data.imgUrl) data.imgUrl = await fetchProfilePicSafe(sock, jid);
+
                         await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                     }));
-                    await new Promise(r => setTimeout(r, 10));
                 }
             }
 
-            // B. Scan de Mensagens (Name Hunter)
+            // 2. PROCESSAMENTO DE MENSAGENS
             if (messages && messages.length > 0) {
-                messages.forEach(msg => {
-                    if (msg.key.fromMe) return;
-                    const jid = normalizeJid(msg.key.remoteJid);
-                    if (!jid) return;
-                    const existing = contactsMap.get(jid);
-                    if (!existing || !existing.name) {
-                        if (msg.pushName) {
-                            if (existing) existing.name = msg.pushName; 
-                            else contactsMap.set(jid, { name: msg.pushName, imgUrl: null, isFromBook: false, lid: null });
-                        }
-                    }
-                });
-            }
+                await updateSyncStatus(sessionId, 'importing_messages', 40);
 
-            // C. Processamento de Mensagens
-            if (messages && messages.length > 0) {
-                await updateSyncStatus(sessionId, 'importing_messages', 30);
-                
+                // Organiza mensagens por chat para processar as mais recentes de cada conversa
                 const messagesByChat = new Map();
                 messages.forEach(msg => {
                     const unwrapped = unwrapMessage(msg);
                     if(!unwrapped.key?.remoteJid) return;
                     const jid = normalizeJid(unwrapped.key.remoteJid);
                     if (!jid || jid === 'status@broadcast') return;
+                    
                     if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
                     messagesByChat.get(jid).push(unwrapped);
                 });
 
+                // Ordena chats por atividade recente
                 const sortedChats = Array.from(messagesByChat.entries()).sort(([, msgsA], [, msgsB]) => {
                     const tA = Math.max(...msgsA.map(m => m.messageTimestamp || 0));
                     const tB = Math.max(...msgsB.map(m => m.messageTimestamp || 0));
                     return tB - tA; 
                 });
 
-                const topChats = sortedChats.slice(0, 300); 
+                // Limita a quantidade de chats históricos processados para performance (Top 300 chats)
+                const topChats = sortedChats.slice(0, 300);
                 
                 for (let i = 0; i < topChats.length; i++) {
                     const [chatJid, chatMsgs] = topChats[i];
+                    
+                    // Ordena cronologicamente
                     chatMsgs.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                     
-                    const msgsToSave = chatMsgs.slice(-10); // Mantém apenas as 10 últimas para Fast Boot
+                    // Pega apenas as últimas 10 mensagens (conforme sua regra de negócio)
+                    const msgsToSave = chatMsgs.slice(-10); 
 
                     for (const msg of msgsToSave) {
                         const mapData = contactsMap.get(chatJid);
-                        const forcedName = msg.pushName || (mapData ? mapData.name : null);
-                        await processSingleMessage(msg, sock, companyId, sessionId, false, forcedName, true);
+                        
+                        // Tenta pegar o nome do pushName da mensagem se não tivermos no mapa
+                        const senderName = msg.pushName || (mapData ? mapData.name : null);
+                        
+                        // Salva mensagem (e cria Lead se necessário, agora com nome correto!)
+                        await processSingleMessage(msg, sock, companyId, sessionId, false, senderName, true);
                     }
 
-                    await new Promise(r => setTimeout(r, 5));
+                    // Yield para não travar o event loop
+                    if (i % 5 === 0) await new Promise(r => setTimeout(r, 10));
 
-                    if (i % 10 === 0) {
-                        const progress = 30 + Math.floor((i / topChats.length) * 65);
+                    // Atualiza progresso visual
+                    if (i % 20 === 0) {
+                        const progress = 40 + Math.floor((i / topChats.length) * 60);
                         await updateSyncStatus(sessionId, 'importing_messages', progress);
                     }
                 }
             }
 
+            console.log("✅ [HISTÓRICO] Sincronização finalizada.");
+            await updateSyncStatus(sessionId, 'completed', 100);
+
         } catch (e) {
-            console.error("❌ [CRITICAL SYNC ERROR]", e);
-        } finally {
-            if (isLatest || historyChunkCounter >= 2) {
-                await updateSyncStatus(sessionId, 'completed', 100);
-            } else {
-                await updateSyncStatus(sessionId, 'importing_messages', 99);
-            }
+            console.error("❌ [SYNC ERROR]", e);
+            // Em caso de erro, força status completed para liberar a UI
+            await updateSyncStatus(sessionId, 'completed', 100);
         }
     });
 
@@ -248,30 +229,26 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         for (const msg of messages) {
             const protocolMsg = msg.message?.protocolMessage;
             
-            // Tratamento de Revoke (Mensagem Apagada)
+            // Revoke (Mensagem Apagada)
             if (protocolMsg && protocolMsg.type === 0) {
                 const keyToRevoke = protocolMsg.key;
-                if (keyToRevoke && keyToRevoke.id) {
+                if (keyToRevoke?.id) {
                     await supabase.from('messages')
-                        .update({ 
-                            content: '🚫 Mensagem apagada', 
-                            message_type: 'text',
-                            is_deleted: true 
-                        })
-                        .eq('whatsapp_id', keyToRevoke.id)
-                        .eq('company_id', companyId);
+                        .update({ content: '🚫 Mensagem apagada', is_deleted: true })
+                        .eq('whatsapp_id', keyToRevoke.id).eq('company_id', companyId);
                 }
                 continue; 
             }
 
             if (!msg.message) continue;
-            if (!addToCache(msg.key.id)) continue;
+            if (!addToCache(msg.key.id)) continue; // Deduplicação
 
             const clean = unwrapMessage(msg);
             const jid = normalizeJid(clean.key.remoteJid);
             
-            // Atualiza foto do contato se possível
+            // Atualização de Perfil em tempo real (Lazy Update)
             if (jid && !clean.key.fromMe) { 
+                 // Não esperamos a foto baixar para processar a mensagem
                  fetchProfilePicSafe(sock, jid).then(url => {
                      if(url) upsertContact(jid, companyId, clean.pushName, url, false);
                  });
@@ -281,54 +258,54 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         }
     });
 
-    // --- 4. VOTOS DE ENQUETE (REALTIME) ---
+    // --- 4. VOTOS DE ENQUETE ---
     sock.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
             if (update.pollUpdates) {
                 for (const pollUpdate of update.pollUpdates) {
                     const messageId = update.key.id;
-                    const voterJid = normalizeJid(pollUpdate.senderTimestampMs ? update.key.remoteJid : undefined);
+                    const voterJid = normalizeJid(pollUpdate.senderTimestampMs ? update.key.remoteJid : undefined); // Quem votou? (em grupos, é diferente do remoteJid)
                     
-                    try {
-                        const { data: currentMsg } = await supabase
-                            .from('messages')
-                            .select('poll_votes')
-                            .eq('whatsapp_id', messageId)
-                            .eq('company_id', companyId)
-                            .single();
-                            
-                        if (currentMsg) {
-                            let votes = Array.isArray(currentMsg.poll_votes) ? currentMsg.poll_votes : [];
-                            
-                            // Adiciona voto bruto. A lógica de decriptação exata é complexa no Baileys,
-                            // mas o evento garante que houve uma interação.
-                            votes.push({
-                                voterJid,
-                                ts: Date.now(),
-                                raw: pollUpdate.vote
-                            });
-
-                            await supabase.from('messages')
-                                .update({ poll_votes: votes, updated_at: new Date() }) 
+                    // Baileys envia o voto descriptografado em pollUpdate.vote
+                    if (pollUpdate.vote) {
+                        try {
+                            const { data: currentMsg } = await supabase
+                                .from('messages')
+                                .select('poll_votes')
                                 .eq('whatsapp_id', messageId)
-                                .eq('company_id', companyId);
+                                .eq('company_id', companyId)
+                                .single();
+                                
+                            if (currentMsg) {
+                                let votes = Array.isArray(currentMsg.poll_votes) ? currentMsg.poll_votes : [];
+                                
+                                // Adiciona o voto
+                                votes.push({
+                                    voterJid,
+                                    ts: Date.now(),
+                                    selectedOptions: pollUpdate.vote.selectedOptions // Array de hashes/textos
+                                });
+
+                                await supabase.from('messages')
+                                    .update({ poll_votes: votes, updated_at: new Date() }) 
+                                    .eq('whatsapp_id', messageId)
+                                    .eq('company_id', companyId);
+                            }
+                        } catch(err) {
+                            console.error("Erro processar voto:", err);
                         }
-                    } catch(err) {
-                        console.error("Erro ao processar voto:", err);
                     }
                 }
             }
         }
     });
     
-    // --- 5. STATUS DE LEITURA (TICKS AZUIS) ---
+    // --- 5. STATUS DE LEITURA ---
     sock.ev.on('message-receipt.update', async (events) => {
         for (const event of events) {
-            const statusMap = {
-                1: 'sent',       // Clock/One Check
-                2: 'delivered',  // Two Checks Gray
-                3: 'read',       // Two Checks Blue
-                4: 'played'      // Microphone Blue
+            const statusMap = { 
+                1: 'sent', 2: 'delivered', 3: 'read', 4: 'played',
+                13: 'read' // Novo código do Baileys para Read
             };
             const newStatus = statusMap[event.receipt.status];
 
@@ -345,7 +322,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         }
     });
 
-    // --- 6. REAÇÕES (EMOJIS) ---
+    // --- 6. REAÇÕES ---
     sock.ev.on('messages.reaction', async (reactions) => {
         for (const reaction of reactions) {
             const { key, text } = reaction;
@@ -354,46 +331,16 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             const myJid = normalizeJid(sock.user?.id);
             const reactorJid = normalizeJid(reaction.key.participant || reaction.key.remoteJid || myJid);
 
-            const { data: msg } = await supabase.from('messages')
-                .select('reactions')
-                .eq('whatsapp_id', key.id)
-                .eq('company_id', companyId)
-                .single();
+            const { data: msg } = await supabase.from('messages').select('reactions').eq('whatsapp_id', key.id).eq('company_id', companyId).single();
 
             if (msg) {
                 let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
-                
-                // Remove reação anterior deste usuário (para evitar duplicatas ou permitir troca)
+                // Remove reação anterior deste usuário
                 currentReactions = currentReactions.filter(r => r.actor !== reactorJid);
+                // Adiciona nova se houver texto (se for null, é remoção)
+                if (text) currentReactions.push({ text, actor: reactorJid, ts: Date.now() });
                 
-                // Se 'text' existe, é uma nova reação. Se for null/undefined, foi uma remoção.
-                if (text) {
-                    currentReactions.push({ text, actor: reactorJid, ts: Date.now() });
-                }
-                
-                await supabase.from('messages')
-                    .update({ reactions: currentReactions })
-                    .eq('whatsapp_id', key.id)
-                    .eq('company_id', companyId);
-            }
-        }
-    });
-
-    // --- 7. ATUALIZAÇÃO DE CONTATOS ---
-    sock.ev.on('contacts.upsert', async (contacts) => {
-        for (const c of contacts) {
-            const jid = normalizeJid(c.id);
-            if (jid && (c.name || c.notify || c.imgUrl)) {
-                await upsertContact(jid, companyId, c.name || c.notify, c.imgUrl || null, !!c.name, c.lid);
-            }
-        }
-    });
-
-    sock.ev.on('contacts.update', async (updates) => {
-        for (const update of updates) {
-            const jid = normalizeJid(update.id);
-            if (update.imgUrl) {
-                await upsertContact(jid, companyId, null, update.imgUrl, false);
+                await supabase.from('messages').update({ reactions: currentReactions }).eq('whatsapp_id', key.id).eq('company_id', companyId);
             }
         }
     });
@@ -403,77 +350,72 @@ const processSingleMessage = async (msg, sock, companyId, sessionId, isRealtime,
     try {
         if (!msg.message) return;
         const jid = normalizeJid(msg.key.remoteJid);
-        if (jid === 'status@broadcast') return;
-
         const body = getBody(msg.message);
         const type = getContentType(msg.message) || Object.keys(msg.message)[0];
-        const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
-        if (!body && !isMedia) return;
+        // Ignora mensagens vazias ou de protocolo puro (exceto mídia)
+        if (!body && !['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage', 'pollCreationMessage', 'pollCreationMessageV2', 'pollCreationMessageV3'].includes(type)) return;
 
-        const fromMe = msg.key.fromMe;
-        const myJid = normalizeJid(sock.user?.id); 
-
-        // 1. GARANTE ESTRUTURA (LEAD/CONTATO)
         let leadId = null;
         if (jid && !jid.includes('@g.us')) {
-            leadId = await ensureLeadExists(jid, companyId, forcedName, myJid);
-            if (isRealtime && forcedName && jid !== myJid) {
+            // Cria Lead e garante nome correto
+            leadId = await ensureLeadExists(jid, companyId, forcedName, normalizeJid(sock.user?.id));
+            
+            // Se for realtime e tivermos um nome novo (PushName), atualiza o contato
+            if (isRealtime && forcedName && jid !== normalizeJid(sock.user?.id)) {
                 await upsertContact(jid, companyId, forcedName, null, false);
             }
         }
-        
-        // Atualiza quem mandou a mensagem no grupo
-        if (jid.includes('@g.us') && msg.key.participant && forcedName) {
-             const partJid = normalizeJid(msg.key.participant);
-             if (partJid !== myJid) {
-                 await upsertContact(partJid, companyId, forcedName, null, false);
-             }
-        }
 
-        // 2. DOWNLOAD E UPLOAD DE MÍDIA
         let mediaUrl = null;
+        const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
+        
         if (isMedia && isRealtime) {
             try {
-                const mediaContent = msg.message[type];
-                const fileLength = Number(mediaContent?.fileLength || 0);
-                const MAX_SIZE_BYTES = 32 * 1024 * 1024; // 32MB
-
-                if (fileLength > MAX_SIZE_BYTES) {
-                    console.warn(`⚠️ [MÍDIA] Arquivo muito grande (${(fileLength/1024/1024).toFixed(2)}MB). Ignorando download.`);
-                    body += ' [Arquivo Grande - Não baixado]';
-                } else {
-                    const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger });
-                    let mimeType = 'application/octet-stream';
-                    if (msg.message?.imageMessage) mimeType = 'image/jpeg';
-                    else if (msg.message?.audioMessage) mimeType = 'audio/mp4'; 
-                    else if (msg.message?.videoMessage) mimeType = 'video/mp4';
-                    else if (msg.message?.documentMessage) mimeType = msg.message.documentMessage.mimetype;
-                    else if (msg.message?.stickerMessage) mimeType = 'image/webp';
-
-                    mediaUrl = await uploadMedia(buffer, mimeType);
-                }
-            } catch (e) {
-                console.error("Erro download media:", e);
-            }
+                // Download apenas se for realtime. Histórico não baixa mídia para economizar espaço/banda.
+                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger });
+                
+                let mimeType = 'application/octet-stream';
+                if(msg.message.imageMessage) mimeType = msg.message.imageMessage.mimetype || 'image/jpeg';
+                else if(msg.message.audioMessage) mimeType = msg.message.audioMessage.mimetype || 'audio/mp4';
+                
+                mediaUrl = await uploadMedia(buffer, mimeType);
+            } catch (e) { console.error("Media DL Error", e); }
         }
 
-        // 3. PERSISTÊNCIA DA MENSAGEM
+        // Mapeamento de Tipos
+        let finalType = 'text';
+        if (type.includes('image')) finalType = 'image';
+        else if (type.includes('video')) finalType = 'video';
+        else if (type.includes('audio')) finalType = 'audio';
+        else if (type.includes('document')) finalType = 'document';
+        else if (type.includes('poll')) finalType = 'poll';
+        else if (type.includes('sticker')) finalType = 'sticker';
+
+        // Salva conteúdo da enquete corretamente
+        let finalContent = body || (mediaUrl ? '[Mídia]' : '');
+        if (finalType === 'poll') {
+            const pollData = msg.message[type];
+            finalContent = JSON.stringify({
+                name: pollData.name,
+                options: pollData.options.map(o => o.optionName),
+                selectableOptionsCount: pollData.selectableOptionsCount
+            });
+        }
+
         await upsertMessage({
             company_id: companyId,
             session_id: sessionId,
             remote_jid: jid,
             whatsapp_id: msg.key.id,
-            from_me: fromMe,
-            content: body || (mediaUrl ? '[Mídia]' : ''),
+            from_me: msg.key.fromMe,
+            content: finalContent,
             media_url: mediaUrl,
-            message_type: type?.replace('Message', '') || 'text',
-            status: fromMe ? 'sent' : 'received',
+            message_type: finalType,
+            status: msg.key.fromMe ? 'sent' : 'received',
             lead_id: leadId,
             created_at: new Date((msg.messageTimestamp || Date.now() / 1000) * 1000)
         }, ignoreConflict);
 
-    } catch (e) {
-        console.error("Erro processSingleMessage:", e);
-    }
+    } catch (e) {}
 };
