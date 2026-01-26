@@ -1,4 +1,3 @@
-
 import { sessions } from './connection.js';
 import { delay, generateWAMessageFromContent, proto } from '@whiskeysockets/baileys';
 
@@ -77,48 +76,53 @@ export const sendMessage = async ({
         // 4. Switch de Tipos de Mensagem
         switch (type) {
             case 'pix':
-                // --- PIX NATIVO (Button Flow) ---
-                // Cria um card visual com botão "COPIAR" nativo do Android/iOS
+                // --- ESTRATÉGIA DUAL-SEND (MAXIMUM COMPATIBILITY) ---
                 const pixKey = content || "CHAVE_NAO_INFORMADA";
                 console.log(`💲 [PIX] Gerando payload Native Flow para: ${pixKey}`);
 
-                const msgParams = {
-                    viewOnceMessage: {
-                        message: {
-                            messageContextInfo: {
-                                deviceListMetadata: {},
-                                deviceListMetadataVersion: 2
-                            },
-                            interactiveMessage: {
-                                body: { text: "Copie a chave abaixo para realizar o pagamento." },
-                                footer: { text: "Wancora Secure Pay" },
-                                header: { 
-                                    title: "PAGAMENTO VIA PIX", 
-                                    subtitle: "Instantâneo", 
-                                    hasMediaAttachment: false 
+                // A. Envia Card Interativo (Bonito, mas falha no Web/Desktop)
+                try {
+                    const msgParams = {
+                        viewOnceMessage: {
+                            message: {
+                                messageContextInfo: {
+                                    deviceListMetadata: {},
+                                    deviceListMetadataVersion: 2
                                 },
-                                nativeFlowMessage: {
-                                    buttons: [{
-                                        name: "cta_copy",
-                                        buttonParamsJson: JSON.stringify({
-                                            display_text: "COPIAR CHAVE PIX",
-                                            id: "copy_code",
-                                            copy_code: pixKey
-                                        })
-                                    }]
+                                interactiveMessage: {
+                                    body: { text: "Copie a chave abaixo para realizar o pagamento." },
+                                    footer: { text: "Pagamento Seguro" },
+                                    header: { 
+                                        title: "CHAVE PIX", 
+                                        subtitle: "Pagamento", 
+                                        hasMediaAttachment: false 
+                                    },
+                                    nativeFlowMessage: {
+                                        buttons: [{
+                                            name: "cta_copy",
+                                            buttonParamsJson: JSON.stringify({
+                                                display_text: "COPIAR CHAVE PIX",
+                                                id: "copy_code",
+                                                copy_code: pixKey
+                                            })
+                                        }]
+                                    }
                                 }
                             }
                         }
-                    }
-                };
-
-                // Relay Message é necessário para mensagens complexas não-padrão
-                const waMessage = await generateWAMessageFromContent(jid, msgParams, { 
-                    userJid: sock.user.id 
-                });
+                    };
+                    const waMessage = await generateWAMessageFromContent(jid, msgParams, { userJid: sock.user.id });
+                    await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
+                } catch (e) {
+                    console.error("Erro ao enviar botão Pix (Ignorado):", e);
+                }
                 
-                await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
-                sentMsg = waMessage;
+                // B. Envia Texto Puro (Fallback Garantido)
+                // Pequeno delay para garantir ordem de chegada
+                await delay(300);
+                sentMsg = await sock.sendMessage(jid, { 
+                    text: `Chave Pix:\n\n${pixKey}\n\n_(Caso o botão acima não funcione)_` 
+                });
                 break;
 
             case 'text':
