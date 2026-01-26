@@ -1,4 +1,3 @@
-
 import Redis from 'ioredis';
 import pino from 'pino';
 
@@ -7,7 +6,12 @@ let redisClient;
 
 const getRedisClient = () => {
     if (!redisClient) {
-        const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+        const redisUrl = process.env.REDIS_URL;
+        
+        if (!redisUrl) {
+            console.warn("⚠️ [REDIS] Variável REDIS_URL não definida. Funcionalidades de fila (Campanha) ficarão indisponíveis.");
+            return null;
+        }
         
         // Oculta senha nos logs para segurança
         const safeUrl = redisUrl.replace(/:[^:]*@/, ':***@');
@@ -16,22 +20,22 @@ const getRedisClient = () => {
         redisClient = new Redis(redisUrl, {
             maxRetriesPerRequest: null, // Obrigatório para BullMQ
             enableReadyCheck: false,
+            // Retry Strategy mais agressiva para evitar crash no boot
             retryStrategy(times) {
-                // Backoff exponencial limitado a 2s
-                const delay = Math.min(times * 50, 2000);
+                const delay = Math.min(times * 100, 3000);
                 return delay;
             },
             reconnectOnError: (err) => {
                 const targetError = "READONLY";
                 if (err.message.includes(targetError)) {
-                    // Tenta reconectar se cair em modo somente leitura (comum em failovers)
                     return true;
                 }
             }
         });
 
         redisClient.on('error', (err) => {
-            console.error('❌ [REDIS] Erro de conexão:', err.message);
+            // Evita crash do processo por erro não tratado no Redis
+            console.error('❌ [REDIS] Erro de conexão (Background):', err.message);
         });
 
         redisClient.on('connect', () => {
