@@ -7,6 +7,9 @@ import pino from 'pino';
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'silent' });
 
+// User-Agent Fixo para emular navegador real
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
 /**
  * Faz o download da mídia da mensagem e upload para o Supabase.
  * Retorna a URL pública.
@@ -14,10 +17,15 @@ const logger = pino({ level: 'silent' });
 export const handleMediaUpload = async (msg) => {
     try {
         // Baileys Download (Decriptação AES-256-CTR automática)
+        // PATCH: Passamos 'options' com headers para o axios interno do Baileys
         const buffer = await downloadMediaMessage(
             msg,
             'buffer',
-            {},
+            { 
+                options: { 
+                    headers: { 'User-Agent': BROWSER_UA } 
+                } 
+            },
             { logger, reuploadRequest: msg.updateMediaMessage }
         );
 
@@ -50,7 +58,7 @@ export const handleMediaUpload = async (msg) => {
         return data.publicUrl;
 
     } catch (e) {
-        console.error("[MEDIA] Falha crítica no processamento:", e);
+        console.error("[MEDIA] Falha crítica no processamento:", e.message);
         return null;
     }
 };
