@@ -7,8 +7,15 @@ import pino from 'pino';
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'silent' });
 
-// User-Agent Real para evitar bloqueio 403 (Fingerprint de Chrome Windows)
-const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+// Headers completos para emular tráfego legítimo do WhatsApp Web
+const AXIOS_OPTIONS = {
+    headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://web.whatsapp.com/',
+        'Origin': 'https://web.whatsapp.com/'
+    },
+    timeout: 20000 // 20s timeout para evitar travamentos
+};
 
 /**
  * Faz o download da mídia da mensagem e upload para o Supabase.
@@ -17,14 +24,11 @@ const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 export const handleMediaUpload = async (msg) => {
     try {
         // Baileys Download (Decriptação AES-256-CTR automática)
-        // CORREÇÃO CRÍTICA: O objeto de opções é passado diretamente para o axios.
-        // Headers devem estar no primeiro nível, não dentro de 'options'.
+        // PATCH CORRETO: Passamos 'options' (config do axios) dentro do objeto de opções do downloadMediaMessage
         const buffer = await downloadMediaMessage(
             msg,
             'buffer',
-            { 
-                headers: { 'User-Agent': BROWSER_UA }
-            },
+            { options: AXIOS_OPTIONS },
             { logger, reuploadRequest: msg.updateMediaMessage }
         );
 
@@ -57,7 +61,10 @@ export const handleMediaUpload = async (msg) => {
         return data.publicUrl;
 
     } catch (e) {
-        console.error("[MEDIA] Falha crítica no processamento:", e.message);
+        // Log detalhado apenas se não for 404 (mídia expirada)
+        if (!e.message?.includes('404')) {
+             console.error("[MEDIA] Falha no processamento:", e.message);
+        }
         return null;
     }
 };
