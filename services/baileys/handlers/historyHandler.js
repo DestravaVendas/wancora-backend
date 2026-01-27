@@ -22,7 +22,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest }, sock, 
     }
 
     // Aceita apenas o primeiro chunk para não sobrecarregar
-    // (O Baileys geralmente manda o mais recente primeiro ou em um chunk único se não for gigante)
     if (chunkCounter > 2) {
         console.log(`⏩ [HISTÓRICO] Otimização: Ignorando lote histórico profundo ${chunkCounter}.`);
         await updateSyncStatus(sessionId, 'completed', 100);
@@ -41,6 +40,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest }, sock, 
             contacts.forEach(c => {
                 const jid = normalizeJid(c.id);
                 if (!jid) return;
+                
+                // Salva no mapa para uso nas mensagens
                 contactsMap.set(jid, { 
                     name: c.name || c.verifiedName || c.notify, 
                     imgUrl: c.imgUrl, 
@@ -49,7 +50,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest }, sock, 
                 });
             });
 
-            // Upsert em lotes de 20
+            // Upsert em lotes de 20 para o banco
             const uniqueJids = Array.from(contactsMap.keys());
             const BATCH_SIZE = 20;
             
@@ -57,6 +58,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest }, sock, 
                 const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
                 await Promise.all(batchJids.map(async (jid) => {
                     let data = contactsMap.get(jid);
+                    // Passamos isFromBook=true se c.name existir, para forçar a autoridade do nome da agenda
                     await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                 }));
             }
@@ -74,20 +76,20 @@ export const handleHistorySync = async ({ contacts, messages, isLatest }, sock, 
                 const jid = normalizeJid(clean.key.remoteJid);
                 if (jid === 'status@broadcast') return;
 
-                // Name Hunter (Cache Local)
-                if (!clean.key.fromMe && clean.pushName) {
-                    const existing = contactsMap.get(jid);
-                    if (!existing || !existing.name) {
-                        // Salva nome se não tivermos
-                        contactsMap.set(jid, { name: clean.pushName });
-                        upsertContact(jid, companyId, clean.pushName, null, false);
-                    }
-                }
-
                 if (!chats[jid]) chats[jid] = [];
-                // Injeta nome forçado
+                
+                // Injeta nome forçado (Agenda > Notify)
                 const mapData = contactsMap.get(jid);
-                clean._forcedName = clean.pushName || (mapData ? mapData.name : null);
+                
+                // Se não temos o contato no mapa mas a mensagem tem pushName, adicionamos ao mapa
+                // para garantir que as próximas mensagens deste chat usem esse nome
+                if (!clean.key.fromMe && clean.pushName && (!mapData || !mapData.name)) {
+                    contactsMap.set(jid, { name: clean.pushName });
+                }
+                
+                const updatedMapData = contactsMap.get(jid);
+                // AQUI ESTÁ O SEGREDO: Se temos um nome no mapa (seja agenda ou notify anterior), usamos ele.
+                clean._forcedName = updatedMapData ? updatedMapData.name : clean.pushName;
                 
                 chats[jid].push(clean);
             });
@@ -123,8 +125,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest }, sock, 
             for (const msg of curatedMessages) {
                 
                 // Opções Especiais para Histórico Recente:
-                // - downloadMedia: TRUE (Baixa mídia dessas mensagens selecionadas)
-                // - fetchProfilePic: TRUE (Busca foto se for a primeira msg do chat processada)
                 const options = {
                     downloadMedia: true, 
                     fetchProfilePic: true 

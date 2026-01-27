@@ -1,3 +1,4 @@
+
 import { sessions } from './connection.js';
 import { delay, generateWAMessageFromContent, proto } from '@whiskeysockets/baileys';
 
@@ -62,7 +63,6 @@ export const sendMessage = async ({
                 const pixKey = content || "CHAVE_INVALIDA";
                 console.log(`💲 [PIX] Gerando payload Native Flow para: ${pixKey}`);
 
-                // Estratégia Híbrida: Tenta Native Flow, se falhar, manda texto.
                 try {
                     const msgParams = {
                         viewOnceMessage: {
@@ -98,7 +98,6 @@ export const sendMessage = async ({
                     sentMsg = waMessage;
                 } catch (e) {
                     console.error("Erro no Native Flow Pix, enviando fallback:", e);
-                    // Fallback texto puro
                     sentMsg = await sock.sendMessage(jid, { 
                         text: `Chave Pix:\n\n${pixKey}` 
                     });
@@ -118,10 +117,17 @@ export const sendMessage = async ({
                 break;
 
             case 'audio':
+                // Tratamento Especial para PTT (Gravador Web)
+                // Se for PTT e vier como webm, forçamos audio/ogg; codecs=opus para melhor compatibilidade com WhatsApp Mobile
+                let finalMime = mimetype;
+                if (ptt && (mimetype === 'audio/webm' || mimetype?.includes('opus'))) {
+                    finalMime = 'audio/ogg; codecs=opus';
+                }
+                
                 sentMsg = await sock.sendMessage(jid, { 
                     audio: { url }, 
                     ptt: !!ptt, 
-                    mimetype: mimetype || 'audio/mp4' 
+                    mimetype: finalMime || 'audio/mp4' 
                 });
                 break;
 
