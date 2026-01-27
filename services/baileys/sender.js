@@ -118,7 +118,6 @@ export const sendMessage = async ({
 
             case 'audio':
                 // Tratamento Especial para PTT (Gravador Web)
-                // Se for PTT e vier como webm, forçamos audio/ogg; codecs=opus para melhor compatibilidade com WhatsApp Mobile
                 let finalMime = mimetype;
                 if (ptt && (mimetype === 'audio/webm' || mimetype?.includes('opus'))) {
                     finalMime = 'audio/ogg; codecs=opus';
@@ -146,10 +145,11 @@ export const sendMessage = async ({
 
             case 'poll':
                 if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
+                // Baileys espera 'values' para a lista de opções, mas o nosso front manda 'options'
                 sentMsg = await sock.sendMessage(jid, {
                     poll: {
                         name: poll.name,
-                        values: poll.options, // Array de strings
+                        values: poll.options, 
                         selectableCount: Number(poll.selectableOptionsCount) || 1
                     }
                 });
