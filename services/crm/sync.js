@@ -4,7 +4,8 @@ import pino from "pino";
 
 // Inicializa o cliente Supabase
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const logger = pino({ level: 'error' });
+// 🔥 SILENCER PATCH: Logger interno apenas para erros fatais, sem poluição de console
+const logger = pino({ level: 'fatal' });
 
 const leadLock = new Set(); 
 
@@ -101,8 +102,9 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
             jid: cleanJid,
             phone: phoneColumnValue,
             company_id: companyId,
-            updated_at: new Date(),
-            last_message_at: new Date()
+            updated_at: new Date()
+            // REMOVIDO: last_message_at: new Date() 
+            // Motivo: Contatos da agenda sem conversas não devem aparecer no topo do chat.
         };
 
         let finalName = current?.name;
@@ -205,6 +207,18 @@ export const upsertMessage = async (msgData) => {
         await new Promise(resolve => setTimeout(resolve, 250));
         const { error } = await supabase.from('messages').upsert(msgData, { onConflict: 'remote_jid, whatsapp_id' });
         if (error) throw error;
+
+        // --- ATUALIZAÇÃO DO CONTATO (CHAT LIST SORTING) ---
+        // Apenas quando uma mensagem é salva é que o contato ganha relevância na lista de chat.
+        await supabase.from('contacts')
+            .update({ 
+                last_message_at: msgData.created_at,
+                // Opcional: Atualizar preview se a tabela suportar 'last_message_content'
+                // last_message_content: typeof msgData.content === 'string' ? msgData.content : '[Mídia]'
+            })
+            .eq('jid', msgData.remote_jid)
+            .eq('company_id', msgData.company_id);
+
     } catch (e) {
         logger.error({ err: e.message }, 'Erro upsertMessage');
     }
