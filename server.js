@@ -2,6 +2,7 @@
 import 'dotenv/config'; 
 import express from 'express';
 import cors from 'cors';
+import axios from 'axios'; // Importação necessária para o patch
 import { createClient } from "@supabase/supabase-js";
 import { startSession } from './services/baileys/connection.js';
 import { startSentinel } from './services/scheduler/sentinel.js';
@@ -12,6 +13,17 @@ import sessionRoutes from './routes/session.routes.js';
 import messageRoutes from './routes/message.routes.js';
 import automationRoutes from './routes/automation.routes.js';
 import managementRoutes from './routes/management.routes.js'; // Novo Import
+
+// 🔥 PATCH CRÍTICO: USER-AGENT SPOOFING (INTERCEPTOR) 🔥
+// Resolve o erro 403 Forbidden garantindo que TODA requisição saia como Chrome
+const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+axios.defaults.headers.common['User-Agent'] = userAgent;
+
+// Adiciona interceptor para pegar instâncias isoladas
+axios.interceptors.request.use(config => {
+    config.headers['User-Agent'] = userAgent;
+    return config;
+});
 
 // 🔥 INICIALIZAÇÃO DOS WORKERS DE CAMPANHA 🔥
 if (process.env.REDIS_URL) {
