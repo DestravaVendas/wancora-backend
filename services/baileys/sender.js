@@ -145,11 +145,16 @@ export const sendMessage = async ({
 
             case 'poll':
                 if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
-                // Baileys espera 'values' para a lista de opções, mas o nosso front manda 'options'
+                
+                // Sanitização Proativa: Garante que as opções não tenham espaços fantasmas
+                const cleanOptions = poll.options.map(opt => opt.trim()).filter(opt => opt.length > 0);
+                if (cleanOptions.length < 2) throw new Error("Enquete precisa de pelo menos 2 opções válidas.");
+
+                // Baileys espera 'values' para a lista de opções
                 sentMsg = await sock.sendMessage(jid, {
                     poll: {
-                        name: poll.name,
-                        values: poll.options, 
+                        name: poll.name.trim(),
+                        values: cleanOptions, 
                         selectableCount: Number(poll.selectableOptionsCount) || 1
                     }
                 });
