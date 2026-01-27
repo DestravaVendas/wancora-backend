@@ -1,11 +1,12 @@
+
 {
   "name": "wancora-backend-service",
   "version": "5.0.0",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node --max-old-space-size=512 server.js",
-    "dev": "node --watch server.js"
+    "start": "node --max-old-space-size=2048 server.js",
+    "dev": "node --watch --max-old-space-size=2048 server.js"
   },
   "keywords": [
     "whatsapp",

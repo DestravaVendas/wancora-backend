@@ -33,6 +33,7 @@ const isGenericName = (name, phone) => {
 export const normalizeJid = (jid) => {
     if (!jid) return null;
     if (jid.includes('@g.us')) return jid.split('@')[0] + '@g.us';
+    if (jid.includes('@newsletter')) return jid; // FIX: Suporte a Canais
     if (jid.includes('@lid')) return jid; // Mantém LID para o mapa de identidade
     return jid.split('@')[0].split(':')[0] + '@s.whatsapp.net';
 };
@@ -74,9 +75,10 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
 
         const cleanJid = normalizeJid(jid);
         const isGroup = cleanJid.includes('@g.us');
+        const isNewsletter = cleanJid.includes('@newsletter'); // FIX: Identificação de Canal
         
         // 1. Identity Resolution: Mapeia LID -> Phone JID
-        if (lidJid && !isGroup) {
+        if (lidJid && !isGroup && !isNewsletter) {
             await supabase.from('identity_map').upsert({
                 lid_jid: normalizeJid(lidJid),
                 phone_jid: cleanJid, 
@@ -85,11 +87,16 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         }
 
         // Define o telefone para salvar na coluna 'phone'
-        let phoneColumnValue = cleanJid.split('@')[0].replace(/\D/g, '');
-        if (cleanJid.includes('@lid')) {
-            const realPhone = await resolveRealPhone(cleanJid, companyId);
-            if (realPhone && !realPhone.includes('@lid')) {
-                phoneColumnValue = realPhone.replace(/\D/g, '');
+        // FIX: Canais não têm telefone, usamos '0' ou o próprio ID para manter a integridade
+        let phoneColumnValue = '0';
+        
+        if (!isNewsletter) {
+            phoneColumnValue = cleanJid.split('@')[0].replace(/\D/g, '');
+            if (cleanJid.includes('@lid')) {
+                const realPhone = await resolveRealPhone(cleanJid, companyId);
+                if (realPhone && !realPhone.includes('@lid')) {
+                    phoneColumnValue = realPhone.replace(/\D/g, '');
+                }
             }
         }
         
@@ -112,25 +119,23 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
         let shouldUpdateLead = false;
 
         // --- LÓGICA DE PRIORIDADE (NAME HUNTER) ---
-        if (pushName && pushName.trim().length > 0 && !isGenericName(pushName, phoneColumnValue)) {
+        // Ignora validação de nome genérico para Newsletters (geralmente o nome é o ID ou PushName direto)
+        if (pushName && pushName.trim().length > 0 && (!isGenericName(pushName, phoneColumnValue) || isNewsletter)) {
             updateData.push_name = pushName;
             
             const currentName = current?.name;
             const isCurrentBad = !currentName || isGenericName(currentName, phoneColumnValue);
 
             // Se o nome atual no banco for ruim (NULL ou Número), sobrescreve!
-            // Se já tiver um nome bom (Ex: "Cliente VIP"), ISSO AQUI DÁ FALSE e mantém o seu nome.
             if (isCurrentBad || isFromBook) {
                 updateData.name = pushName;
                 finalName = pushName;    
                 shouldUpdateLead = true; 
             }
         } else if (!current) {
-            // Contato novo sem nome? Manda NULL.
             updateData.name = null; 
             finalName = null; 
-        } else if (current && isGenericName(current.name, phoneColumnValue)) {
-            // Se já existe mas é número, limpa para NULL
+        } else if (current && isGenericName(current.name, phoneColumnValue) && !isNewsletter) {
             updateData.name = null;
         }
 
@@ -142,8 +147,8 @@ export const upsertContact = async (jid, companyId, pushName = null, profilePicU
 
         if (error) {
              console.error('[CONTACT SYNC ERROR]', error.message);
-        } else if (shouldUpdateLead && finalName && !isGroup) {
-            // Propaga para o Lead se existir
+        } else if (shouldUpdateLead && finalName && !isGroup && !isNewsletter) {
+            // Propaga para o Lead se existir (Apenas contatos reais)
             await ensureLeadExists(cleanJid, companyId, finalName);
         }
     } catch (e) {

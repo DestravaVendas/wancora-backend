@@ -50,8 +50,9 @@ const getBody = (msg) => {
 
 /**
  * Processa uma única mensagem (Realtime ou Histórico)
+ * @param {boolean} options.downloadMedia - Se true, força o download da mídia mesmo se não for realtime
  */
-export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime, forcedName = null) => {
+export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime, forcedName = null, options = {}) => {
     try {
         // 1. Filtros Iniciais
         if (!msg.message) return;
@@ -93,8 +94,8 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         // Se não sou eu, tento identificar ou criar o contato/lead
         let leadId = null;
         if (!fromMe && jid && !jid.includes('@g.us')) {
-            // Tenta obter foto de perfil (apenas em realtime para não travar histórico)
-            if (isRealtime) {
+            // Tenta obter foto de perfil se for realtime OU se for solicitado via options (Histórico Recente)
+            if (isRealtime || options.fetchProfilePic) {
                 try {
                     // Fetch Profile Pic async (não bloqueante)
                     sock.profilePictureUrl(jid, 'image').then(url => {
@@ -116,8 +117,9 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         }
 
         // 5. Media Handling
+        // Baixa mídia se for realtime OU se for forçado pelo histórico inteligente
         let mediaUrl = null;
-        if (isMedia && isRealtime) {
+        if (isMedia && (isRealtime || options.downloadMedia)) {
             mediaUrl = await handleMediaUpload(cleanMsg);
         }
 

@@ -4,12 +4,19 @@ import makeWASocket, {
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
     Browsers,
-    isJidBroadcast
+    isJidBroadcast,
+    proto
 } from '@whiskeysockets/baileys';
 import { useSupabaseAuthState } from '../../auth/supabaseAuth.js';
 import { setupListeners } from './listener.js';
-import { deleteSessionData, updateInstanceStatus } from '../crm/sync.js';
+import { deleteSessionData, updateInstanceStatus, normalizeJid } from '../crm/sync.js';
+import { createClient } from "@supabase/supabase-js";
 import pino from 'pino';
+
+// Cliente para getMessage (Recuperação de falha de criptografia)
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+    auth: { persistSession: false }
+});
 
 // Mapa em memória para manter os sockets ativos
 export const sessions = new Map();
@@ -27,7 +34,7 @@ export const startSession = async (sessionId, companyId) => {
 
         console.log(`🔌 [CONNECTION] Iniciando sessão ${sessionId} (v${version.join('.')}) - Empresa: ${companyId}`);
 
-        // 2. Configuração do Socket (Blindagem Anti-Ban)
+        // 2. Configuração do Socket (Blindagem Anti-Ban & Protocolo Manual v2.0)
         const sock = makeWASocket({
             version,
             logger,
@@ -44,7 +51,39 @@ export const startSession = async (sessionId, companyId) => {
             retryRequestDelayMs: 2500,
             keepAliveIntervalMs: 15000, 
             shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter'),
-            getMessage: async (key) => { return { conversation: 'hello' }; }
+            
+            // --- IMPLEMENTAÇÃO OBRIGATÓRIA DO MANUAL (getMessage) ---
+            // Recupera mensagens antigas caso o outro lado solicite reenvio (Criptografia)
+            getMessage: async (key) => {
+                if (!key.id) return null;
+                try {
+                    const { data: msg } = await supabase
+                        .from('messages')
+                        .select('content, message_type, media_url')
+                        .eq('whatsapp_id', key.id)
+                        .eq('company_id', companyId)
+                        .maybeSingle();
+
+                    if (!msg) return null;
+
+                    // Reconstrói um payload básico compatível com Proto
+                    let messagePayload = {};
+                    
+                    if (msg.message_type === 'text') {
+                        messagePayload = { conversation: msg.content };
+                    } else if (msg.message_type === 'image') {
+                        messagePayload = { imageMessage: { caption: msg.content, url: msg.media_url } };
+                    } else {
+                        // Fallback para texto se for tipo complexo não suportado na reconstrução
+                        messagePayload = { conversation: msg.content || '' };
+                    }
+
+                    return proto.Message.fromObject(messagePayload);
+                } catch (e) {
+                    // console.error('[getMessage] Falha ao recuperar mensagem:', e.message);
+                    return null;
+                }
+            }
         });
 
         sessions.set(sessionId, { sock, companyId });
@@ -81,25 +120,27 @@ export const startSession = async (sessionId, companyId) => {
                 });
             }
 
-            // C) DESCONEXÃO
+            // C) DESCONEXÃO (Tratamento conforme Manual Seção 2.2)
             if (connection === 'close') {
                 const statusCode = (lastDisconnect?.error)?.output?.statusCode;
                 
-                // Filtra erros fatais onde NÃO devemos reconectar
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut 
-                    && statusCode !== 403 
-                    && statusCode !== 440 
-                    && statusCode !== 401;
-                
-                console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}. Reconectar? ${shouldReconnect}`);
+                console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}.`);
 
-                if (shouldReconnect) {
-                    handleReconnect(sessionId, companyId);
-                } else {
-                    if (statusCode === 440) console.warn(`⚠️ [CONFLITO] Sessão ${sessionId} substituída.`);
-                    console.log(`🧹 [LOGOUT] Limpando dados da sessão ${sessionId}`);
+                // 401 (Logged Out) ou 403 (Forbidden) -> DELETAR SESSÃO (Não reconectar)
+                if (statusCode === DisconnectReason.loggedOut || statusCode === 403) {
+                    console.warn(`🔒 [SECURITY] Sessão inválida ou desconectada pelo celular. Limpando dados...`);
                     await deleteSession(sessionId, companyId);
+                    return; // Encerra fluxo
                 }
+
+                // 440 (Conflict) -> Não reconectar automaticamente para evitar briga de sockets
+                if (statusCode === 440) {
+                    console.warn(`⚠️ [CONFLITO] Sessão ativa em outro processo.`);
+                    return;
+                }
+
+                // Qualquer outro erro (515, 408, 500, socket hang up) -> RECONECTAR
+                handleReconnect(sessionId, companyId);
             }
         });
 
@@ -116,6 +157,15 @@ export const startSession = async (sessionId, companyId) => {
 // Lógica de Reconexão Inteligente
 const handleReconnect = (sessionId, companyId) => {
     const attempt = (retries.get(sessionId) || 0) + 1;
+    
+    // Limite de segurança: se falhar 10x seguidas, para de tentar para não estourar cota do banco
+    if (attempt > 10) {
+        console.error(`💀 [DEATH] Sessão ${sessionId} falhou 10x seguidas. Desistindo.`);
+        retries.delete(sessionId);
+        updateInstanceStatus(sessionId, companyId, { status: 'disconnected' });
+        return;
+    }
+
     retries.set(sessionId, attempt);
 
     // Backoff: 2s, 4s, 8s... até o teto de 60s
@@ -135,6 +185,6 @@ export const deleteSession = async (sessionId, companyId) => {
         } catch(e) {}
         sessions.delete(sessionId);
     }
-    retries.delete(sessionId); // Limpa histórico de tentativas
+    retries.delete(sessionId); 
     await deleteSessionData(sessionId, companyId);
 };

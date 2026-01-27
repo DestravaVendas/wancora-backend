@@ -5,6 +5,9 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
+// CONFIGURAÇÃO: Limite de mensagens por conversa no histórico inicial
+const HISTORY_MSG_LIMIT = 10;
+
 export const handleHistorySync = async ({ contacts, messages, isLatest }, sock, sessionId, companyId, chunkCounter) => {
     
     // Verifica se já completou para evitar reprocessamento desnecessário
@@ -18,18 +21,20 @@ export const handleHistorySync = async ({ contacts, messages, isLatest }, sock, 
         return;
     }
 
-    if (chunkCounter > 1) {
-        console.log(`⏩ [HISTÓRICO] Ignorando lote extra ${chunkCounter} para otimização.`);
+    // Aceita apenas o primeiro chunk para não sobrecarregar
+    // (O Baileys geralmente manda o mais recente primeiro ou em um chunk único se não for gigante)
+    if (chunkCounter > 2) {
+        console.log(`⏩ [HISTÓRICO] Otimização: Ignorando lote histórico profundo ${chunkCounter}.`);
         await updateSyncStatus(sessionId, 'completed', 100);
         return;
     }
 
-    console.log(`📚 [HISTÓRICO] Processando Lote Único...`);
+    console.log(`📚 [HISTÓRICO] Smart Sync: Processando Lote ${chunkCounter}...`);
 
     try {
         const contactsMap = new Map();
 
-        // 1. Processar Contatos (Batch)
+        // 1. Processar Contatos (Batch Rápido)
         if (contacts && contacts.length > 0) {
             await updateSyncStatus(sessionId, 'importing_contacts', 5);
             
@@ -44,73 +49,96 @@ export const handleHistorySync = async ({ contacts, messages, isLatest }, sock, 
                 });
             });
 
-            // Upsert em lotes de 10 para não travar o banco
+            // Upsert em lotes de 20
             const uniqueJids = Array.from(contactsMap.keys());
-            const BATCH_SIZE = 10;
+            const BATCH_SIZE = 20;
             
             for (let i = 0; i < uniqueJids.length; i += BATCH_SIZE) {
                 const batchJids = uniqueJids.slice(i, i + BATCH_SIZE);
                 await Promise.all(batchJids.map(async (jid) => {
                     let data = contactsMap.get(jid);
-                    // Lógica segura de enriquecimento (Group Subject / Profile Pic) seria feita aqui
-                    // Mas para histórico, confiamos nos dados que vieram no payload para performance
                     await upsertContact(jid, companyId, data.name, data.imgUrl, data.isFromBook, data.lid);
                 }));
-                await new Promise(r => setTimeout(r, 20)); // Respiro
             }
         }
 
-        // 2. Processar Mensagens (Granular)
+        // 2. Processar Mensagens (Filtro Inteligente: Top 10 por Chat)
         if (messages && messages.length > 0) {
-            // Name Hunter Pre-Pass
-            messages.forEach(msg => {
-                if (msg.key.fromMe) return;
-                const jid = normalizeJid(msg.key.remoteJid);
-                if (!jid) return;
-                const existing = contactsMap.get(jid);
-                // Se descobrimos um nome novo no pushName da mensagem, salvamos
-                if ((!existing || !existing.name) && msg.pushName) {
-                    upsertContact(jid, companyId, msg.pushName, null, false);
-                }
-            });
-
-            // Flatten & Sort & Limit
-            let allMessages = [];
+            
+            // A) Agrupamento
+            const chats = {}; // Map<RemoteJid, Message[]>
+            
             messages.forEach(msg => {
                 const clean = unwrapMessage(msg);
-                if(clean.key?.remoteJid && normalizeJid(clean.key.remoteJid) !== 'status@broadcast') {
-                    // Injeta nome forçado do mapa se existir
-                    const mapData = contactsMap.get(normalizeJid(clean.key.remoteJid));
-                    clean._forcedName = clean.pushName || (mapData ? mapData.name : null);
-                    allMessages.push(clean);
+                if (!clean.key?.remoteJid) return;
+                const jid = normalizeJid(clean.key.remoteJid);
+                if (jid === 'status@broadcast') return;
+
+                // Name Hunter (Cache Local)
+                if (!clean.key.fromMe && clean.pushName) {
+                    const existing = contactsMap.get(jid);
+                    if (!existing || !existing.name) {
+                        // Salva nome se não tivermos
+                        contactsMap.set(jid, { name: clean.pushName });
+                        upsertContact(jid, companyId, clean.pushName, null, false);
+                    }
                 }
+
+                if (!chats[jid]) chats[jid] = [];
+                // Injeta nome forçado
+                const mapData = contactsMap.get(jid);
+                clean._forcedName = clean.pushName || (mapData ? mapData.name : null);
+                
+                chats[jid].push(clean);
             });
 
-            // Ordena cronologicamente
-            allMessages.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+            // B) Filtragem (Sort & Slice)
+            let curatedMessages = [];
+            const chatJids = Object.keys(chats);
             
-            // Opcional: Limitar histórico (ex: últimas 500 globais ou 20 por chat)
-            // Aqui processaremos todas que vieram no chunk principal
-            
-            const total = allMessages.length;
+            console.log(`🔍 [SMART SYNC] Analisando ${chatJids.length} conversas...`);
+
+            chatJids.forEach(jid => {
+                // Ordena: Mais recente primeiro
+                chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0));
+                
+                // Pega apenas as Top N
+                const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT);
+                
+                // Reverte para ordem cronológica (Antiga -> Nova) para salvar corretamente no banco
+                topMessages.reverse();
+                
+                curatedMessages.push(...topMessages);
+            });
+
+            // C) Processamento Rico (Com Mídia e Fotos)
+            const total = curatedMessages.length;
+            console.log(`📥 [SMART SYNC] Importando ${total} mensagens relevantes (Top ${HISTORY_MSG_LIMIT}/chat)...`);
+            await updateSyncStatus(sessionId, 'importing_messages', 10);
+
             let processed = 0;
             let lastLoggedPercent = 0;
 
-            console.log(`📥 [SYNC] Importando ${total} mensagens...`);
-            await updateSyncStatus(sessionId, 'importing_messages', 10);
+            // Processa sequencialmente para não estourar memória com downloads simultâneos
+            for (const msg of curatedMessages) {
+                
+                // Opções Especiais para Histórico Recente:
+                // - downloadMedia: TRUE (Baixa mídia dessas mensagens selecionadas)
+                // - fetchProfilePic: TRUE (Busca foto se for a primeira msg do chat processada)
+                const options = {
+                    downloadMedia: true, 
+                    fetchProfilePic: true 
+                };
 
-            for (const msg of allMessages) {
-                // Reutiliza a lógica central de mensagem
-                await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName);
+                await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
+                
                 processed++;
-
                 const percent = Math.min(99, Math.floor((processed / total) * 100));
-                if (percent >= lastLoggedPercent + 5) {
+                
+                if (percent >= lastLoggedPercent + 10) {
                     await updateSyncStatus(sessionId, 'importing_messages', percent);
                     lastLoggedPercent = percent;
                 }
-                
-                if (processed % 20 === 0) await new Promise(r => setTimeout(r, 10)); // Anti-block
             }
         }
 
@@ -118,6 +146,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest }, sock, 
         console.error("❌ [SYNC ERROR]", e);
     } finally {
         await updateSyncStatus(sessionId, 'completed', 100);
-        console.log(`✅ [HISTÓRICO] Sincronização Finalizada.`);
+        console.log(`✅ [HISTÓRICO] Smart Sync Finalizado com Sucesso.`);
     }
 };

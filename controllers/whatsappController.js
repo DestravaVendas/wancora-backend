@@ -2,6 +2,14 @@
 import { createClient } from "@supabase/supabase-js";
 import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
 import { sendMessage as sendService } from '../services/baileys/sender.js';
+import { 
+    createGroup as createGroupService, 
+    manageGroupParticipants as manageParticipantsService,
+    updateGroupSettings as updateGroupService,
+    getGroupInviteCode as getInviteService,
+    createChannel as createChannelService,
+    deleteChannel as deleteChannelService
+} from '../services/baileys/community.js';
 import { savePollVote, normalizeJid } from '../services/crm/sync.js';
 import { proto } from '@whiskeysockets/baileys';
 
@@ -37,6 +45,57 @@ export const sendMessage = async (payload) => {
         throw error; 
     }
 };
+
+// --- GRUPOS & CANAIS (Community) ---
+
+export const createGroup = async (req, res) => {
+    const { sessionId, companyId, subject, participants } = req.body;
+    try {
+        const group = await createGroupService(sessionId, companyId, subject, participants);
+        res.json({ success: true, group });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+};
+
+export const updateGroup = async (req, res) => {
+    const { sessionId, groupId, action, value, participants } = req.body;
+    try {
+        let result;
+        if (['add', 'remove', 'promote', 'demote'].includes(action)) {
+            result = await manageParticipantsService(sessionId, groupId, action, participants);
+        } else if (action === 'invite_code') {
+            result = { code: await getInviteService(sessionId, groupId) };
+        } else {
+            result = await updateGroupService(sessionId, groupId, action, value);
+        }
+        res.json({ success: true, result });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+};
+
+export const createChannel = async (req, res) => {
+    const { sessionId, companyId, name, description } = req.body;
+    try {
+        const channel = await createChannelService(sessionId, companyId, name, description);
+        res.json({ success: true, channel });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+};
+
+export const deleteChannel = async (req, res) => {
+    const { sessionId, channelId } = req.body;
+    try {
+        await deleteChannelService(sessionId, channelId);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+};
+
+// --- FIM Community ---
 
 export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, optionId) => {
     try {
