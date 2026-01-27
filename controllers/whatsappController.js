@@ -119,27 +119,36 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error("Conteúdo da enquete corrompido.");
         }
 
-        // 2. Resolve a opção
+        // 2. Resolve a opção com Robustez
         let optionsList = [];
         if (Array.isArray(pollContent.options)) {
             optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
+        } else if (pollContent.values) {
+            // Suporte legado
+            optionsList = pollContent.values;
         } else {
             throw new Error("Estrutura da enquete inválida.");
         }
 
         const selectedOptionText = optionsList[optionId];
+        
         if (selectedOptionText === undefined) {
             throw new Error(`Opção inválida: Index ${optionId} não existe.`);
         }
 
-        console.log(`🗳️ [VOTE] Votando em: "${selectedOptionText}"`);
+        // FIX: Remove espaços extras que podem quebrar o hash do Baileys
+        const cleanOptionText = selectedOptionText.trim(); 
+        
+        // Safety Check: Baileys rejeita opções vazias
+        if (!cleanOptionText) {
+            throw new Error("Opção de voto vazia ou inválida.");
+        }
+
+        console.log(`🗳️ [VOTE] Votando em: "${cleanOptionText}" (Index: ${optionId})`);
 
         const chatJid = normalizeJid(remoteJid);
         
-        // 3. FIX: Payload Correto para Voto (Baileys v6+)
-        // O segredo é que o Baileys precisa dos buffers internos para calcular o hash da opção.
-        // Se a mensagem original não estiver na memória do Baileys, precisamos recriar a estrutura de chave.
-        
+        // 3. Payload de Voto
         await session.sock.sendMessage(chatJid, {
             poll: {
                 vote: {
@@ -148,7 +157,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
                         id: pollMsg.whatsapp_id,
                         fromMe: pollMsg.from_me,
                     },
-                    selectedOptions: [selectedOptionText] // Array de strings (Texto exato da opção)
+                    selectedOptions: [cleanOptionText] 
                 }
             }
         });
@@ -160,10 +169,13 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         const { data: currentMsg } = await supabase.from('messages').select('poll_votes').eq('whatsapp_id', pollMsg.whatsapp_id).single();
         let votes = currentMsg?.poll_votes || [];
         
+        // Remove voto anterior meu se for single choice (Lógica simplificada para UI)
+        votes = votes.filter(v => v.voterJid !== myJid);
+
         votes.push({
             voterJid: myJid,
             ts: Date.now(),
-            selectedOptions: [selectedOptionText] // Salva o texto da opção
+            selectedOptions: [cleanOptionText]
         });
 
         await supabase.from('messages')
