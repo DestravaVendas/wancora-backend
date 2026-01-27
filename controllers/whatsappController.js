@@ -122,9 +122,9 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         // 2. Resolve a opção com Robustez
         let optionsList = [];
         if (Array.isArray(pollContent.options)) {
-            // Suporte híbrido para objetos (Baileys nativo) ou strings simples (Nosso sender)
             optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
         } else if (pollContent.values) {
+            // Suporte legado
             optionsList = pollContent.values;
         } else {
             throw new Error("Estrutura da enquete inválida.");
@@ -136,17 +136,19 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error(`Opção inválida: Index ${optionId} não existe em [${optionsList.join(', ')}].`);
         }
 
-        // NÃO FAÇA TRIM AQUI se a opção original tiver espaços. O hash deve ser exato.
-        // Apenas garanta que não é vazio.
-        if (!selectedOptionText || selectedOptionText === '') {
-            throw new Error("Opção de voto vazia.");
+        // PATCH: Remover .trim() para garantir que o hash bata com a opção original, 
+        // mesmo se houver espaços acidentais.
+        const cleanOptionText = selectedOptionText; 
+        
+        if (!cleanOptionText) {
+            throw new Error("Opção de voto vazia ou inválida.");
         }
 
-        console.log(`🗳️ [VOTE] Votando em: "${selectedOptionText}" (Index: ${optionId})`);
+        console.log(`🗳️ [VOTE] Votando em: "${cleanOptionText}" (Index: ${optionId})`);
 
         const chatJid = normalizeJid(remoteJid);
         
-        // 3. Payload de Voto (Protocolo Baileys)
+        // 3. Payload de Voto
         await session.sock.sendMessage(chatJid, {
             poll: {
                 vote: {
@@ -155,12 +157,12 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
                         id: pollMsg.whatsapp_id,
                         fromMe: pollMsg.from_me,
                     },
-                    selectedOptions: [selectedOptionText] // O texto exato é o que valida o voto
+                    selectedOptions: [cleanOptionText] 
                 }
             }
         });
 
-        // 4. Salva no banco (Update Local para feedback imediato)
+        // 4. Salva no banco (Update Local)
         const myJid = normalizeJid(session.sock.user?.id);
         
         const { data: currentMsg } = await supabase.from('messages').select('poll_votes').eq('whatsapp_id', pollMsg.whatsapp_id).single();
@@ -172,7 +174,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         votes.push({
             voterJid: myJid,
             ts: Date.now(),
-            selectedOptions: [selectedOptionText]
+            selectedOptions: [cleanOptionText]
         });
 
         await supabase.from('messages')
