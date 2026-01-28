@@ -178,10 +178,18 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         if (isRealtime && !fromMe) {
             const config = await getInstanceConfig(sessionId, companyId);
             if (config.webhook_enabled && config.webhook_url) {
+                // PATCH: Payload Limpo para Webhook (Contrato v5.1)
                 dispatchWebhook(config.webhook_url, 'message.upsert', {
-                    ...savedMsg,
+                    company_id: companyId,
+                    session_id: sessionId,
+                    remote_jid: jid,
                     pushName: cleanMsg.pushName,
-                    isGroup: isGroup
+                    content: finalContent,
+                    message_type: messageTypeClean,
+                    from_me: fromMe,
+                    isGroup: isGroup,
+                    media_url: mediaUrl,
+                    whatsapp_id: cleanMsg.key.id
                 });
             }
         }
