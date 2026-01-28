@@ -138,7 +138,8 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
         let mediaUrl = null;
         if (isMedia && (isRealtime || options.downloadMedia)) {
-            mediaUrl = await handleMediaUpload(cleanMsg);
+            // PATCH: Passando companyId para organizar o storage
+            mediaUrl = await handleMediaUpload(cleanMsg, companyId);
         }
 
         let messageTypeClean = type?.replace('Message', '') || 'text';
