@@ -1,16 +1,10 @@
 
 import { sessions } from './connection.js';
 import { delay, generateWAMessageFromContent, proto } from '@whiskeysockets/baileys';
+import { normalizeJid } from '../../utils/wppParsers.js';
 
 // Helper: Delay Aleatório (Humanização)
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
-
-// Formata JID
-const formatJid = (to) => {
-    if (!to) throw new Error("Destinatário inválido");
-    if (to.includes('@')) return to; 
-    return `${to.replace(/\D/g, '')}@s.whatsapp.net`;
-};
 
 export const sendMessage = async ({
     sessionId,
@@ -30,30 +24,37 @@ export const sendMessage = async ({
     if (!session || !session.sock) throw new Error(`Sessão ${sessionId} não encontrada.`);
 
     const sock = session.sock;
-    const jid = formatJid(to);
+    const jid = normalizeJid(to);
 
-    // Anti-Ban Check
-    if (!jid.includes('@g.us')) {
-        try {
-            const [result] = await sock.onWhatsApp(jid);
-            if (result && !result.exists) {
-                throw new Error("Número não possui WhatsApp.");
-            }
-        } catch (e) {
-            console.warn(`[ANTI-BAN] Aviso: ${e.message}`);
-        }
-    }
+    // OTIMIZAÇÃO: Removemos a checagem sock.onWhatsApp(jid).
+    // Motivo: Gera latência de rede desnecessária. Se o número for inválido, o Baileys/WhatsApp retornará erro no envio, que capturamos no catch.
 
     try {
         console.log(`🤖 [HUMAN-SEND] Iniciando protocolo para: ${jid} (Tipo: ${type})`);
 
+        // 1. Pausa Inicial
         await delay(randomDelay(500, 1000));
+        
+        // 2. Simulação de Presença
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
         await sock.sendPresenceUpdate(presenceType, jid);
 
-        let typingTime = 1000; 
-        if (type === 'text' && content) typingTime = Math.min(content.length * 50, 4000); 
-        await delay(typingTime);
+        // 3. Cálculo de Tempo de Produção (Inteligente)
+        let productionTime = 1000; 
+        
+        if (type === 'text' && content) {
+            // ~50ms por caractere para texto
+            productionTime = Math.min(content.length * 50, 5000); 
+        } else if (type === 'audio' || ptt) {
+            // Para áudio, simula um tempo de gravação realista (ex: 3 a 6 segundos fixos para UX)
+            // Futuro: Se tiver a duração do áudio no payload, usar ela.
+            productionTime = randomDelay(3000, 6000);
+        } else if (type === 'image' || type === 'video') {
+            // Tempo para "selecionar a mídia"
+            productionTime = 2000;
+        }
+
+        await delay(productionTime);
         await sock.sendPresenceUpdate('paused', jid);
 
         let sentMsg;
@@ -146,11 +147,10 @@ export const sendMessage = async ({
             case 'poll':
                 if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
                 
-                // Sanitização Proativa: Garante que as opções não tenham espaços fantasmas
+                // Sanitização Proativa
                 const cleanOptions = poll.options.map(opt => opt.trim()).filter(opt => opt.length > 0);
                 if (cleanOptions.length < 2) throw new Error("Enquete precisa de pelo menos 2 opções válidas.");
 
-                // Baileys espera 'values' para a lista de opções
                 sentMsg = await sock.sendMessage(jid, {
                     poll: {
                         name: poll.name.trim(),

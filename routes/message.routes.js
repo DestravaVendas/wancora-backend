@@ -4,6 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 import { sendMessage, sendPollVote, sendReaction, deleteMessage } from "../controllers/whatsappController.js"; 
 import { requireAuth } from "../middleware/auth.js";
 import { apiLimiter } from "../middleware/limiter.js";
+import { normalizeJid } from "../utils/wppParsers.js"; // Importando normalizador
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -26,9 +27,12 @@ router.post("/send", async (req, res) => {
   }
 
   try {
+    // Normalização Segura do Destinatário
+    const cleanTo = normalizeJid(to);
+    
     const payload = {
         sessionId,
-        to,
+        to: cleanTo,
         type: type || 'text',
         content: text,
         url, caption, poll, location, contact, ptt, mimetype, fileName
@@ -39,10 +43,9 @@ router.post("/send", async (req, res) => {
     
     // 2. Salvamento Otimista
     if (companyId && sentMsg?.key) {
-        const remoteJid = to.includes('@') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`;
         
         let leadId = null;
-        const phoneClean = remoteJid.split('@')[0];
+        const phoneClean = cleanTo.split('@')[0].replace(/\D/g, '');
         const { data: lead } = await supabase.from("leads").select("id").eq("phone", phoneClean).eq("company_id", companyId).maybeSingle();
         if (lead) leadId = lead.id;
 
@@ -56,7 +59,7 @@ router.post("/send", async (req, res) => {
             company_id: companyId,
             lead_id: leadId,
             session_id: sessionId,
-            remote_jid: remoteJid,
+            remote_jid: cleanTo,
             whatsapp_id: sentMsg.key.id,
             from_me: true,
             message_type: payload.type,

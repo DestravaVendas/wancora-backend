@@ -1,5 +1,6 @@
 
-import { upsertContact, normalizeJid } from '../../crm/sync.js';
+import { upsertContact } from '../../crm/sync.js';
+import { normalizeJid } from '../../../utils/wppParsers.js';
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);

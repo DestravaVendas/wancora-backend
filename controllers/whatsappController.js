@@ -10,7 +10,7 @@ import {
     createChannel as createChannelService,
     deleteChannel as deleteChannelService
 } from '../services/baileys/community.js';
-import { savePollVote, normalizeJid } from '../services/crm/sync.js';
+import { normalizeJid } from '../utils/wppParsers.js';
 import { proto } from '@whiskeysockets/baileys';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {

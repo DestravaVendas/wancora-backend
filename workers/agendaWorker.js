@@ -1,142 +1,139 @@
 
 import cron from 'node-cron';
-import { createClient } from '@supabase/supabase-js';
+import { createClient } from "@supabase/supabase-js";
 import { sendMessage } from '../services/baileys/sender.js';
+import { getSessionId } from '../controllers/whatsappController.js';
 
-// Cliente Supabase Service Role (Bypassa RLS)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
 
-// Helper para formatar telefone
 const cleanPhone = (phone) => phone.replace(/\D/g, '');
 
-// Helper para encontrar sessão ativa da empresa
-const getSessionId = async (companyId) => {
-    const { data } = await supabase.from('instances')
-        .select('session_id')
-        .eq('company_id', companyId)
-        .eq('status', 'connected')
-        .limit(1)
-        .maybeSingle();
-    return data?.session_id;
-};
+const processReminders = async () => {
+    try {
+        console.log('⏰ [Agenda Worker] Verificando lembretes pendentes...');
+        
+        // 1. Busca agendamentos das próximas 24h que ainda não foram notificados
+        const now = new Date();
+        const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+        
+        const { data: appointments, error } = await supabase
+            .from('appointments')
+            .select(`
+                *,
+                leads (id, name, phone),
+                companies (name),
+                availability_rules (notification_config)
+            `)
+            .eq('status', 'confirmed')
+            .eq('reminder_sent', false)
+            .gte('start_time', now.toISOString())
+            .lte('start_time', tomorrow.toISOString());
 
-/**
- * Worker de Automação de Agenda
- * Verifica a cada 5 minutos se existem agendamentos próximos para enviar lembretes.
- */
-export const startAgendaWorker = () => {
-    console.log("⏰ [Agenda Worker] Serviço de notificações agendadas iniciado.");
-    
-    // Executa a cada 5 minutos
-    cron.schedule('*/5 * * * *', async () => {
-        try {
-            const now = new Date();
-            // Busca agendamentos nas próximas 24h que ainda não foram notificados
-            const limit = new Date(now.getTime() + 24 * 60 * 60 * 1000); 
+        if (error) throw error;
+        if (!appointments || appointments.length === 0) return;
 
-            // 1. Buscar agendamentos confirmados e pendentes de lembrete
-            const { data: appointments, error } = await supabase
-                .from('appointments')
-                .select(`
-                    id, start_time, title, company_id, user_id,
-                    leads (id, name, phone),
-                    companies (name)
-                `)
-                .eq('status', 'confirmed')
-                .eq('reminder_sent', false) // Idempotência: Só processa se ainda não enviou
-                .gte('start_time', now.toISOString())
-                .lte('start_time', limit.toISOString());
+        console.log(`🔍 [Agenda Worker] ${appointments.length} agendamentos futuros encontrados.`);
 
-            if (error) {
-                console.error("❌ [Agenda Worker] Erro query:", error.message);
-                return;
-            }
+        for (const app of appointments) {
+            // Regras de Notificação
+            const config = app.availability_rules?.notification_config;
+            
+            // Se não tem config ou não tem lead vinculado, pula
+            if (!config || !config.lead_notifications || !app.leads?.phone) continue;
 
-            if (!appointments || appointments.length === 0) return;
+            const leadReminders = config.lead_notifications.filter(n => n.type === 'before_event' && n.active);
+            if (leadReminders.length === 0) continue;
 
-            console.log(`⏰ [Agenda Worker] Analisando ${appointments.length} agendamentos futuros...`);
+            const appTime = new Date(app.start_time).getTime();
+            const timeUntil = appTime - now.getTime();
+            
+            // Verifica cada regra de tempo (Ex: 1 hora antes)
+            for (const rule of leadReminders) {
+                // Converte tempo da regra para ms
+                let ruleTimeMs = 0;
+                const amount = Number(rule.time_amount);
+                if (rule.time_unit === 'minutes') ruleTimeMs = amount * 60 * 1000;
+                else if (rule.time_unit === 'hours') ruleTimeMs = amount * 60 * 60 * 1000;
+                else if (rule.time_unit === 'days') ruleTimeMs = amount * 24 * 60 * 60 * 1000;
 
-            for (const app of appointments) {
-                if (!app.leads || !app.leads.phone) continue;
+                // Margem de erro de 10 minutos (devido ao cron rodar a cada 5/10 min)
+                const margin = 10 * 60 * 1000;
 
-                // 2. Buscar Regras de Notificação do Dono da Agenda
-                const { data: rules } = await supabase
-                    .from('availability_rules')
-                    .select('notification_config')
-                    .eq('user_id', app.user_id)
-                    .eq('company_id', app.company_id)
-                    .eq('is_active', true)
-                    .limit(1)
-                    .maybeSingle();
-
-                if (!rules || !rules.notification_config) continue;
-
-                const config = rules.notification_config;
-                const leadNotifs = config.lead_notifications || [];
-
-                // 3. Verificar Gatilhos (type: before_event)
-                for (const trigger of leadNotifs) {
-                    if (trigger.type === 'before_event' && trigger.active) {
-                        const timeAmount = parseInt(trigger.time_amount);
-                        const timeUnit = trigger.time_unit || 'minutes';
-                        
-                        const appTime = new Date(app.start_time).getTime();
-                        let triggerTime = appTime;
-
-                        // Calcula o momento exato do disparo
-                        if (timeUnit === 'minutes') triggerTime -= timeAmount * 60 * 1000;
-                        if (timeUnit === 'hours') triggerTime -= timeAmount * 60 * 60 * 1000;
-                        if (timeUnit === 'days') triggerTime -= timeAmount * 24 * 60 * 60 * 1000;
-
-                        // Verifica janela de disparo (com tolerância de 15 min atrasado para não perder o timing do cron)
-                        const diff = now.getTime() - triggerTime;
-                        
-                        // Se já passou da hora do trigger (diff >= 0) E não passou muito tempo (15 min)
-                        if (diff >= 0 && diff < 15 * 60 * 1000) {
-                            
-                            // A. Resolve Sessão WhatsApp
-                            const sessionId = await getSessionId(app.company_id);
-                            if (!sessionId) continue;
-
-                            // B. Formata Dados para Template
-                            const dateObj = new Date(app.start_time);
-                            const dateStr = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(dateObj);
-                            const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
-
-                            // C. Processa Template (Substituição de Variáveis)
-                            let msg = trigger.template
-                                .replace('[lead_name]', app.leads.name.split(' ')[0])
-                                .replace('[lead_phone]', app.leads.phone)
-                                .replace('[empresa]', app.companies?.name || 'Empresa')
-                                .replace('[data]', dateStr)
-                                .replace('[hora]', timeStr);
-
-                            // D. Envia Mensagem
-                            const leadPhone = cleanPhone(app.leads.phone);
-                            console.log(`🚀 [Agenda Worker] Enviando lembrete para ${leadPhone}`);
-                            
-                            await sendMessage({
-                                sessionId,
-                                to: `${leadPhone}@s.whatsapp.net`,
-                                type: 'text',
-                                content: msg
-                            });
-
-                            // E. Marca como Enviado (Evita loop)
-                            await supabase.from('appointments')
-                                .update({ reminder_sent: true })
-                                .eq('id', app.id);
-                            
-                            break; // Sai do loop de triggers para este appointment (1 lembrete por vez)
-                        }
+                // Se está na hora de enviar (timeUntil está dentro da janela do ruleTime +/- margem)
+                // Ex: Faltam 58min, regra é 60min. (60-58 = 2min < 10min). Envia.
+                // Mas precisamos garantir que não enviamos muito cedo.
+                // Lógica simples: Se timeUntil <= ruleTimeMs E timeUntil > ruleTimeMs - margin
+                
+                if (timeUntil <= ruleTimeMs && timeUntil > (ruleTimeMs - margin)) {
+                    
+                    // A. Resolve Sessão
+                    const sessionId = await getSessionId(app.company_id);
+                    if (!sessionId) {
+                        console.warn(`⚠️ [Agenda Worker] Sem sessão para empresa ${app.company_id}`);
+                        continue;
                     }
+
+                    // B. Prepara Mensagem
+                    const dateObj = new Date(app.start_time);
+                    const dateStr = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(dateObj);
+                    const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
+
+                    let msg = rule.template
+                        .replace('[lead_name]', app.leads.name || 'Cliente')
+                        .replace('[empresa]', app.companies?.name || '')
+                        .replace('[data]', dateStr)
+                        .replace('[hora]', timeStr);
+
+                    // C. Envia
+                    const leadPhone = cleanPhone(app.leads.phone);
+                    console.log(`🚀 [Agenda Worker] Enviando lembrete para ${leadPhone}`);
+                    
+                    try {
+                        await sendMessage({
+                            sessionId,
+                            to: `${leadPhone}@s.whatsapp.net`,
+                            type: 'text',
+                            content: msg
+                        });
+
+                        // D. Marca como Enviado
+                        // Nota: Se houver múltiplos lembretes (ex: 24h antes e 1h antes), 
+                        // esta flag única 'reminder_sent' impede o segundo.
+                        // Para suporte a múltiplos lembretes, precisaríamos de uma tabela auxiliar 'appointment_logs'.
+                        // No MVP, assumimos que o mais próximo (ex: 1h) vai ganhar se o cron pegar, ou o primeiro que bater.
+                        // Para segurança, marcamos true.
+                        await supabase.from('appointments')
+                            .update({ reminder_sent: true })
+                            .eq('id', app.id);
+                        
+                        // E. Log
+                        await supabase.from('lead_activities').insert({
+                            company_id: app.company_id,
+                            lead_id: app.leads.id,
+                            type: 'log',
+                            content: `⏰ Lembrete Automático enviado (${amount} ${rule.time_unit} antes).`,
+                            created_by: app.user_id, // Atribui ao dono da agenda
+                            created_at: new Date()
+                        });
+
+                    } catch (sendError) {
+                        console.error(`❌ [Agenda Worker] Erro no envio:`, sendError.message);
+                    }
+                    
+                    break; // Sai do loop de regras para este appointment (evita flood de múltiplos lembretes no mesmo tick)
                 }
             }
-
-        } catch (e) {
-            console.error("❌ [Agenda Worker] Falha crítica:", e);
         }
-    });
+
+    } catch (e) {
+        console.error("❌ [Agenda Worker] Falha crítica:", e);
+    }
+};
+
+export const startAgendaWorker = () => {
+    console.log("📅 [AGENDA] Worker de Notificações Iniciado (Check a cada 5 min).");
+    // Roda a cada 5 minutos
+    cron.schedule('*/5 * * * *', processReminders);
 };

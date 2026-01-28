@@ -24,7 +24,8 @@ export const sessions = new Map();
 // Mapa para gerenciar tentativas de reconexão (Backoff Exponencial)
 const retries = new Map();
 
-const logger = pino({ level: 'silent' });
+// 🔥 SILENCER PATCH: Define nível 'fatal' para ignorar logs de info/debug/warn do Baileys
+const logger = pino({ level: 'fatal' });
 
 export const startSession = async (sessionId, companyId) => {
     try {
@@ -49,7 +50,7 @@ export const startSession = async (sessionId, companyId) => {
             generateHighQualityLinkPreview: true,
             defaultQueryTimeoutMs: 60000,
             retryRequestDelayMs: 2500,
-            keepAliveIntervalMs: 15000, 
+            keepAliveIntervalMs: 30000, // Aumentado para 30s para reduzir overhead
             shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter'),
             
             // --- IMPLEMENTAÇÃO OBRIGATÓRIA DO MANUAL (getMessage) ---
@@ -66,21 +67,40 @@ export const startSession = async (sessionId, companyId) => {
 
                     if (!msg) return null;
 
-                    // Reconstrói um payload básico compatível com Proto
+                    // Reconstrói um payload compatível com Proto
                     let messagePayload = {};
                     
                     if (msg.message_type === 'text') {
                         messagePayload = { conversation: msg.content };
                     } else if (msg.message_type === 'image') {
                         messagePayload = { imageMessage: { caption: msg.content, url: msg.media_url } };
+                    } else if (msg.message_type === 'poll') {
+                        // Reconstrói Poll
+                        try {
+                            const pollContent = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
+                            
+                            // Extração de opções robusta
+                            const options = (pollContent.options || []).map(opt => ({ 
+                                optionName: typeof opt === 'string' ? opt : (opt.optionName || 'Opção') 
+                            }));
+
+                            messagePayload = {
+                                pollCreationMessage: {
+                                    name: pollContent.name || 'Enquete',
+                                    options: options,
+                                    selectableOptionsCount: pollContent.selectableOptionsCount || 1
+                                }
+                            };
+                        } catch (e) {
+                            messagePayload = { conversation: "[Enquete Corrompida]" };
+                        }
                     } else {
-                        // Fallback para texto se for tipo complexo não suportado na reconstrução
+                        // Fallback genérico
                         messagePayload = { conversation: msg.content || '' };
                     }
 
                     return proto.Message.fromObject(messagePayload);
                 } catch (e) {
-                    // console.error('[getMessage] Falha ao recuperar mensagem:', e.message);
                     return null;
                 }
             }
@@ -109,7 +129,7 @@ export const startSession = async (sessionId, companyId) => {
             // B) CONECTADO
             if (connection === 'open') {
                 console.log(`✅ [CONECTADO] Sessão ${sessionId} online!`);
-                retries.delete(sessionId); // Zera contador de erros ao conectar com sucesso
+                retries.delete(sessionId); 
                 
                 await updateInstanceStatus(sessionId, companyId, { 
                     status: 'connected', 
@@ -120,26 +140,21 @@ export const startSession = async (sessionId, companyId) => {
                 });
             }
 
-            // C) DESCONEXÃO (Tratamento conforme Manual Seção 2.2)
+            // C) DESCONEXÃO
             if (connection === 'close') {
                 const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 403;
                 
-                console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}.`);
+                console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}. Retry: ${shouldReconnect}`);
 
-                // 401 (Logged Out) ou 403 (Forbidden) -> DELETAR SESSÃO (Não reconectar)
-                if (statusCode === DisconnectReason.loggedOut || statusCode === 403) {
-                    console.warn(`🔒 [SECURITY] Sessão inválida ou desconectada pelo celular. Limpando dados...`);
+                if (!shouldReconnect) {
+                    console.warn(`🔒 [SECURITY] Sessão inválida ou logout. Limpando dados...`);
                     await deleteSession(sessionId, companyId);
-                    return; // Encerra fluxo
+                    return; 
                 }
 
-                // 440 (Conflict) -> Não reconectar automaticamente para evitar briga de sockets
-                if (statusCode === 440) {
-                    console.warn(`⚠️ [CONFLITO] Sessão ativa em outro processo.`);
-                    return;
-                }
+                if (statusCode === 440) return; // Conflito de sessão, não reconecta auto
 
-                // Qualquer outro erro (515, 408, 500, socket hang up) -> RECONECTAR
                 handleReconnect(sessionId, companyId);
             }
         });
@@ -154,25 +169,19 @@ export const startSession = async (sessionId, companyId) => {
     }
 };
 
-// Lógica de Reconexão Inteligente
 const handleReconnect = (sessionId, companyId) => {
     const attempt = (retries.get(sessionId) || 0) + 1;
     
-    // Limite de segurança: se falhar 10x seguidas, para de tentar para não estourar cota do banco
     if (attempt > 10) {
-        console.error(`💀 [DEATH] Sessão ${sessionId} falhou 10x seguidas. Desistindo.`);
+        console.error(`💀 [DEATH] Sessão ${sessionId} falhou 10x. Desistindo.`);
         retries.delete(sessionId);
         updateInstanceStatus(sessionId, companyId, { status: 'disconnected' });
         return;
     }
 
     retries.set(sessionId, attempt);
-
-    // Backoff: 2s, 4s, 8s... até o teto de 60s
     const delayMs = Math.min(Math.pow(2, attempt) * 1000, 60000);
-    
     console.log(`🔄 [RETRY] ${sessionId} em ${delayMs}ms (Tentativa ${attempt})`);
-
     setTimeout(() => startSession(sessionId, companyId), delayMs);
 };
 
