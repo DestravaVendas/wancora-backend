@@ -1,8 +1,9 @@
 
 import { updateSyncStatus } from '../crm/sync.js';
 import { handlePresenceUpdate, handleContactsUpsert } from './handlers/contactHandler.js';
-import { handleMessage, handleReceiptUpdate, handleMessageUpdate, handleReaction } from './handlers/messageHandler.js';
+import { handleReceiptUpdate, handleMessageUpdate, handleReaction } from './handlers/messageHandler.js';
 import { handleHistorySync } from './handlers/historyHandler.js';
+import { enqueueMessage } from './messageQueue.js'; // Import da Fila
 
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
@@ -47,7 +48,9 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         const isRealtime = type === 'notify';
         
         for (const msg of messages) {
-            await handleMessage(msg, sock, companyId, sessionId, isRealtime);
+            // SUBSTITUIÇÃO: Em vez de await handleMessage(...), usamos a fila.
+            // Isso libera o listener imediatamente para receber mais eventos.
+            enqueueMessage(msg, sock, companyId, sessionId, isRealtime);
         }
     });
 
