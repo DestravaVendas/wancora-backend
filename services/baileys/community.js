@@ -1,7 +1,7 @@
 
 import { sessions } from './connection.js';
 import { normalizeJid, upsertContact } from '../crm/sync.js';
-import { delay } from '@whiskeysockets/baileys';
+import axios from 'axios';
 
 // --- GRUPOS ---
 
@@ -39,23 +39,51 @@ export const updateGroupSettings = async (sessionId, groupId, action, value) => 
 
     if (action === 'subject') {
         await session.sock.groupUpdateSubject(jid, value);
-        // Atualiza nome no banco Wancora
-        const { companyId } = session; // Recupera companyId da sessão em memória
+        const { companyId } = session; 
         if (companyId) await upsertContact(jid, companyId, value, null, true);
     } 
     else if (action === 'description') {
         await session.sock.groupUpdateDescription(jid, value);
     }
     else if (action === 'locked') {
-        // Apenas admins podem alterar configurações
+        // value=true: Apenas admins editam info
         await session.sock.groupSettingUpdate(jid, value ? 'locked' : 'unlocked');
     }
     else if (action === 'announcement') {
-        // Apenas admins podem enviar mensagens
+        // value=true: Apenas admins enviam msg
         await session.sock.groupSettingUpdate(jid, value ? 'announcement' : 'not_announcement');
     }
     
     return { success: true };
+};
+
+// Funçao Especial para Atualizar Foto (Grupo ou Perfil)
+export const updateGroupPicture = async (sessionId, groupId, imageUrl) => {
+    const session = sessions.get(sessionId);
+    if (!session?.sock) throw new Error("Sessão desconectada.");
+    
+    const jid = normalizeJid(groupId);
+
+    try {
+        // Baixa a imagem da URL (Supabase ou externa) para um Buffer
+        const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+        const buffer = Buffer.from(response.data);
+
+        // Atualiza no WhatsApp
+        await session.sock.updateProfilePicture(jid, buffer);
+        
+        // Atualiza no Banco CRM
+        const { companyId } = session;
+        if (companyId) {
+            // Note: Não mudamos o nome aqui, passamos null
+            await upsertContact(jid, companyId, null, imageUrl, false); 
+        }
+
+        return { success: true };
+    } catch (e) {
+        console.error("Erro ao atualizar foto de grupo:", e);
+        throw new Error("Falha ao atualizar imagem.");
+    }
 };
 
 export const getGroupInviteCode = async (sessionId, groupId) => {
@@ -100,9 +128,6 @@ export const deleteChannel = async (sessionId, channelId) => {
     const session = sessions.get(sessionId);
     if (!session?.sock) throw new Error("Sessão desconectada.");
 
-    // Baileys não tem um "delete" direto documentado publicamente em todas versões,
-    // mas geralmente é tratado como unsubscribe ou delete via query.
-    // Implementação segura: Unfollow/Unsubscribe
     await session.sock.newsletterUnfollow(channelId);
     return { success: true };
 };
