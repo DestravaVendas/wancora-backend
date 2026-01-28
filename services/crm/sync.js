@@ -226,10 +226,17 @@ export const upsertMessage = async (msgData) => {
         const { error } = await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
         if (error) throw error;
         
-        // Atualiza last_message_at no contato para subir o chat na lista
-        await supabase.from('contacts').update({ 
-            last_message_at: msgData.created_at 
-        }).eq('jid', cleanRemoteJid).eq('company_id', msgData.company_id);
+        // HARDENING FIX: Upsert em vez de Update para garantir que o chat apareça
+        // Mesmo que 'upsertContact' tenha falhado antes (ex: Status/Broadcast), isso garante o registro na tabela contacts
+        const { error: contactError } = await supabase.from('contacts').upsert({
+            jid: cleanRemoteJid,
+            company_id: msgData.company_id,
+            last_message_at: msgData.created_at,
+            // phone é derivado do jid se não existir
+            phone: cleanRemoteJid.split('@')[0].replace(/\D/g, '')
+        }, { onConflict: 'company_id, jid', ignoreDuplicates: false }); 
+
+        if (contactError) console.error("Erro update contact last_message:", contactError.message);
         
     } catch (e) {
         console.error(`❌ [SYNC] Erro upsertMessage:`, e.message);
