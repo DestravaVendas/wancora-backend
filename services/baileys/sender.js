@@ -1,4 +1,3 @@
-
 import { sessions } from './connection.js';
 import { delay, generateWAMessageFromContent, proto } from '@whiskeysockets/baileys';
 import { normalizeJid } from '../../utils/wppParsers.js';
@@ -26,8 +25,7 @@ export const sendMessage = async ({
     const sock = session.sock;
     const jid = normalizeJid(to);
 
-    // OTIMIZAÇÃO: Removemos a checagem sock.onWhatsApp(jid).
-    // Motivo: Gera latência de rede desnecessária. Se o número for inválido, o Baileys/WhatsApp retornará erro no envio, que capturamos no catch.
+    // OTIMIZAÇÃO: Removemos a checagem sock.onWhatsApp(jid) para evitar latência desnecessária.
 
     try {
         console.log(`🤖 [HUMAN-SEND] Iniciando protocolo para: ${jid} (Tipo: ${type})`);
@@ -46,8 +44,7 @@ export const sendMessage = async ({
             // ~50ms por caractere para texto
             productionTime = Math.min(content.length * 50, 5000); 
         } else if (type === 'audio' || ptt) {
-            // Para áudio, simula um tempo de gravação realista (ex: 3 a 6 segundos fixos para UX)
-            // Futuro: Se tiver a duração do áudio no payload, usar ela.
+            // Para áudio, simula um tempo de gravação realista
             productionTime = randomDelay(3000, 6000);
         } else if (type === 'image' || type === 'video') {
             // Tempo para "selecionar a mídia"
@@ -118,8 +115,8 @@ export const sendMessage = async ({
                 break;
 
             case 'audio':
-                // Tratamento Especial para PTT (Gravador Web)
                 let finalMime = mimetype;
+                // Tratamento Especial para PTT (Gravador Web)
                 if (ptt && (mimetype === 'audio/webm' || mimetype?.includes('opus'))) {
                     finalMime = 'audio/ogg; codecs=opus';
                 }
@@ -145,6 +142,7 @@ export const sendMessage = async ({
                 break;
 
             case 'poll':
+                // LÓGICA NOVA DE ENQUETES (Implementada Corretamente)
                 if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
                 
                 // Sanitização Proativa
