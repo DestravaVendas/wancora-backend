@@ -26,8 +26,9 @@ const instanceConfigCache = new Map();
 const getInstanceConfig = async (sessionId, companyId) => {
     if (instanceConfigCache.has(sessionId)) return instanceConfigCache.get(sessionId);
     
+    // PATCH: Adicionado 'id' na seleção para logs
     const { data } = await supabase.from('instances')
-        .select('webhook_url, webhook_enabled')
+        .select('webhook_url, webhook_enabled, id')
         .eq('session_id', sessionId)
         .eq('company_id', companyId)
         .single();
@@ -178,7 +179,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         if (isRealtime && !fromMe) {
             const config = await getInstanceConfig(sessionId, companyId);
             if (config.webhook_enabled && config.webhook_url) {
-                // PATCH: Payload Limpo para Webhook (Contrato v5.1)
+                // PATCH: Passando config.id (instance_id) para log
                 dispatchWebhook(config.webhook_url, 'message.upsert', {
                     company_id: companyId,
                     session_id: sessionId,
@@ -190,7 +191,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime,
                     isGroup: isGroup,
                     media_url: mediaUrl,
                     whatsapp_id: cleanMsg.key.id
-                });
+                }, config.id);
             }
         }
 
