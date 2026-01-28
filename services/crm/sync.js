@@ -119,9 +119,11 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
                 .maybeSingle();
             
             if (lead) {
-                const leadNameBad = isGenericName(lead.name, purePhone);
-                // Se o lead tem nome ruim e achamos um nome bom (ou veio da agenda), atualiza
+                // Se o lead tem nome NULL ou Genérico, e achamos um nome bom, atualiza!
+                const leadNameBad = !lead.name || isGenericName(lead.name, purePhone);
+                
                 if (leadNameBad && incomingNameValid) {
+                    console.log(`✨ [SYNC] Atualizando nome do Lead (Self-Healing): ${purePhone} -> ${incomingName}`);
                     await supabase.from('leads').update({ name: incomingName }).eq('id', lead.id);
                 }
             }
@@ -157,15 +159,15 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         const nameIsValid = !isGenericName(pushName, purePhone);
         
         if (existing) {
-            // Self-Healing: Atualiza nome do lead se ele era genérico e agora temos um bom
-            if (nameIsValid && isGenericName(existing.name, purePhone)) {
+            // Self-Healing: Atualiza nome do lead se ele era genérico/nulo e agora temos um bom
+            if ((!existing.name || isGenericName(existing.name, purePhone)) && nameIsValid) {
                 await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
             }
             return existing.id;
         }
 
         // 2. Determinação do Nome (Hierarquia)
-        // Padrão: NULL (Regra do NULL)
+        // Padrão: NULL (Regra do NULL estrita)
         let finalName = null;
         
         const { data: contact } = await supabase.from('contacts')
@@ -183,10 +185,8 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             finalName = pushName;
         }
         
-        // AUTO-LEAD: Se ainda não tem nome, usa o número formatado como fallback para garantir a criação
-        if (!finalName) {
-            finalName = `+${purePhone}`;
-        }
+        // NOTA: Se finalName for NULL, salvamos NULL mesmo.
+        // O Frontend deve exibir o telefone se o nome for null.
 
         // 3. Pega Funil Padrão
         const { data: stage } = await supabase.from('pipeline_stages')
@@ -197,11 +197,11 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             .maybeSingle();
 
         // 4. Criação
-        console.log(`⚡ [AUTO-LEAD] Criando lead para ${purePhone}`);
+        console.log(`⚡ [AUTO-LEAD] Criando lead para ${purePhone} (Nome: ${finalName || 'NULL'})`);
         const { data: newLead } = await supabase.from('leads').insert({
             company_id: companyId,
             phone: purePhone,
-            name: finalName,
+            name: finalName, // Pode ser null
             status: 'new',
             pipeline_stage_id: stage?.id,
             position: Date.now()
@@ -232,8 +232,7 @@ export const upsertMessage = async (msgData) => {
         const { error } = await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
         if (error) throw error;
         
-        // Atualiza last_message_at no contato para subir o chat na lista
-        // Usa Upsert para garantir que o contato exista mesmo se for a primeira mensagem
+        // Atualiza last_message_at no contato
         await supabase.from('contacts').upsert({
             jid: cleanRemoteJid,
             company_id: msgData.company_id,
