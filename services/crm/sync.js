@@ -1,6 +1,6 @@
 
 import { createClient } from "@supabase/supabase-js";
-import { normalizeJid } from '../utils/wppParsers.js'; // Uso do parser centralizado
+import { normalizeJid } from '../../utils/wppParsers.js'; // Uso do parser centralizado (FIX PATH)
 import pino from "pino";
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
