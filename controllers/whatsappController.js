@@ -6,6 +6,7 @@ import {
     createGroup as createGroupService, 
     manageGroupParticipants as manageParticipantsService,
     updateGroupSettings as updateGroupService,
+    updateGroupPicture as updatePictureService,
     getGroupInviteCode as getInviteService,
     createChannel as createChannelService,
     deleteChannel as deleteChannelService
@@ -66,6 +67,9 @@ export const updateGroup = async (req, res) => {
             result = await manageParticipantsService(sessionId, groupId, action, participants);
         } else if (action === 'invite_code') {
             result = { code: await getInviteService(sessionId, groupId) };
+        } else if (action === 'picture') {
+            // value aqui deve ser a URL da imagem
+            result = await updatePictureService(sessionId, groupId, value);
         } else {
             result = await updateGroupService(sessionId, groupId, action, value);
         }
@@ -136,8 +140,6 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error(`Opção inválida: Index ${optionId} não existe em [${optionsList.join(', ')}].`);
         }
 
-        // PATCH: Remover .trim() para garantir que o hash bata com a opção original, 
-        // mesmo se houver espaços acidentais.
         const cleanOptionText = selectedOptionText; 
         
         if (!cleanOptionText) {
