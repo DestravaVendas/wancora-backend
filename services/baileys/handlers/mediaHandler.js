@@ -11,8 +11,10 @@ const logger = pino({ level: 'silent' });
 /**
  * Faz o download da mídia da mensagem e upload para o Supabase.
  * Retorna a URL pública.
+ * @param {object} msg - Objeto da mensagem Baileys
+ * @param {string} companyId - ID da empresa para organização de pasta
  */
-export const handleMediaUpload = async (msg) => {
+export const handleMediaUpload = async (msg, companyId) => {
     try {
         // PATCH: User-Agent spoofing completo para Chrome 120+ (Win10)
         // Isso é vital para evitar o erro 403 Forbidden do servidor de mídia do WhatsApp
@@ -49,19 +51,21 @@ export const handleMediaUpload = async (msg) => {
         else if (messageType === 'stickerMessage') mimeType = 'image/webp';
 
         const ext = mime.extension(mimeType) || 'bin';
-        const fileName = `chat_${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
+        // Organização: company_id/timestamp_random.ext
+        const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
+        const filePath = companyId ? `${companyId}/${fileName}` : fileName;
 
         // Upload Supabase Storage
         const { error } = await supabase.storage
             .from('chat-media')
-            .upload(fileName, buffer, { contentType: mimeType, upsert: false });
+            .upload(filePath, buffer, { contentType: mimeType, upsert: false });
 
         if (error) {
             console.error("[MEDIA] Erro Upload Supabase:", error.message);
             return null;
         }
 
-        const { data } = supabase.storage.from('chat-media').getPublicUrl(fileName);
+        const { data } = supabase.storage.from('chat-media').getPublicUrl(filePath);
         return data.publicUrl;
 
     } catch (e) {
