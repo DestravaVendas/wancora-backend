@@ -12,7 +12,7 @@ const leadLock = new Set();
 // --- HELPERS ---
 
 // Valida se o nome é genérico (número de telefone, vazio ou inválido)
-// Regra Estrita: Deve conter letras.
+// REGRA DO NULL: Deve conter letras para ser considerado um nome real.
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
@@ -24,7 +24,7 @@ const isGenericName = (name, phone) => {
     // Se o nome for igual ao telefone (mesmo com formatação diferente)
     if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true;
     
-    // Deve conter letras (A-Z) para ser considerado válido
+    // Deve conter pelo menos uma letra (A-Z) para ser considerado válido
     return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName);
 };
 
@@ -54,6 +54,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
         const cleanJid = normalizeJid(jid);
         const purePhone = cleanJid.split('@')[0].replace(/\D/g, ''); 
+        const isGroup = cleanJid.includes('@g.us');
         
         // Objeto Base
         const updateData = {
@@ -65,8 +66,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
         const incomingNameValid = !isGenericName(incomingName, purePhone);
 
-        // LÓGICA DE NOME (Name Hunter V5)
-        // 1. Busca contato existente para decisão
+        // LÓGICA DE NOME (Name Hunter V6 - Strict NULL)
         const { data: existingContact } = await supabase.from('contacts')
             .select('name, push_name')
             .eq('jid', cleanJid)
@@ -74,20 +74,22 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             .maybeSingle();
 
         if (isFromBook) {
-            // Se veio da Agenda, TEM autoridade.
-            // Se o nome for válido, salva. Se for inválido (número), salva NULL.
+            // Cenário: Agenda do Dispositivo (Alta Prioridade)
+            // Se o nome da agenda for válido, usamos. Se for o número, forçamos NULL.
             updateData.name = incomingNameValid ? incomingName : null;
         } else {
-            // Se veio do WhatsApp (PushName)
+            // Cenário: PushName / NotifyName
             if (incomingNameValid) {
                 updateData.push_name = incomingName;
                 
-                // Só promove para 'name' se não existir nada válido lá
-                if (!existingContact || !existingContact.name || isGenericName(existingContact.name, purePhone)) {
-                    // Mas cuidado: não sobrescreva se for apenas um update de presença
-                    // Opcional: updateData.name = incomingName; 
-                    // Melhor deixar 'name' como NULL se não for da agenda, o frontend usa push_name como fallback.
+                // Cenário 1: Enriquecimento Tardio
+                // Se não existe, ou se o nome atual é NULL, aceitamos o PushName como nome principal
+                if (!existingContact || existingContact.name === null || existingContact.name === '') {
+                    updateData.name = incomingName;
                 }
+                // Cenário 2: Proteção de Edição
+                // Se já existe um nome válido (provavelmente editado manualmente ou da agenda), 
+                // IGNORAMOS o incomingName no campo 'name', salvando apenas em 'push_name'.
             }
         }
 
@@ -96,7 +98,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
         if (error) throw error;
 
-        // 2. Mapeamento de LID
+        // 2. Mapeamento de LID (Identity Unification)
         if (lid) {
             const cleanLid = normalizeJid(lid);
             supabase.rpc('link_identities', { 
@@ -107,7 +109,8 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         }
 
         // 3. Lead Self-Healing (Propaga nome para o Lead se necessário)
-        if (!cleanJid.includes('@g.us')) {
+        // Só propaga se não for grupo e se tivermos um nome válido agora
+        if (!isGroup) {
             const { data: lead } = await supabase.from('leads')
                 .select('id, name')
                 .eq('company_id', companyId)
@@ -116,10 +119,9 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
                 .maybeSingle();
             
             if (lead) {
-                // Se o lead tem nome genérico/nulo e agora temos um nome válido
                 const leadNameBad = isGenericName(lead.name, purePhone);
+                // Se o lead tem nome ruim e achamos um nome bom (ou veio da agenda), atualiza
                 if (leadNameBad && incomingNameValid) {
-                    // Atualiza o lead com o novo nome válido
                     await supabase.from('leads').update({ name: incomingName }).eq('id', lead.id);
                 }
             }
@@ -132,7 +134,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
 export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     if (!jid || jid.endsWith('@g.us') || jid.includes('status@broadcast')) return null; 
-    if (myJid && normalizeJid(jid) === normalizeJid(myJid)) return null;
+    if (myJid && normalizeJid(jid) === normalizeJid(myJid)) return null; // Self-exclusion
 
     const cleanJid = normalizeJid(jid);
     const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
@@ -155,7 +157,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         const nameIsValid = !isGenericName(pushName, purePhone);
         
         if (existing) {
-            // Self-Healing
+            // Self-Healing: Atualiza nome do lead se ele era genérico e agora temos um bom
             if (nameIsValid && isGenericName(existing.name, purePhone)) {
                 await supabase.from('leads').update({ name: pushName }).eq('id', existing.id);
             }
@@ -163,7 +165,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         }
 
         // 2. Determinação do Nome (Hierarquia)
-        // Padrão: NULL (Regra do Usuário)
+        // Padrão: NULL (Regra do NULL)
         let finalName = null;
         
         const { data: contact } = await supabase.from('contacts')
@@ -173,8 +175,8 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             .maybeSingle();
 
         if (contact) {
-            if (!isGenericName(contact.name, purePhone)) finalName = contact.name; // Agenda
-            else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name; // PushName
+            if (!isGenericName(contact.name, purePhone)) finalName = contact.name; 
+            else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name; 
         }
 
         if (!finalName && nameIsValid) {
@@ -193,7 +195,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         const { data: newLead } = await supabase.from('leads').insert({
             company_id: companyId,
             phone: purePhone,
-            name: finalName, // Pode ser NULL
+            name: finalName, // Será NULL se nenhum nome válido for encontrado
             status: 'new',
             pipeline_stage_id: stage?.id,
             position: Date.now()
@@ -211,6 +213,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
 export const upsertMessage = async (msgData) => {
     try {
+        // Delay tático para garantir que Contact/Lead existam (FK implícita)
         await new Promise(resolve => setTimeout(resolve, 100));
         
         const cleanRemoteJid = normalizeJid(msgData.remote_jid);
@@ -223,7 +226,7 @@ export const upsertMessage = async (msgData) => {
         const { error } = await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
         if (error) throw error;
         
-        // Atualiza last_message_at para subir o chat
+        // Atualiza last_message_at no contato para subir o chat na lista
         await supabase.from('contacts').update({ 
             last_message_at: msgData.created_at 
         }).eq('jid', cleanRemoteJid).eq('company_id', msgData.company_id);
