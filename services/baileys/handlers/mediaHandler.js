@@ -3,7 +3,7 @@ import { downloadMediaMessage } from '@whiskeysockets/baileys';
 import { createClient } from '@supabase/supabase-js';
 import mime from 'mime-types';
 import pino from 'pino';
-import axios from 'axios'; // Import necessário
+import axios from 'axios'; 
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'silent' });
@@ -14,7 +14,8 @@ const logger = pino({ level: 'silent' });
  */
 export const handleMediaUpload = async (msg) => {
     try {
-        // PATCH: Configuração de emulação de navegador para evitar 403 Forbidden do WhatsApp
+        // PATCH: User-Agent spoofing completo para Chrome 120+ (Win10)
+        // Isso é vital para evitar o erro 403 Forbidden do servidor de mídia do WhatsApp
         const downloadOptions = {
             options: {
                 headers: {
@@ -22,7 +23,8 @@ export const handleMediaUpload = async (msg) => {
                     'Referer': 'https://web.whatsapp.com/',
                     'Origin': 'https://web.whatsapp.com/'
                 },
-                timeout: 60000 // Aumentado para 60s
+                // Timeout estendido para vídeos grandes
+                timeout: 90000 
             }
         };
 
@@ -63,9 +65,12 @@ export const handleMediaUpload = async (msg) => {
         return data.publicUrl;
 
     } catch (e) {
-        // Se for erro de timeout ou 403, loga específico
-        if (e?.response?.status === 403 || e?.statusCode === 403) {
-             console.error("[MEDIA] Erro 403 (Bloqueio WA). Verifique User-Agent ou IP.");
+        // Tratamento de Erros Específicos
+        const status = e?.response?.status || e?.statusCode;
+        if (status === 403) {
+             console.error("[MEDIA] Erro 403 (Bloqueio WA). O User-Agent pode estar desatualizado.");
+        } else if (status === 401) {
+             console.error("[MEDIA] Erro 401 (Não Autorizado). A URL de mídia expirou.");
         } else if (!e.message?.includes('404')) {
              console.error("[MEDIA] Falha no processamento:", e.message);
         }
