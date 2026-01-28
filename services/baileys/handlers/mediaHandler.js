@@ -3,19 +3,10 @@ import { downloadMediaMessage } from '@whiskeysockets/baileys';
 import { createClient } from '@supabase/supabase-js';
 import mime from 'mime-types';
 import pino from 'pino';
+import axios from 'axios'; // Import necessário
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'silent' });
-
-// Headers completos para emular tráfego legítimo do WhatsApp Web
-const AXIOS_OPTIONS = {
-    headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://web.whatsapp.com/',
-        'Origin': 'https://web.whatsapp.com/'
-    },
-    timeout: 20000 // 20s timeout para evitar travamentos
-};
 
 /**
  * Faz o download da mídia da mensagem e upload para o Supabase.
@@ -23,12 +14,23 @@ const AXIOS_OPTIONS = {
  */
 export const handleMediaUpload = async (msg) => {
     try {
+        // PATCH: Configuração de emulação de navegador para evitar 403 Forbidden do WhatsApp
+        const downloadOptions = {
+            options: {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    'Referer': 'https://web.whatsapp.com/',
+                    'Origin': 'https://web.whatsapp.com/'
+                },
+                timeout: 60000 // Aumentado para 60s
+            }
+        };
+
         // Baileys Download (Decriptação AES-256-CTR automática)
-        // PATCH CORRETO: Passamos 'options' (config do axios) dentro do objeto de opções do downloadMediaMessage
         const buffer = await downloadMediaMessage(
             msg,
             'buffer',
-            { options: AXIOS_OPTIONS },
+            downloadOptions,
             { logger, reuploadRequest: msg.updateMediaMessage }
         );
 
@@ -61,8 +63,10 @@ export const handleMediaUpload = async (msg) => {
         return data.publicUrl;
 
     } catch (e) {
-        // Log detalhado apenas se não for 404 (mídia expirada)
-        if (!e.message?.includes('404')) {
+        // Se for erro de timeout ou 403, loga específico
+        if (e?.response?.status === 403 || e?.statusCode === 403) {
+             console.error("[MEDIA] Erro 403 (Bloqueio WA). Verifique User-Agent ou IP.");
+        } else if (!e.message?.includes('404')) {
              console.error("[MEDIA] Falha no processamento:", e.message);
         }
         return null;
