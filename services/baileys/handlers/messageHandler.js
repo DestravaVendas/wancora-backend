@@ -84,36 +84,55 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime,
 
         const fromMe = cleanMsg.key.fromMe;
         const myJid = normalizeJid(sock.user?.id);
+        const isGroup = jid.includes('@g.us');
 
         let leadId = null;
+        const finalName = forcedName || cleanMsg.pushName;
         
-        if (!fromMe && jid && !jid.includes('@g.us')) {
-            const finalName = forcedName || cleanMsg.pushName;
-
-            // FORÇA BUSCA DE FOTO EM TEMPO REAL
-            // Se for realtime, tenta buscar a foto para atualizar cache/urls expiradas
+        // 1. TRATAMENTO DE INDIVIDUAIS (LEADS)
+        if (!fromMe && !isGroup) {
+            // Busca Foto em Realtime (Fire & Forget)
             if (isRealtime || options.fetchProfilePic) {
-                // Fire and forget para não travar o fluxo
                 sock.profilePictureUrl(jid, 'image')
                     .then(url => {
-                        if (url) {
-                            upsertContact(jid, companyId, finalName, url, false);
-                        }
+                        if (url) upsertContact(jid, companyId, finalName, url, false);
                     })
-                    .catch((err) => {
-                        // Se der 404/401, a foto pode ter sido removida. Atualizar com null?
-                        // Por segurança, mantemos a antiga se falhar.
-                        // console.log(`[PROFILE] Falha ao buscar foto para ${jid}`);
-                    });
+                    .catch(() => {});
+            } else if (finalName) {
+                // Atualiza nome se tiver, mesmo sem foto
+                upsertContact(jid, companyId, finalName, null, false);
             }
             
+            // Garante existência do Lead (Auto-Lead)
             leadId = await ensureLeadExists(jid, companyId, finalName, myJid);
         }
         
-        if (jid.includes('@g.us') && cleanMsg.key.participant) {
-             const partJid = normalizeJid(cleanMsg.key.participant);
-             if (partJid !== myJid && (forcedName || cleanMsg.pushName)) {
-                 await upsertContact(partJid, companyId, forcedName || cleanMsg.pushName, null, false);
+        // 2. TRATAMENTO DE GRUPOS (COMUNIDADE)
+        if (isGroup) {
+             // Atualiza participante que mandou a msg (se não for eu)
+             if (cleanMsg.key.participant) {
+                 const partJid = normalizeJid(cleanMsg.key.participant);
+                 if (partJid !== myJid && finalName) {
+                     await upsertContact(partJid, companyId, finalName, null, false);
+                 }
+             }
+
+             // Atualiza FOTO DO GRUPO (Se solicitado ou aleatoriamente para manter atualizado)
+             // Check de 10% de chance para não floodar requisições em grupos movimentados
+             if ((isRealtime && Math.random() < 0.1) || options.fetchProfilePic) {
+                 sock.profilePictureUrl(jid, 'image')
+                    .then(url => {
+                        if (url) {
+                            // Para grupos, usamos upsertContact mas o nome vem de 'subject' (não temos aqui facilmente sem getMetadata)
+                            // Então atualizamos apenas a URL da foto mantendo o nome existente
+                            supabase.from('contacts')
+                                .update({ profile_pic_url: url })
+                                .eq('jid', jid)
+                                .eq('company_id', companyId)
+                                .then(() => {});
+                        }
+                    })
+                    .catch(() => {});
              }
         }
 
@@ -161,7 +180,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime,
                 dispatchWebhook(config.webhook_url, 'message.upsert', {
                     ...savedMsg,
                     pushName: cleanMsg.pushName,
-                    isGroup: jid.includes('@g.us')
+                    isGroup: isGroup
                 });
             }
         }
