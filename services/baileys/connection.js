@@ -42,6 +42,8 @@ export const startSession = async (sessionId, companyId) => {
             printQRInTerminal: false,
             auth: {
                 creds: state.creds,
+                // 🚀 CACHE EM MEMÓRIA: Envolve o store do Supabase com um cache LRU.
+                // Isso evita que o bot bata no banco a cada mensagem recebida para buscar chaves.
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
             browser: Browsers.ubuntu("Chrome"), 
