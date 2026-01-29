@@ -1,4 +1,3 @@
-
 import { createClient } from "@supabase/supabase-js";
 import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
 import { sendMessage as sendService } from '../services/baileys/sender.js';
@@ -17,6 +16,8 @@ import { proto } from '@whiskeysockets/baileys';
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
+
+// --- GERENCIAMENTO DE SESSÃO ---
 
 export const startSession = async (sessionId, companyId) => {
     try {
@@ -38,6 +39,8 @@ export const deleteSession = async (sessionId, companyId) => {
     }
 };
 
+// --- ENVIO DE MENSAGENS ---
+
 export const sendMessage = async (payload) => {
     try {
         return await sendService(payload);
@@ -47,7 +50,7 @@ export const sendMessage = async (payload) => {
     }
 };
 
-// --- GRUPOS & CANAIS (Community) ---
+// --- GRUPOS & CANAIS (Community Module) ---
 
 export const createGroup = async (req, res) => {
     const { sessionId, companyId, subject, participants } = req.body;
@@ -99,7 +102,7 @@ export const deleteChannel = async (req, res) => {
     }
 };
 
-// --- FIM Community ---
+// --- INTERATIVIDADE (Enquetes, Reações, Delete) ---
 
 export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, optionId) => {
     try {
@@ -123,12 +126,11 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error("Conteúdo da enquete corrompido.");
         }
 
-        // 2. Resolve a opção com Robustez
+        // 2. Resolve a opção com Robustez (Suporte a legado)
         let optionsList = [];
         if (Array.isArray(pollContent.options)) {
             optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
         } else if (pollContent.values) {
-            // Suporte legado
             optionsList = pollContent.values;
         } else {
             throw new Error("Estrutura da enquete inválida.");
@@ -137,7 +139,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         const selectedOptionText = optionsList[optionId];
         
         if (selectedOptionText === undefined) {
-            throw new Error(`Opção inválida: Index ${optionId} não existe em [${optionsList.join(', ')}].`);
+            throw new Error(`Opção inválida: Index ${optionId} não existe.`);
         }
 
         const cleanOptionText = selectedOptionText; 
@@ -150,7 +152,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
 
         const chatJid = normalizeJid(remoteJid);
         
-        // 3. Payload de Voto
+        // 3. Payload de Voto (Baileys)
         await session.sock.sendMessage(chatJid, {
             poll: {
                 vote: {
@@ -164,13 +166,14 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             }
         });
 
-        // 4. Salva no banco (Update Local)
+        // 4. Salva no banco (Atualização Otimista)
+        // Atualizamos localmente para a UI reagir rápido, mas o listener confirmará depois.
         const myJid = normalizeJid(session.sock.user?.id);
         
         const { data: currentMsg } = await supabase.from('messages').select('poll_votes').eq('whatsapp_id', pollMsg.whatsapp_id).single();
         let votes = currentMsg?.poll_votes || [];
         
-        // Remove voto anterior meu se for single choice
+        // Remove voto anterior meu se existir
         votes = votes.filter(v => v.voterJid !== myJid);
 
         votes.push({
