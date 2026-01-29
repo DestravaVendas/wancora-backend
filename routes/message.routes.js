@@ -1,4 +1,3 @@
-
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import { sendMessage, sendPollVote, sendReaction, deleteMessage } from "../controllers/whatsappController.js"; 
@@ -42,13 +41,16 @@ router.post("/send", async (req, res) => {
     const sentMsg = await sendMessage(payload);
     
     // 2. Salvamento Otimista
+    // Isso garante que a mensagem apareça no chat instantaneamente para quem enviou
     if (companyId && sentMsg?.key) {
         
+        // Tenta vincular ao Lead existente
         let leadId = null;
         const phoneClean = cleanTo.split('@')[0].replace(/\D/g, '');
         const { data: lead } = await supabase.from("leads").select("id").eq("phone", phoneClean).eq("company_id", companyId).maybeSingle();
         if (lead) leadId = lead.id;
 
+        // Prepara conteúdo para exibição no banco
         let displayContent = text || caption || `[${payload.type}]`;
         if (payload.type === 'poll' && poll) displayContent = JSON.stringify(poll);
         else if (payload.type === 'location' && location) displayContent = JSON.stringify(location);
@@ -78,10 +80,14 @@ router.post("/send", async (req, res) => {
   }
 });
 
-// Votar
+// Votar em Enquete
 router.post("/vote", async (req, res) => {
     const { companyId, sessionId, remoteJid, pollId, optionId } = req.body;
-    if(!pollId || optionId === undefined) return res.status(400).json({ error: "PollId e OptionId obrigatórios" });
+    
+    // Validação estrita
+    if(!pollId || optionId === undefined) {
+        return res.status(400).json({ error: "PollId e OptionId obrigatórios" });
+    }
 
     try {
         await sendPollVote(sessionId, companyId, remoteJid, pollId, optionId);
