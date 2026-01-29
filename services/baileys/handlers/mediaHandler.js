@@ -13,16 +13,19 @@ const logger = pino({ level: 'silent' });
  */
 export const handleMediaUpload = async (msg, companyId) => {
     try {
-        // PATCH 2025: User-Agent spoofing atualizado para Chrome 126+ (Win10)
-        // Resolve erros 403/401 no servidor de mídia do WhatsApp
+        // PATCH 403: Headers completos simulando navegador real
+        // O WhatsApp valida User-Agent e Referer rigorosamente agora
         const downloadOptions = {
             options: {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
                     'Referer': 'https://web.whatsapp.com/',
-                    'Origin': 'https://web.whatsapp.com/'
+                    'Origin': 'https://web.whatsapp.com/',
+                    'Sec-Fetch-Dest': 'empty',
+                    'Sec-Fetch-Mode': 'cors',
+                    'Sec-Fetch-Site': 'same-origin'
                 },
-                timeout: 90000 
+                timeout: 60000 // 60s timeout
             }
         };
 
@@ -45,7 +48,10 @@ export const handleMediaUpload = async (msg, companyId) => {
         else if (messageType === 'documentMessage') mimeType = msg.message.documentMessage.mimetype || 'application/pdf';
         else if (messageType === 'stickerMessage') mimeType = 'image/webp';
 
-        const ext = mime.extension(mimeType) || 'bin';
+        // Correção de Extensão para Audio (WhatsApp manda ogg, navegador prefere mp4/mp3 container)
+        let ext = mime.extension(mimeType) || 'bin';
+        if (mimeType === 'audio/mp4') ext = 'm4a';
+
         const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
         const filePath = companyId ? `${companyId}/${fileName}` : fileName;
 
@@ -63,13 +69,12 @@ export const handleMediaUpload = async (msg, companyId) => {
         return data.publicUrl;
 
     } catch (e) {
-        const status = e?.response?.status || e?.statusCode;
-        if (status === 403) {
-             console.error("[MEDIA] Erro 403 (Bloqueio WA). User-Agent atualizado.");
-        } else if (status === 401) {
-             console.error("[MEDIA] Erro 401 (Expirado).");
-        } else if (!e.message?.includes('404')) {
-             console.error("[MEDIA] Falha:", e.message);
+        // Silencia erros conhecidos para não poluir log
+        const msg = e.message || '';
+        if (msg.includes('403') || msg.includes('401')) {
+             console.warn(`[MEDIA] Falha Download (${msg}) - Tentando novamente na próxima.`);
+        } else {
+             console.error("[MEDIA] Falha Genérica:", msg);
         }
         return null;
     }
