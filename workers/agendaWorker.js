@@ -12,7 +12,7 @@ const cleanPhone = (phone) => phone.replace(/\D/g, '');
 
 const processReminders = async () => {
     try {
-        console.log('⏰ [Agenda Worker] Verificando lembretes pendentes...');
+         // Desativado     console.log('⏰ [Agenda Worker] Verificando lembretes pendentes...'); 
         
         // 1. Busca agendamentos das próximas 24h que ainda não foram notificados
         const now = new Date();
