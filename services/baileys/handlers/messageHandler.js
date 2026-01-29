@@ -156,11 +156,6 @@ export const handleMessageUpdate = async (updates, companyId) => {
 
                 if (originalMsg) {
                     try {
-                        // Decripta voto (No Baileys isso é complexo, aqui simplificamos a agregação)
-                        // A lib Baileys fornece getAggregateVotesInPollMessage, mas exige a chave de criptografia.
-                        // Assumimos que o frontend ou o webhook tratará a lógica fina, 
-                        // aqui apenas salvamos o raw update ou um array simplificado se conseguirmos.
-                        
                         let currentVotes = Array.isArray(originalMsg.poll_votes) ? originalMsg.poll_votes : [];
                         
                         // Remove voto anterior do mesmo usuário
@@ -168,9 +163,6 @@ export const handleMessageUpdate = async (updates, companyId) => {
                         
                         // Adiciona novo voto
                         const selectedOptions = vote.selectedOptions.map(opt => {
-                            // Tenta mapear o hash da opção para o texto (se possível)
-                            // Na prática, precisaria do getAggregateVotesInPollMessage do Baileys
-                            // Para MVP, salvamos o hash
                             return Buffer.isBuffer(opt) ? opt.toString('hex') : opt; 
                         });
 
@@ -202,13 +194,10 @@ export const handleReceiptUpdate = async (events, companyId) => {
         
         let statusStr = 'sent';
         if (receipt.userJid) {
-            // Receipt de usuário específico (em grupo)
-            // Em MVP ignoramos recibos individuais de grupo para não spammar updates
+            // Ignoramos recibos individuais de grupo no MVP para economizar writes
             continue; 
         }
 
-        // Mapeamento Baileys -> Wancora
-        // read | receipt-played
         const type = event.type; 
         
         if (type === 'read' || type === 'read-self') statusStr = 'read';
@@ -220,5 +209,53 @@ export const handleReceiptUpdate = async (events, companyId) => {
             .update({ status: statusStr, [statusStr === 'read' ? 'read_at' : 'delivered_at']: new Date() })
             .eq('whatsapp_id', key.id)
             .eq('company_id', companyId);
+    }
+};
+
+export const handleReaction = async (reactions, sock, companyId) => {
+    for (const reaction of reactions) {
+        const { key, reaction: r } = reaction;
+        const msgId = key.id;
+        
+        // Define quem reagiu (Ator)
+        const participant = key.participant || key.remoteJid;
+        const actor = normalizeJid(participant);
+        const emoji = r.text; // Texto do emoji ou vazio (remoção)
+
+        if (!msgId || !companyId) continue;
+
+        try {
+            // 1. Busca Mensagem para pegar reações atuais
+            const { data: msg } = await supabase
+                .from('messages')
+                .select('id, reactions')
+                .eq('whatsapp_id', msgId)
+                .eq('company_id', companyId)
+                .maybeSingle();
+
+            if (msg) {
+                let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
+
+                // Remove reação anterior deste ator (para evitar duplicidade ou trocar emoji)
+                currentReactions = currentReactions.filter(rx => rx.actor !== actor);
+
+                // Se houver emoji (não é remoção), adiciona a nova
+                if (emoji) {
+                    currentReactions.push({
+                        text: emoji,
+                        actor: actor,
+                        ts: Date.now()
+                    });
+                }
+
+                // 2. Atualiza Banco
+                await supabase
+                    .from('messages')
+                    .update({ reactions: currentReactions })
+                    .eq('id', msg.id);
+            }
+        } catch (e) {
+            console.error(`[REACTION] Erro ao processar reação:`, e.message);
+        }
     }
 };
