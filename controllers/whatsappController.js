@@ -126,7 +126,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error("Conteúdo da enquete corrompido.");
         }
 
-        // 2. Resolve a opção com Robustez (Suporte a legado)
+        // 2. Resolve a opção com Robustez
         let optionsList = [];
         if (Array.isArray(pollContent.options)) {
             optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
@@ -152,7 +152,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
 
         const chatJid = normalizeJid(remoteJid);
         
-        // 3. Payload de Voto (Baileys)
+        // 3. Payload de Voto
         await session.sock.sendMessage(chatJid, {
             poll: {
                 vote: {
@@ -167,13 +167,11 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         });
 
         // 4. Salva no banco (Atualização Otimista)
-        // Atualizamos localmente para a UI reagir rápido, mas o listener confirmará depois.
         const myJid = normalizeJid(session.sock.user?.id);
         
         const { data: currentMsg } = await supabase.from('messages').select('poll_votes').eq('whatsapp_id', pollMsg.whatsapp_id).single();
         let votes = currentMsg?.poll_votes || [];
         
-        // Remove voto anterior meu se existir
         votes = votes.filter(v => v.voterJid !== myJid);
 
         votes.push({
@@ -243,6 +241,67 @@ export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, ever
     } catch (error) {
         console.error(`[Controller] Erro ao deletar:`, error);
         throw error;
+    }
+};
+
+// --- UX: CHECK AZUL & ONLINE (NOVO) ---
+
+/**
+ * Executado quando o usuário abre o chat no Frontend.
+ * 1. Assina o evento de presença (Online/Digitando).
+ * 2. Envia Read Receipt (Check Azul) para mensagens não lidas.
+ */
+export const markChatAsRead = async (sessionId, companyId, remoteJid) => {
+    try {
+        const session = sessions.get(sessionId);
+        if (!session?.sock) return; 
+        
+        const jid = normalizeJid(remoteJid);
+
+        // 1. Inscreve para receber eventos "Online" e "Digitando..."
+        // O Baileys não envia isso por padrão para economizar banda.
+        await session.sock.presenceSubscribe(jid);
+
+        // 2. Busca mensagens não lidas deste chat no banco
+        const { data: unreadMsgs } = await supabase
+            .from('messages')
+            .select('whatsapp_id, from_me')
+            .eq('company_id', companyId)
+            .eq('remote_jid', jid)
+            .eq('from_me', false)
+            .neq('status', 'read')
+            .limit(20); 
+
+        if (unreadMsgs && unreadMsgs.length > 0) {
+            const keys = unreadMsgs.map(m => ({
+                remoteJid: jid,
+                id: m.whatsapp_id,
+                fromMe: false 
+            }));
+
+            // Envia o recibo de leitura (Check Azul)
+            await session.sock.readMessages(keys);
+
+            // Atualiza status no banco (Otimista)
+            await supabase
+                .from('messages')
+                .update({ status: 'read', read_at: new Date() })
+                .eq('company_id', companyId)
+                .eq('remote_jid', jid)
+                .in('whatsapp_id', unreadMsgs.map(m => m.whatsapp_id));
+            
+            // Zera contador de não lidas do contato
+            await supabase
+                .from('contacts')
+                .update({ unread_count: 0 })
+                .eq('company_id', companyId)
+                .eq('jid', jid);
+        }
+
+        return { success: true };
+    } catch (error) {
+        console.error(`[Controller] Erro ao marcar lido:`, error.message);
+        return { success: false, error: error.message };
     }
 };
 
