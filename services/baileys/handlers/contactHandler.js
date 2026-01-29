@@ -5,7 +5,7 @@ import { createClient } from '@supabase/supabase-js';
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 /**
- * Processa atualizações de presença
+ * Processa atualizações de presença (Online/Visto por ultimo)
  */
 export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
     const id = presenceUpdate.id;
@@ -15,7 +15,7 @@ export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
         const lastKnown = presences[id].lastKnownPresence;
         const isOnline = lastKnown === 'composing' || lastKnown === 'recording' || lastKnown === 'available';
         
-        // Fire & Forget update
+        // Update Rápido
         supabase.from('contacts')
             .update({ 
                 is_online: isOnline, 
@@ -28,36 +28,38 @@ export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
 };
 
 /**
- * Processa lista de contatos (Sync inicial)
+ * Processa lista de contatos (Sync inicial da Agenda)
  */
 export const handleContactsUpsert = async (contacts, companyId) => {
     for (const c of contacts) {
         const jid = normalizeJid(c.id);
         if (!jid) continue;
         
-        const bestName = c.name || c.verifiedName || c.notify;
-        
+        // Prioridade: name (Agenda) > notify (PushName)
+        // Se 'name' existe, marcamos isFromBook = true
+        const bestName = c.name || c.notify || c.verifiedName;
+        const isFromBook = !!c.name;
+
         if (bestName || c.imgUrl) {
-            await upsertContact(jid, companyId, bestName, c.imgUrl || null, !!c.name, c.lid);
+            await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook, c.lid);
         }
     }
 };
 
 /**
- * SMART FETCHER (Missão 3: Lazy Load)
- * Verifica se precisa baixar a foto de perfil baseada na regra de 24h.
- * Evita chamadas excessivas ao Baileys (Anti-Ban).
+ * SMART FETCHER (Recuperação de Dados Faltantes em Tempo Real)
+ * Chamado a cada mensagem recebida para garantir que temos foto e dados business.
  */
 export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
     if (!jid || jid.includes('status@broadcast')) return;
+    const cleanJid = normalizeJid(jid);
+    if (cleanJid.includes('@g.us') || cleanJid.includes('@newsletter')) return;
 
     try {
-        const cleanJid = normalizeJid(jid);
-
-        // 1. Consulta o Banco
+        // 1. Consulta o Banco para ver o que falta
         const { data: contact } = await supabase
             .from('contacts')
-            .select('profile_pic_url, profile_pic_updated_at')
+            .select('profile_pic_url, profile_pic_updated_at, is_business, verified_name')
             .eq('jid', cleanJid)
             .eq('company_id', companyId)
             .maybeSingle();
@@ -66,25 +68,50 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
         const lastUpdate = contact?.profile_pic_updated_at ? new Date(contact.profile_pic_updated_at) : new Date(0);
         const diffHours = (now - lastUpdate) / 1000 / 60 / 60;
 
-        // REGRA DE OURO: Só busca se for mais velho que 24h ou nunca buscou
-        if (diffHours >= 24) {
-            let newPicUrl = null;
-            try {
-                // Baixa do Baileys
-                newPicUrl = await sock.profilePictureUrl(cleanJid, 'image');
-            } catch (e) {
-                // Se falhar (ex: privacidade, bloqueado), não crasha, apenas segue.
-                // 401/404/400 são esperados se o usuário não tiver foto
-            }
+        let newPicUrl = null;
+        let isBusiness = contact?.is_business || false;
+        let verifiedName = contact?.verified_name || null;
+        let updated = false;
 
-            // Atualiza com timestamp atual (mesmo se null, para resetar o timer de 24h)
-            await upsertContact(cleanJid, companyId, pushName, newPicUrl, false);
-        } else {
-            // Se cache ainda é válido, apenas atualiza o nome se necessário
-            // (upsertContact já tem lógica interna para não sobrescrever nomes manuais)
-            if (pushName) {
-                await upsertContact(cleanJid, companyId, pushName, null, false);
+        // 2. BUSCA PERFIL BUSINESS (Se não temos ou se faz tempo > 48h)
+        if (!contact || diffHours > 48) { 
+             try {
+                 const businessProfile = await sock.getBusinessProfile(cleanJid);
+                 if (businessProfile) {
+                     isBusiness = true;
+                     // Tenta pegar descrição ou email como prova de business, e usa o pushName se verificado não vier explícito
+                     verifiedName = businessProfile.description || businessProfile.email ? (pushName || null) : null; 
+                     updated = true;
+                 }
+             } catch (e) {
+                 // 404 = Não é business ou erro de rede. Ignora.
+             }
+        }
+
+        // 3. BUSCA FOTO DE PERFIL (Se antiga ou nula) - Debounce de 24h
+        if (!contact?.profile_pic_url || diffHours >= 24) {
+            try {
+                // 'image' retorna url da imagem em alta resolução se disponível, ou thumb
+                newPicUrl = await sock.profilePictureUrl(cleanJid, 'image');
+                updated = true;
+            } catch (e) {
+                // 401/404/400 => Sem foto ou privado.
             }
+        }
+
+        // 4. PERSISTE TUDO (Se houve novidade ou se precisamos atualizar o nome)
+        // Se 'updated' for true ou se tivermos um pushName novo
+        if (updated || pushName) {
+            await upsertContact(
+                cleanJid, 
+                companyId, 
+                pushName, // Envia pushName atual como 'incomingName'
+                newPicUrl || (updated ? null : undefined), // Se tentou e falhou (null), salva null. Se não tentou (undefined), ignora.
+                false, // isFromBook (não é da agenda)
+                null, // lid
+                isBusiness,
+                verifiedName
+            );
         }
 
     } catch (e) {
