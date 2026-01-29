@@ -1,3 +1,4 @@
+
 import {
     upsertContact,
     upsertMessage,
@@ -6,6 +7,7 @@ import {
 } from '../../crm/sync.js';
 import { getContentType, getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 import { handleMediaUpload } from './mediaHandler.js';
+import { refreshContactInfo } from './contactHandler.js'; // NOVO IMPORT
 import { unwrapMessage, getBody } from '../../../utils/wppParsers.js';
 import { dispatchWebhook } from '../../integrations/webhook.js'; 
 import { createClient } from '@supabase/supabase-js';
@@ -90,14 +92,12 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime,
         
         // 1. TRATAMENTO DE INDIVIDUAIS (LEADS)
         if (!fromMe && !isGroup) {
-            // Busca Foto em Realtime (Fire & Forget)
-            if (isRealtime || options.fetchProfilePic) {
-                sock.profilePictureUrl(jid, 'image')
-                    .then(url => {
-                        if (url) upsertContact(jid, companyId, finalName, url, false);
-                    })
-                    .catch(() => {});
+            // SMART FETCH: Substitui lógica aleatória anterior
+            // Verifica no banco se precisa atualizar a foto (Cache 24h)
+            if (isRealtime) {
+                await refreshContactInfo(sock, jid, companyId, finalName);
             } else if (finalName) {
+                // Histórico: Apenas atualiza nome, sem foto (para performance)
                 upsertContact(jid, companyId, finalName, null, false);
             }
             
@@ -109,22 +109,15 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime,
              if (cleanMsg.key.participant) {
                  const partJid = normalizeJid(cleanMsg.key.participant);
                  if (partJid !== myJid && finalName) {
-                     await upsertContact(partJid, companyId, finalName, null, false);
+                     // Smart Fetch para participantes também
+                     if (isRealtime) await refreshContactInfo(sock, partJid, companyId, finalName);
+                     else await upsertContact(partJid, companyId, finalName, null, false);
                  }
              }
 
-             if ((isRealtime && Math.random() < 0.1) || options.fetchProfilePic) {
-                 sock.profilePictureUrl(jid, 'image')
-                    .then(url => {
-                        if (url) {
-                            supabase.from('contacts')
-                                .update({ profile_pic_url: url })
-                                .eq('jid', jid)
-                                .eq('company_id', companyId)
-                                .then(() => {});
-                        }
-                    })
-                    .catch(() => {});
+             // Foto do Grupo (Lazy Load tbm)
+             if (isRealtime) {
+                 await refreshContactInfo(sock, jid, companyId, null);
              }
         }
 
@@ -143,7 +136,6 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime,
             messageTypeClean = 'poll';
             const pollData = cleanMsg.message[type];
             if (pollData) {
-                // Salva estrutura JSON para o Frontend renderizar
                 finalContent = JSON.stringify({
                     name: pollData.name,
                     options: pollData.options.map(o => o.optionName),
@@ -212,7 +204,7 @@ export const handleReceiptUpdate = async (events, companyId) => {
     }
 };
 
-// --- NOVO: Handler de Atualizações de Enquete (Votos) ---
+// --- Handler de Atualizações de Enquete (Votos) ---
 export const handleMessageUpdate = async (updates, companyId) => {
     for (const update of updates) {
         if (update.pollUpdates) {
@@ -220,7 +212,6 @@ export const handleMessageUpdate = async (updates, companyId) => {
             if (!pollCreationKey) continue;
 
             try {
-                // 1. Busca a mensagem original da enquete no banco
                 const { data: originalMsg } = await supabase
                     .from('messages')
                     .select('content, poll_votes')
@@ -229,7 +220,6 @@ export const handleMessageUpdate = async (updates, companyId) => {
                     .single();
 
                 if (originalMsg) {
-                    // 2. Reconstrói o objeto de mensagem original para o Baileys
                     const pollContent = typeof originalMsg.content === 'string' ? JSON.parse(originalMsg.content) : originalMsg.content;
                     
                     const creationMessage = {
@@ -240,13 +230,11 @@ export const handleMessageUpdate = async (updates, companyId) => {
                         }
                     };
 
-                    // 3. Usa a função nativa do Baileys para agregar votos
                     const aggregation = getAggregateVotesInPollMessage({
                         message: creationMessage,
                         pollUpdates: update.pollUpdates
                     });
 
-                    // 4. Converte para o formato do Wancora (Centrado no Eleitor)
                     const voteMap = new Map();
 
                     for (const option of aggregation) {
@@ -266,7 +254,6 @@ export const handleMessageUpdate = async (updates, companyId) => {
                         });
                     });
 
-                    // 5. Salva no Banco
                     console.log(`🗳️ [POLL] Votos computados para msg ${pollCreationKey.id}`);
                     await supabase.from('messages')
                         .update({ poll_votes: newPollVotes })
@@ -292,9 +279,7 @@ export const handleReaction = async (reactions, sock, companyId) => {
 
         if (msg) {
             let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
-            // Remove reação anterior do mesmo usuário
             currentReactions = currentReactions.filter(r => r.actor !== reactorJid);
-            // Se tiver texto (emoji), adiciona. Se não tiver, é un-react (já foi removido no filtro acima)
             if (text) currentReactions.push({ text, actor: reactorJid, ts: Date.now() });
             
             await supabase.from('messages').update({ reactions: currentReactions }).eq('whatsapp_id', key.id).eq('company_id', companyId);
