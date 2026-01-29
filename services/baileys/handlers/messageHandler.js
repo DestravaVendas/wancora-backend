@@ -2,6 +2,7 @@
 import { getContentType, normalizeJid, unwrapMessage, getBody } from '../../../utils/wppParsers.js';
 import { upsertMessage, ensureLeadExists, updateInstanceStatus } from '../../crm/sync.js';
 import { handleMediaUpload } from './mediaHandler.js';
+import { refreshContactInfo } from './contactHandler.js'; // IMPORT IMPORTANTE
 import { dispatchWebhook } from '../../integrations/webhook.js';
 import { createClient } from '@supabase/supabase-js';
 
@@ -13,61 +14,56 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime = true, forcedName = null, options = {}) => {
     try {
-        const { downloadMedia = true } = options;
+        const { downloadMedia = true, fetchProfilePic = false } = options;
 
         // 1. Normalização e Unwrap
         if (!msg.message) return;
-        
-        // Ignora status (stories)
         if (msg.key.remoteJid === 'status@broadcast') return;
 
-        // Desenrola ViewOnce, Ephemeral, Edited
         const unwrapped = unwrapMessage(msg);
         const jid = normalizeJid(unwrapped.key.remoteJid);
         const fromMe = unwrapped.key.fromMe;
-        const pushName = forcedName || unwrapped.pushName; // Nome forçado pelo histórico ou pushName nativo
+        const pushName = forcedName || unwrapped.pushName;
         
         const type = getContentType(unwrapped.message);
         const body = getBody(unwrapped.message);
 
         // 2. Verificação de Bloqueio (Anti-Ghost)
-        // Se o contato estiver marcado como 'is_ignored', não processamos nada (nem webhook, nem lead)
         if (!fromMe) {
             const { data: contact } = await supabase
                 .from('contacts')
-                .select('is_ignored, is_newsletter')
+                .select('is_ignored')
                 .eq('jid', jid)
                 .eq('company_id', companyId)
                 .maybeSingle();
 
-            if (contact?.is_ignored) return; // Bloqueio silencioso
+            if (contact?.is_ignored) return;
         }
 
-        // 3. Garantia de Lead (Apenas se não for eu, e não for grupo/canal)
-        // Se for grupo, o ensureLeadExists retorna null internamente
+        // 3. Garantia de Lead e DADOS FALTANTES (Regra: Buscar o que falta)
         let leadId = null;
-        if (!fromMe && isRealtime) {
+        if (!fromMe) {
             const myJid = normalizeJid(sock.user?.id);
-            leadId = await ensureLeadExists(jid, companyId, pushName, myJid);
+            // Só cria lead se for Realtime (msg nova)
+            if (isRealtime) {
+                // Cria Lead se não existir (filtra grupos/canais internamente)
+                leadId = await ensureLeadExists(jid, companyId, pushName, myJid);
+                
+                // TRIGGER DE DADOS FALTANTES:
+                // Sempre que chega mensagem, tentamos enriquecer o contato (Business/Foto)
+                refreshContactInfo(sock, jid, companyId, pushName).catch(err => console.error("Refresh Error", err));
+            }
         }
 
         // 4. Processamento de Mídia
         let mediaUrl = null;
-        let fileName = null;
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
 
-        // Se for histórico antigo, podemos pular download (opcional via flag downloadMedia)
-        // Se for Realtime, SEMPRE baixamos.
         if (isMedia && (isRealtime || downloadMedia)) {
-            // Tenta obter nome do arquivo se for documento
-            if (type === 'documentMessage') {
-                fileName = unwrapped.message.documentMessage.fileName;
-            }
-            // Upload para Supabase Storage
             mediaUrl = await handleMediaUpload(unwrapped, companyId);
         }
 
-        // 5. Preparar Payload para o Banco (Normalizado)
+        // 5. Payload
         const messageData = {
             company_id: companyId,
             session_id: sessionId,
@@ -75,14 +71,14 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             whatsapp_id: unwrapped.key.id,
             from_me: fromMe,
             content: body,
-            message_type: type?.replace('Message', '') || 'unknown', // imageMessage -> image
+            message_type: type?.replace('Message', '') || 'unknown',
             media_url: mediaUrl,
-            status: fromMe ? 'sent' : 'delivered', // Se eu enviei, assume sent. Se recebi, delivered.
+            status: fromMe ? 'sent' : 'delivered',
             created_at: new Date( (unwrapped.messageTimestamp || Date.now() / 1000) * 1000 ),
             lead_id: leadId
         };
 
-        // Tratamento especial para Enquetes e Localização para salvar JSON limpo no content
+        // Parsers Especiais (Poll, Loc, Contact)
         if (type === 'pollCreationMessage' || type === 'pollCreationMessageV3') {
             const poll = unwrapped.message[type];
             messageData.message_type = 'poll';
@@ -109,20 +105,18 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             });
         }
 
-        // 6. Persistência (DB Upsert)
+        // 6. Persistência
         await upsertMessage(messageData);
 
-        // 7. Webhook (Apenas Realtime)
+        // 7. Webhook
         if (isRealtime) {
-            // Busca URL de webhook da instância
             const { data: instance } = await supabase
                 .from('instances')
-                .select('webhook_url, webhook_enabled, webhook_events, id')
+                .select('webhook_url, webhook_enabled, id')
                 .eq('session_id', sessionId)
                 .single();
 
             if (instance?.webhook_enabled && instance.webhook_url) {
-                // Dispara sem await (Fire & Forget)
                 dispatchWebhook(instance.webhook_url, 'message.upsert', {
                     ...messageData,
                     pushName
@@ -131,22 +125,18 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
 
     } catch (e) {
-        console.error(`❌ [HANDLER] Erro ao processar mensagem ${msg.key?.id}:`, e.message);
+        console.error(`❌ [HANDLER] Erro msg ${msg.key?.id}:`, e.message);
     }
 };
 
-// --- HANDLERS DE ATUALIZAÇÃO ---
-
 export const handleMessageUpdate = async (updates, companyId) => {
     for (const update of updates) {
-        // Enquetes (Votos)
         if (update.pollUpdates) {
             for (const pollUpdate of update.pollUpdates) {
                 const pollMsgId = pollUpdate.pollCreationMessageKey.id;
                 const vote = pollUpdate.vote;
                 const voterJid = normalizeJid(pollUpdate.pollUpdateMessageKey.participant || pollUpdate.pollUpdateMessageKey.remoteJid);
                 
-                // Busca mensagem original
                 const { data: originalMsg } = await supabase
                     .from('messages')
                     .select('poll_votes, content')
@@ -157,30 +147,18 @@ export const handleMessageUpdate = async (updates, companyId) => {
                 if (originalMsg) {
                     try {
                         let currentVotes = Array.isArray(originalMsg.poll_votes) ? originalMsg.poll_votes : [];
-                        
-                        // Remove voto anterior do mesmo usuário
                         currentVotes = currentVotes.filter(v => v.voterJid !== voterJid);
-                        
-                        // Adiciona novo voto
                         const selectedOptions = vote.selectedOptions.map(opt => {
                             return Buffer.isBuffer(opt) ? opt.toString('hex') : opt; 
                         });
-
-                        currentVotes.push({
-                            voterJid,
-                            selectedOptions,
-                            ts: Date.now()
-                        });
+                        currentVotes.push({ voterJid, selectedOptions, ts: Date.now() });
 
                         await supabase
                             .from('messages')
                             .update({ poll_votes: currentVotes })
                             .eq('whatsapp_id', pollMsgId)
                             .eq('company_id', companyId);
-
-                    } catch (e) {
-                        console.error("[POLL] Erro ao processar voto:", e);
-                    }
+                    } catch (e) {}
                 }
             }
         }
@@ -190,19 +168,12 @@ export const handleMessageUpdate = async (updates, companyId) => {
 export const handleReceiptUpdate = async (events, companyId) => {
     for (const event of events) {
         const { key, receipt } = event;
-        // status: 1=sent, 2=delivered, 3=read/played
-        
         let statusStr = 'sent';
-        if (receipt.userJid) {
-            // Ignoramos recibos individuais de grupo no MVP para economizar writes
-            continue; 
-        }
-
+        if (receipt.userJid) continue; 
         const type = event.type; 
-        
         if (type === 'read' || type === 'read-self') statusStr = 'read';
         else if (type === 'delivery') statusStr = 'delivered';
-        else return; // Outros tipos ignorados
+        else return;
 
         await supabase
             .from('messages')
@@ -216,16 +187,13 @@ export const handleReaction = async (reactions, sock, companyId) => {
     for (const reaction of reactions) {
         const { key, reaction: r } = reaction;
         const msgId = key.id;
-        
-        // Define quem reagiu (Ator)
         const participant = key.participant || key.remoteJid;
         const actor = normalizeJid(participant);
-        const emoji = r.text; // Texto do emoji ou vazio (remoção)
+        const emoji = r.text;
 
         if (!msgId || !companyId) continue;
 
         try {
-            // 1. Busca Mensagem para pegar reações atuais
             const { data: msg } = await supabase
                 .from('messages')
                 .select('id, reactions')
@@ -235,27 +203,12 @@ export const handleReaction = async (reactions, sock, companyId) => {
 
             if (msg) {
                 let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
-
-                // Remove reação anterior deste ator (para evitar duplicidade ou trocar emoji)
                 currentReactions = currentReactions.filter(rx => rx.actor !== actor);
-
-                // Se houver emoji (não é remoção), adiciona a nova
                 if (emoji) {
-                    currentReactions.push({
-                        text: emoji,
-                        actor: actor,
-                        ts: Date.now()
-                    });
+                    currentReactions.push({ text: emoji, actor: actor, ts: Date.now() });
                 }
-
-                // 2. Atualiza Banco
-                await supabase
-                    .from('messages')
-                    .update({ reactions: currentReactions })
-                    .eq('id', msg.id);
+                await supabase.from('messages').update({ reactions: currentReactions }).eq('id', msg.id);
             }
-        } catch (e) {
-            console.error(`[REACTION] Erro ao processar reação:`, e.message);
-        }
+        } catch (e) {}
     }
 };
