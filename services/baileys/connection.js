@@ -43,7 +43,7 @@ export const startSession = async (sessionId, companyId) => {
             auth: {
                 creds: state.creds,
                 // 🚀 CACHE EM MEMÓRIA: Envolve o store do Supabase com um cache LRU.
-                // Isso evita que o bot bata no banco a cada mensagem recebida para buscar chaves.
+                // Isso reduz IO e evita que o bot bata no banco a cada mensagem recebida.
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
             browser: Browsers.ubuntu("Chrome"), 
@@ -52,7 +52,7 @@ export const startSession = async (sessionId, companyId) => {
             generateHighQualityLinkPreview: true,
             defaultQueryTimeoutMs: 60000,
             retryRequestDelayMs: 2500,
-            keepAliveIntervalMs: 30000, // Aumentado para 30s para reduzir overhead
+            keepAliveIntervalMs: 30000, 
             shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter'),
             
             // --- IMPLEMENTAÇÃO OBRIGATÓRIA DO MANUAL (getMessage) ---
