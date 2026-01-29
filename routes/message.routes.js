@@ -1,6 +1,6 @@
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
-import { sendMessage, sendPollVote, sendReaction, deleteMessage } from "../controllers/whatsappController.js"; 
+import { sendMessage, sendPollVote, sendReaction, deleteMessage, markChatAsRead } from "../controllers/whatsappController.js"; 
 import { requireAuth } from "../middleware/auth.js";
 import { apiLimiter } from "../middleware/limiter.js";
 import { normalizeJid } from "../utils/wppParsers.js"; // Importando normalizador
@@ -117,6 +117,24 @@ router.post("/delete", async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: error.message });
+    }
+});
+
+// --- NOVA ROTA: Marcar como Lido & Presença ---
+router.post("/read", async (req, res) => {
+    const { sessionId, companyId, remoteJid } = req.body;
+    
+    if (!sessionId || !remoteJid) {
+        return res.status(400).json({ error: "Parâmetros inválidos" });
+    }
+
+    try {
+        await markChatAsRead(sessionId, companyId, remoteJid);
+        res.json({ success: true });
+    } catch (error) {
+        // Loga mas não retorna 500 para não travar o frontend em loop
+        console.error("Erro rota /read:", error);
+        res.json({ success: false });
     }
 });
 
