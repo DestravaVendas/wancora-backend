@@ -1,3 +1,4 @@
+
 import Redis from 'ioredis';
 import pino from 'pino';
 
@@ -20,9 +21,9 @@ const getRedisClient = () => {
         redisClient = new Redis(redisUrl, {
             maxRetriesPerRequest: null, // Obrigatório para BullMQ
             enableReadyCheck: false,
-            // Retry Strategy mais agressiva para evitar crash no boot
+            // Retry Strategy mais robusta
             retryStrategy(times) {
-                const delay = Math.min(times * 100, 3000);
+                const delay = Math.min(times * 200, 5000);
                 return delay;
             },
             reconnectOnError: (err) => {
@@ -30,11 +31,14 @@ const getRedisClient = () => {
                 if (err.message.includes(targetError)) {
                     return true;
                 }
-            }
+            },
+            // TLS configuration for Render (se URL for rediss://)
+            tls: redisUrl.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined
         });
 
         redisClient.on('error', (err) => {
             // Evita crash do processo por erro não tratado no Redis
+            // ETIMEDOUT é comum em cold starts, apenas logamos
             console.error('❌ [REDIS] Erro de conexão (Background):', err.message);
         });
 
