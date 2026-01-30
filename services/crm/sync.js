@@ -1,44 +1,39 @@
 
 import { createClient } from "@supabase/supabase-js";
-import pino from "pino";
 
+// Configurações do Cliente Supabase para evitar Timeouts
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false },
-    db: {
-        schema: 'public',
-    },
-    // Configurações globais de fetch para evitar timeouts agressivos
+    db: { schema: 'public' },
     global: {
         headers: { 'x-my-custom-header': 'wancora-backend' },
     },
+    // Aumenta timeouts internos
+    options: {
+        timeout: 60000 
+    }
 });
 
 const leadLock = new Set(); 
 
-// --- UTILS: RETRY WRAPPER ---
-// Tenta executar uma operação de banco até 3 vezes antes de falhar
-const safeSupabaseCall = async (operation, retries = 3, delay = 500) => {
+// WRAPPER DE RETRY (Com backoff maior)
+const safeSupabaseCall = async (operation, retries = 3) => {
     for (let i = 0; i < retries; i++) {
         try {
             return await operation();
         } catch (error) {
-            const isNetworkError = error.message && (
-                error.message.includes('fetch failed') || 
-                error.message.includes('socket hang up') ||
-                error.message.includes('ETIMEDOUT')
-            );
-
-            if (isNetworkError && i < retries - 1) {
-                // Wait (Exponential Backoff: 500ms, 1000ms, 2000ms)
-                await new Promise(res => setTimeout(res, delay * Math.pow(2, i)));
+            const msg = error.message || '';
+            // Erros recuperáveis de rede
+            if (msg.includes('fetch failed') || msg.includes('socket') || msg.includes('timeout') || msg.includes('503') || msg.includes('502')) {
+                if (i === retries - 1) throw error; // Desiste na última
+                // Espera: 1s, 2s, 4s
+                await new Promise(res => setTimeout(res, 1000 * Math.pow(2, i)));
                 continue;
             }
-            throw error;
+            throw error; // Erros de lógica (ex: coluna não existe) lança direto
         }
     }
 };
-
-// --- HELPERS ---
 
 export const normalizeJid = (jid) => {
     if (!jid) return null;
@@ -55,8 +50,6 @@ const isGenericName = (name, phone) => {
     return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName);
 };
 
-// --- CORE SYNC FUNCTIONS ---
-
 export const updateInstanceStatus = async (sessionId, companyId, data) => {
     try {
         await safeSupabaseCall(() => supabase.from('instances')
@@ -65,18 +58,23 @@ export const updateInstanceStatus = async (sessionId, companyId, data) => {
             .eq('company_id', companyId)
         );
     } catch (e) {
-        console.error(`❌ [SYNC] Erro updateInstanceStatus:`, e.message);
+        // Fail silent para não parar fluxo
     }
 };
 
+// Atualiza status e barra de progresso
 export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     try {
         await safeSupabaseCall(() => supabase.from('instances')
-            .update({ sync_status: status, sync_percent: percent, updated_at: new Date() })
+            .update({ 
+                sync_status: status, 
+                sync_percent: percent, 
+                updated_at: new Date() 
+            })
             .eq('session_id', sessionId)
         );
     } catch (e) {
-        console.error(`❌ [SYNC] Erro updateSyncStatus:`, e.message);
+        console.error(`❌ [SYNC] Falha ao atualizar status visual:`, e.message);
     }
 };
 
@@ -111,18 +109,13 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             updateData.profile_pic_updated_at = new Date(); 
         }
 
-        if (!isFromBook && !updateData.name) {
-            delete updateData.name;
-        }
-
-        // WRAPPER DE SEGURANÇA COM RETRY
+        // TENTA O UPSERT
         await safeSupabaseCall(async () => {
             const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
             if (error) throw error;
         });
 
         if (lid) {
-            // Non-blocking call
             supabase.rpc('link_identities', { 
                 p_lid: normalizeJid(lid), 
                 p_phone: cleanJid, 
@@ -130,33 +123,14 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             }).then(() => {});
         }
 
-        // Atualização de Lead (Opcional, fail silent)
-        if (!cleanJid.includes('@g.us') && !cleanJid.includes('@newsletter')) {
-            const bestNameAvailable = isFromBook ? incomingName : (verifiedName || incomingName);
-            if (bestNameAvailable && !isGenericName(bestNameAvailable, purePhone)) {
-                 // Lógica simplificada sem await para não travar o loop
-                 supabase.from('leads')
-                    .update({ name: bestNameAvailable })
-                    .eq('company_id', companyId)
-                    .eq('phone', purePhone)
-                    .is('name', null) // Só atualiza se for nulo ou genérico (via app logic, aqui simplificado)
-                    .then(() => {});
-            }
-        }
-
     } catch (e) {
-        // Silencia erro de fetch para não poluir log se falhar após retries
-        if (!e.message?.includes('fetch failed')) {
-            console.error(`❌ [SYNC] Erro upsertContact (${jid}):`, e.message);
-        }
+        // Erro silencioso após retries para não parar o loop do histórico
+        // console.error(`❌ [SYNC] Falha upsert contato ${jid}:`, e.message);
     }
 };
 
 export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
-    if (!jid) return null;
-    if (jid.includes('@g.us')) return null;
-    if (jid.includes('@newsletter')) return null;
-    if (jid.includes('status@broadcast')) return null;
+    if (!jid || jid.includes('@g.us') || jid.includes('@newsletter') || jid.includes('status@broadcast')) return null;
     
     const cleanJid = normalizeJid(jid);
     const cleanMyJid = normalizeJid(myJid);
@@ -165,6 +139,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
     if (purePhone.length < 8) return null;
     
+    // Mutex Local para evitar duplicata na mesma execução do processo
     const lockKey = `${companyId}:${purePhone}`;
     if (leadLock.has(lockKey)) return null;
     
@@ -177,7 +152,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
         if (existing) return existing.id;
 
-        // Busca dados de contato para enriquecer
+        // Se não existe, busca nome melhor
         const { data: contact } = await safeSupabaseCall(() => 
             supabase.from('contacts').select('name, push_name, verified_name').eq('jid', cleanJid).eq('company_id', companyId).maybeSingle()
         );
@@ -188,11 +163,11 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             else if (!isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name;
             else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
         }
-
         if (!finalName && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
         }
 
+        // Pega Funil Padrão
         const { data: stage } = await supabase.from('pipeline_stages')
             .select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
 
@@ -210,17 +185,15 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         return newLead?.id;
 
     } catch (e) {
-        console.error(`❌ [SYNC] Erro ensureLead:`, e.message);
         return null;
     } finally {
+        // Libera lock após 2s (tempo suficiente para o banco processar)
         setTimeout(() => leadLock.delete(lockKey), 2000);
     }
 };
 
 export const upsertMessage = async (msgData) => {
     try {
-        await new Promise(resolve => setTimeout(resolve, 150));
-        
         const cleanRemoteJid = normalizeJid(msgData.remote_jid);
         const finalData = { ...msgData, remote_jid: cleanRemoteJid };
 
