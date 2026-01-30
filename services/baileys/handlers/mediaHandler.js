@@ -13,8 +13,8 @@ const logger = pino({ level: 'silent' });
  */
 export const handleMediaUpload = async (msg, companyId) => {
     try {
-        // PATCH 403: Headers completos simulando navegador real
-        // O WhatsApp valida User-Agent e Referer rigorosamente agora
+        // PATCH 2025: Headers completos simulando navegador real (Chrome Windows)
+        // A estrutura 'options' deve ser passada corretamente para o axios interno do Baileys
         const downloadOptions = {
             options: {
                 headers: {
@@ -29,6 +29,7 @@ export const handleMediaUpload = async (msg, companyId) => {
             }
         };
 
+        // Baileys download
         const buffer = await downloadMediaMessage(
             msg,
             'buffer',
@@ -48,9 +49,10 @@ export const handleMediaUpload = async (msg, companyId) => {
         else if (messageType === 'documentMessage') mimeType = msg.message.documentMessage.mimetype || 'application/pdf';
         else if (messageType === 'stickerMessage') mimeType = 'image/webp';
 
-        // Correção de Extensão para Audio (WhatsApp manda ogg, navegador prefere mp4/mp3 container)
+        // Correção de Extensão para Audio
         let ext = mime.extension(mimeType) || 'bin';
-        if (mimeType === 'audio/mp4') ext = 'm4a';
+        if (mimeType === 'audio/mp4' || mimeType.includes('audio/mp4')) ext = 'm4a';
+        if (mimeType.includes('opus')) ext = 'ogg';
 
         const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
         const filePath = companyId ? `${companyId}/${fileName}` : fileName;
@@ -69,12 +71,12 @@ export const handleMediaUpload = async (msg, companyId) => {
         return data.publicUrl;
 
     } catch (e) {
-        // Silencia erros conhecidos para não poluir log
-        const msg = e.message || '';
-        if (msg.includes('403') || msg.includes('401')) {
-             console.warn(`[MEDIA] Falha Download (${msg}) - Tentando novamente na próxima.`);
+        // Silencia erros conhecidos
+        const msgStr = e.message || '';
+        if (msgStr.includes('403') || msgStr.includes('401') || msgStr.includes('network')) {
+             console.warn(`[MEDIA] Falha Download (${msgStr}) - Tentando novamente na próxima.`);
         } else {
-             console.error("[MEDIA] Falha Genérica:", msg);
+             console.error("[MEDIA] Falha Genérica:", msgStr);
         }
         return null;
     }
