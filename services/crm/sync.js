@@ -40,11 +40,20 @@ export const normalizeJid = (jid) => {
     return jid.includes('@') ? jid : `${jid}@s.whatsapp.net`;
 };
 
+// Validador Estrito de Nomes
+// Retorna TRUE se o nome for inválido (nulo, vazio, apenas números ou igual ao telefone)
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
     if (cleanName.length < 1) return true;
+    
+    // Se o nome for apenas números ou caracteres especiais
+    if (/^[\d\s\+\-\(\)]*$/.test(cleanName)) return true;
+
+    // Se o nome for igual ao telefone (mesmo com formatação diferente)
     if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true;
+    
+    // Deve conter pelo menos uma letra para ser considerado um nome real
     return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName);
 };
 
@@ -137,7 +146,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     // Auto-exclusão (Não cria lead para mim mesmo)
     if (myJid) {
         const cleanMyJid = normalizeJid(myJid);
-        // Compara apenas os números para evitar divergência de sufixo/server
         const myNum = cleanMyJid?.split('@')[0];
         const targetNum = cleanJid?.split('@')[0];
         if (myNum && targetNum && myNum === targetNum) return null;
@@ -152,8 +160,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     try {
         leadLock.add(lockKey);
 
-        // 2. VERIFICAÇÃO DE "REMOVIDO DO CRM" (is_ignored)
-        // Se o contato existe e está ignorado, aborta imediatamente.
+        // 2. BUSCA DADOS ATUAIS (Contacts)
         const { data: contact } = await safeSupabaseCall(() => 
             supabase.from('contacts')
                 .select('is_ignored, name, push_name, verified_name')
@@ -163,36 +170,46 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         );
 
         if (contact?.is_ignored) {
-            // console.log(`🚫 [SYNC] Contato ${purePhone} ignorado. Lead não criado.`);
             return null;
         }
 
-        // 3. VERIFICAÇÃO DE LEAD EXISTENTE
-        const { data: existing } = await safeSupabaseCall(() => 
-            supabase.from('leads').select('id').eq('phone', purePhone).eq('company_id', companyId).maybeSingle()
-        );
-
-        if (existing) return existing.id;
-
-        // 4. PREPARAÇÃO DO NOME (Hierarquia)
+        // 3. DETERMINAÇÃO DO NOME (REAL NAME ONLY)
         let finalName = null;
+
+        // Tenta pegar o melhor nome disponível, validando se não é genérico
         if (contact) {
-            if (!isGenericName(contact.name, purePhone)) finalName = contact.name;
-            else if (!isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name;
-            else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
+            if (!isGenericName(contact.name, purePhone)) finalName = contact.name; // Agenda (Prioridade Max)
+            else if (!isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name; // Business
+            else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name; // Perfil anterior
         }
         
-        // Fallback para pushName vindo do evento, se o do banco for ruim
+        // Se ainda não temos nome bom, tenta o pushName que veio no evento da mensagem
         if (!finalName && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
         }
 
-        // Se ainda não tiver nome, usa o número formatado como último recurso
-        if (!finalName) {
-            finalName = `+${purePhone}`;
+        // IMPORTANTE: Se finalName continuar null, ELE VAI COMO NULL PARA O BANCO.
+        // O Frontend cuidará da exibição (fallback para telefone formatado).
+
+        // 4. VERIFICAÇÃO E ATUALIZAÇÃO (AUTO-HEALING)
+        const { data: existing } = await safeSupabaseCall(() => 
+            supabase.from('leads').select('id, name').eq('phone', purePhone).eq('company_id', companyId).maybeSingle()
+        );
+
+        if (existing) {
+            // LÓGICA DE CURA: Se o lead existe mas tem nome genérico (ou nulo), e agora descobrimos um nome válido:
+            const currentNameIsBad = isGenericName(existing.name, purePhone);
+            const newNameIsGood = finalName && !isGenericName(finalName, purePhone);
+
+            if (currentNameIsBad && newNameIsGood) {
+                console.log(`✨ [CRM] Auto-Healing nome do Lead ${purePhone}: "${existing.name || 'NULL'}" -> "${finalName}"`);
+                await supabase.from('leads').update({ name: finalName }).eq('id', existing.id);
+            }
+            return existing.id;
         }
 
-        // 5. CRIAÇÃO DO LEAD
+        // 5. CRIAÇÃO DO LEAD (Somente se não existir)
+        // Se não existir nome, cria como NULL. O funil default é buscado.
         const { data: stage } = await supabase.from('pipeline_stages')
             .select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
 
@@ -200,7 +217,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             supabase.from('leads').insert({
                 company_id: companyId,
                 phone: purePhone,
-                name: finalName,
+                name: finalName, // Será NULL se não achou nome real
                 status: 'new',
                 pipeline_stage_id: stage?.id,
                 position: Date.now()
