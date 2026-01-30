@@ -44,7 +44,7 @@ const subscribeToRecentChats = async (sock, companyId) => {
             for (const contact of recent) {
                 if (contact.jid.includes('@s.whatsapp.net')) {
                     await sock.presenceSubscribe(contact.jid);
-                    // Delay minúsculo para não floodar o socket
+                    // Delay minúsculo para não floodar o socket e evitar desconexão
                     await new Promise(r => setTimeout(r, 100));
                 }
             }
@@ -169,6 +169,7 @@ export const startSession = async (sessionId, companyId) => {
                 });
 
                 // ATIVAÇÃO DE PRESENÇA (FIX Visto Por Último)
+                // Espera 5s para garantir que a conexão está estável antes de floodar com subscribes
                 setTimeout(() => subscribeToRecentChats(sock, companyId), 5000);
             }
 
