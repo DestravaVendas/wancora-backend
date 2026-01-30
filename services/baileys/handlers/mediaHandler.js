@@ -9,16 +9,16 @@ const logger = pino({ level: 'silent' });
 
 export const handleMediaUpload = async (msg, companyId) => {
     try {
-        // PATCH: User-Agent Genérico e Moderno
-        // Removemos referências excessivas para evitar fingerprinting agressivo
+        // PATCH: User-Agent Genérico e Moderno para evitar bloqueio 403 do WhatsApp
         const downloadOptions = {
             options: {
                 headers: {
-                    'User-Agent': 'WhatsApp/2.2413.51 A', // Simula User-Agent nativo
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                     'Referer': 'https://web.whatsapp.com/',
                     'Origin': 'https://web.whatsapp.com/'
                 },
-                timeout: 30000 // Timeout mais curto para falhar rápido e não travar fila
+                // Timeout curto (15s) para falhar rápido e não travar o loop de histórico se a mídia estiver pesada/lenta
+                timeout: 15000 
             }
         };
 
@@ -31,11 +31,10 @@ export const handleMediaUpload = async (msg, companyId) => {
 
         if (!buffer) return null;
 
-        // --- LÓGICA DE EXTENSÃO (Mantida e Robusta) ---
+        // --- Determinação de Tipo ---
         let mimeType = 'application/octet-stream';
         const messageType = Object.keys(msg.message)[0];
 
-        // Mapeamento seguro
         if (messageType === 'imageMessage') mimeType = msg.message.imageMessage?.mimetype || 'image/jpeg';
         else if (messageType === 'audioMessage') mimeType = msg.message.audioMessage?.mimetype || 'audio/mp4';
         else if (messageType === 'videoMessage') mimeType = msg.message.videoMessage?.mimetype || 'video/mp4';
@@ -49,13 +48,13 @@ export const handleMediaUpload = async (msg, companyId) => {
         const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
         const filePath = companyId ? `${companyId}/${fileName}` : fileName;
 
-        // Upload
+        // Upload Supabase (Sem travar se der erro de duplicata)
         const { error } = await supabase.storage
             .from('chat-media')
             .upload(filePath, buffer, { contentType: mimeType, upsert: false });
 
         if (error) {
-            // Se der erro de "Duplicate", ignoramos (idempotência)
+             // Ignora erro se arquivo já existe (idempotência)
             if (!error.message.includes('Duplicate')) {
                  console.error("[MEDIA] Erro Upload Supabase:", error.message);
             }
@@ -66,13 +65,13 @@ export const handleMediaUpload = async (msg, companyId) => {
         return data.publicUrl;
 
     } catch (e) {
-        // Tratamento silencioso de erros conhecidos
+        // Silencia erros 403/404/410 (Mídia expirada ou bloqueada)
+        // Isso impede que o terminal fique cheio de logs inúteis e o sync prossiga
         const m = e.message || '';
-        // 403/401/404/410 são erros de mídia expirada ou bloqueio. Não adianta tentar de novo imediatamente.
-        if (m.includes('403') || m.includes('401') || m.includes('404') || m.includes('410')) {
-             return null; // Mídia perdida/expirada
+        if (m.includes('403') || m.includes('401') || m.includes('404') || m.includes('410') || m.includes('timeout')) {
+             return null; 
         }
-        console.warn(`[MEDIA] Falha download (${m})`);
+        console.warn(`[MEDIA] Falha download genérica: ${m}`);
         return null;
     }
 };
