@@ -23,14 +23,12 @@ const safeSupabaseCall = async (operation, retries = 3) => {
             return await operation();
         } catch (error) {
             const msg = error.message || '';
-            // Erros recuperáveis de rede
             if (msg.includes('fetch failed') || msg.includes('socket') || msg.includes('timeout') || msg.includes('503') || msg.includes('502')) {
-                if (i === retries - 1) throw error; // Desiste na última
-                // Espera: 1s, 2s, 4s
+                if (i === retries - 1) throw error; 
                 await new Promise(res => setTimeout(res, 1000 * Math.pow(2, i)));
                 continue;
             }
-            throw error; // Erros de lógica (ex: coluna não existe) lança direto
+            throw error;
         }
     }
 };
@@ -62,7 +60,6 @@ export const updateInstanceStatus = async (sessionId, companyId, data) => {
     }
 };
 
-// Atualiza status e barra de progresso
 export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     try {
         await safeSupabaseCall(() => supabase.from('instances')
@@ -109,7 +106,6 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             updateData.profile_pic_updated_at = new Date(); 
         }
 
-        // TENTA O UPSERT
         await safeSupabaseCall(async () => {
             const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
             if (error) throw error;
@@ -124,49 +120,79 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         }
 
     } catch (e) {
-        // Erro silencioso após retries para não parar o loop do histórico
+        // Erro silencioso
     }
 };
 
+// --- GUARDIÃO DE LEADS (The Gatekeeper) ---
 export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
-    if (!jid || jid.includes('@g.us') || jid.includes('@newsletter') || jid.includes('status@broadcast')) return null;
+    // 1. REGRAS DE EXCLUSÃO (Hard Rules)
+    if (!jid) return null;
+    if (jid.includes('@g.us')) return null; // Grupos não viram Leads
+    if (jid.includes('@newsletter')) return null; // Canais não viram Leads
+    if (jid.includes('status@broadcast')) return null; // Status não vira Lead
     
     const cleanJid = normalizeJid(jid);
-    const cleanMyJid = normalizeJid(myJid);
-    if (cleanMyJid && cleanJid === cleanMyJid) return null;
+    
+    // Auto-exclusão (Não cria lead para mim mesmo)
+    if (myJid) {
+        const cleanMyJid = normalizeJid(myJid);
+        // Compara apenas os números para evitar divergência de sufixo/server
+        const myNum = cleanMyJid?.split('@')[0];
+        const targetNum = cleanJid?.split('@')[0];
+        if (myNum && targetNum && myNum === targetNum) return null;
+    }
 
     const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
     if (purePhone.length < 8) return null;
     
-    // Mutex Local para evitar duplicata na mesma execução do processo
     const lockKey = `${companyId}:${purePhone}`;
     if (leadLock.has(lockKey)) return null;
     
     try {
         leadLock.add(lockKey);
 
+        // 2. VERIFICAÇÃO DE "REMOVIDO DO CRM" (is_ignored)
+        // Se o contato existe e está ignorado, aborta imediatamente.
+        const { data: contact } = await safeSupabaseCall(() => 
+            supabase.from('contacts')
+                .select('is_ignored, name, push_name, verified_name')
+                .eq('jid', cleanJid)
+                .eq('company_id', companyId)
+                .maybeSingle()
+        );
+
+        if (contact?.is_ignored) {
+            // console.log(`🚫 [SYNC] Contato ${purePhone} ignorado. Lead não criado.`);
+            return null;
+        }
+
+        // 3. VERIFICAÇÃO DE LEAD EXISTENTE
         const { data: existing } = await safeSupabaseCall(() => 
             supabase.from('leads').select('id').eq('phone', purePhone).eq('company_id', companyId).maybeSingle()
         );
 
         if (existing) return existing.id;
 
-        // Se não existe, busca nome melhor
-        const { data: contact } = await safeSupabaseCall(() => 
-            supabase.from('contacts').select('name, push_name, verified_name').eq('jid', cleanJid).eq('company_id', companyId).maybeSingle()
-        );
-
+        // 4. PREPARAÇÃO DO NOME (Hierarquia)
         let finalName = null;
         if (contact) {
             if (!isGenericName(contact.name, purePhone)) finalName = contact.name;
             else if (!isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name;
             else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
         }
+        
+        // Fallback para pushName vindo do evento, se o do banco for ruim
         if (!finalName && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
         }
 
-        // Pega Funil Padrão
+        // Se ainda não tiver nome, usa o número formatado como último recurso
+        if (!finalName) {
+            finalName = `+${purePhone}`;
+        }
+
+        // 5. CRIAÇÃO DO LEAD
         const { data: stage } = await supabase.from('pipeline_stages')
             .select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
 
@@ -186,7 +212,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     } catch (e) {
         return null;
     } finally {
-        // Libera lock após 2s (tempo suficiente para o banco processar)
         setTimeout(() => leadLock.delete(lockKey), 2000);
     }
 };
