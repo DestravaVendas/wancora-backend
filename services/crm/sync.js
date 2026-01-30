@@ -140,8 +140,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     // 1. REGRAS DE EXCLUSÃO (Hard Rules)
     if (!jid) return null;
     
-    // Tratamento de LID (Se for @lid, rejeita criação direta e tenta resolver para Phone)
-    // O messageHandler deve resolver o LID antes de chamar aqui, mas por segurança...
+    // Tratamento de LID
     if (jid.includes('@lid')) return null;
 
     if (jid.includes('@g.us')) return null; // Grupos não viram Leads
@@ -161,9 +160,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
     
     // VALIDACAO RÍGIDA DE TELEFONE (Anti-LID Leak)
-    // Números reais têm entre 8 e 15 dígitos. LIDs são maiores e não seguem padrão E.164.
     if (purePhone.length < 8 || purePhone.length > 15) {
-        // console.warn(`🚫 [LEAD GUARD] Ignorando número inválido/LID: ${purePhone}`);
         return null;
     }
     
@@ -189,14 +186,12 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         // 3. DETERMINAÇÃO DO NOME (REAL NAME ONLY)
         let finalName = null;
 
-        // Tenta pegar o melhor nome disponível, validando se não é genérico
         if (contact) {
-            if (!isGenericName(contact.name, purePhone)) finalName = contact.name; // Agenda (Prioridade Max)
+            if (!isGenericName(contact.name, purePhone)) finalName = contact.name; // Agenda
             else if (!isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name; // Business
-            else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name; // Perfil anterior
+            else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name; // Perfil
         }
         
-        // Se ainda não temos nome bom, tenta o pushName que veio no evento da mensagem
         if (!finalName && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
         }
@@ -207,8 +202,8 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         );
 
         if (existing) {
-            // LÓGICA DE CURA: Se o lead existe mas tem nome genérico (ou nulo), e agora descobrimos um nome válido:
-            const currentNameIsBad = isGenericName(existing.name, purePhone);
+            // LÓGICA DE CURA: Se achamos um nome melhor agora, atualizamos o NULL ou genérico antigo
+            const currentNameIsBad = !existing.name || isGenericName(existing.name, purePhone);
             const newNameIsGood = finalName && !isGenericName(finalName, purePhone);
 
             if (currentNameIsBad && newNameIsGood) {
@@ -218,15 +213,20 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             return existing.id;
         }
 
-        // 5. CRIAÇÃO DO LEAD (Somente se não existir)
+        // 5. CRIAÇÃO DO LEAD (PERMISSIVA: ACEITA NULL)
         const { data: stage } = await supabase.from('pipeline_stages')
             .select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
+
+        // Se finalName for inválido (apenas números), forçamos NULL para que o Frontend formate
+        if (finalName && isGenericName(finalName, purePhone)) {
+            finalName = null;
+        }
 
         const { data: newLead } = await safeSupabaseCall(() => 
             supabase.from('leads').insert({
                 company_id: companyId,
                 phone: purePhone,
-                name: finalName, // Será NULL se não achou nome real
+                name: finalName, // Pode ser NULL, o frontend tratará
                 status: 'new',
                 pipeline_stage_id: stage?.id,
                 position: Date.now()
@@ -236,7 +236,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         return newLead?.id;
 
     } catch (e) {
-        // Se erro for de unique constraint, significa que outro processo criou, então ignoramos
         return null;
     } finally {
         setTimeout(() => leadLock.delete(lockKey), 2000);
