@@ -27,6 +27,33 @@ const retries = new Map();
 // 🔥 SILENCER PATCH: Define nível 'fatal' para ignorar logs de info/debug/warn do Baileys
 const logger = pino({ level: 'fatal' });
 
+// Helper para forçar atualização de presença dos chats recentes
+const subscribeToRecentChats = async (sock, companyId) => {
+    try {
+        // Busca os 20 chats mais recentes para se inscrever na presença
+        const { data: recent } = await supabase
+            .from('contacts')
+            .select('jid')
+            .eq('company_id', companyId)
+            .eq('is_ignored', false)
+            .order('last_message_at', { ascending: false })
+            .limit(20);
+
+        if (recent && recent.length > 0) {
+            console.log(`👀 [PRESENCE] Inscrevendo em ${recent.length} chats recentes...`);
+            for (const contact of recent) {
+                if (contact.jid.includes('@s.whatsapp.net')) {
+                    await sock.presenceSubscribe(contact.jid);
+                    // Delay minúsculo para não floodar o socket
+                    await new Promise(r => setTimeout(r, 100));
+                }
+            }
+        }
+    } catch (e) {
+        console.warn(`⚠️ [PRESENCE] Falha ao inscrever:`, e.message);
+    }
+};
+
 export const startSession = async (sessionId, companyId) => {
     try {
         // 1. Recupera estado de autenticação do Banco
@@ -140,6 +167,9 @@ export const startSession = async (sessionId, companyId) => {
                     sync_percent: 5,
                     profile_pic_url: sock.user?.imgUrl || null
                 });
+
+                // ATIVAÇÃO DE PRESENÇA (FIX Visto Por Último)
+                setTimeout(() => subscribeToRecentChats(sock, companyId), 5000);
             }
 
             // C) DESCONEXÃO
