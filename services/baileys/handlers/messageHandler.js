@@ -21,12 +21,29 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         if (msg.key.remoteJid === 'status@broadcast') return;
 
         const unwrapped = unwrapMessage(msg);
-        const jid = normalizeJid(unwrapped.key.remoteJid);
+        let jid = normalizeJid(unwrapped.key.remoteJid);
         const fromMe = unwrapped.key.fromMe;
         const pushName = forcedName || unwrapped.pushName;
         
         const type = getContentType(unwrapped.message);
         const body = getBody(unwrapped.message);
+
+        // LID RESOLVER: Se a mensagem veio de um LID, tenta descobrir o número real
+        if (jid.includes('@lid')) {
+            const { data: mapping } = await supabase
+                .from('identity_map')
+                .select('phone_jid')
+                .eq('lid_jid', jid)
+                .eq('company_id', companyId)
+                .maybeSingle();
+            
+            if (mapping?.phone_jid) {
+                jid = mapping.phone_jid; // Usa o JID de telefone para tudo a partir de agora
+            } else {
+                // Se não achou mapeamento, tenta extrair se possível ou ignora criação de lead
+                // console.warn("LID sem mapeamento:", jid);
+            }
+        }
 
         // 2. Verificação de Bloqueio (Anti-Ghost)
         if (!fromMe) {
@@ -47,6 +64,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             // Só cria lead se for Realtime (msg nova)
             if (isRealtime) {
                 // Cria Lead se não existir (filtra grupos/canais internamente)
+                // Se o JID ainda for @lid aqui, ensureLeadExists vai rejeitar, evitando duplicação
                 leadId = await ensureLeadExists(jid, companyId, pushName, myJid);
                 
                 // TRIGGER DE DADOS FALTANTES:
@@ -67,7 +85,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const messageData = {
             company_id: companyId,
             session_id: sessionId,
-            remote_jid: jid,
+            remote_jid: jid, // Agora usa o JID normalizado (Phone JID se resolvido)
             whatsapp_id: unwrapped.key.id,
             from_me: fromMe,
             content: body,
