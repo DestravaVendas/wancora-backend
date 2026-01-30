@@ -37,7 +37,9 @@ export const normalizeJid = (jid) => {
     if (!jid) return null;
     if (jid.includes('@g.us')) return jid;
     if (jid.includes('@newsletter')) return jid;
-    return jid.includes('@') ? jid : `${jid}@s.whatsapp.net`;
+    // CORREÇÃO: Remove sufixo de dispositivo (:2, :3) que pode causar duplicidade
+    const clean = jid.split(':')[0];
+    return clean.includes('@') ? clean : `${clean}@s.whatsapp.net`;
 };
 
 // Validador Estrito de Nomes
@@ -137,6 +139,11 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     // 1. REGRAS DE EXCLUSÃO (Hard Rules)
     if (!jid) return null;
+    
+    // Tratamento de LID (Se for @lid, rejeita criação direta e tenta resolver para Phone)
+    // O messageHandler deve resolver o LID antes de chamar aqui, mas por segurança...
+    if (jid.includes('@lid')) return null;
+
     if (jid.includes('@g.us')) return null; // Grupos não viram Leads
     if (jid.includes('@newsletter')) return null; // Canais não viram Leads
     if (jid.includes('status@broadcast')) return null; // Status não vira Lead
@@ -152,7 +159,13 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     }
 
     const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
-    if (purePhone.length < 8) return null;
+    
+    // VALIDACAO RÍGIDA DE TELEFONE (Anti-LID Leak)
+    // Números reais têm entre 8 e 15 dígitos. LIDs são maiores e não seguem padrão E.164.
+    if (purePhone.length < 8 || purePhone.length > 15) {
+        // console.warn(`🚫 [LEAD GUARD] Ignorando número inválido/LID: ${purePhone}`);
+        return null;
+    }
     
     const lockKey = `${companyId}:${purePhone}`;
     if (leadLock.has(lockKey)) return null;
@@ -188,9 +201,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             finalName = pushName;
         }
 
-        // IMPORTANTE: Se finalName continuar null, ELE VAI COMO NULL PARA O BANCO.
-        // O Frontend cuidará da exibição (fallback para telefone formatado).
-
         // 4. VERIFICAÇÃO E ATUALIZAÇÃO (AUTO-HEALING)
         const { data: existing } = await safeSupabaseCall(() => 
             supabase.from('leads').select('id, name').eq('phone', purePhone).eq('company_id', companyId).maybeSingle()
@@ -209,7 +219,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         }
 
         // 5. CRIAÇÃO DO LEAD (Somente se não existir)
-        // Se não existir nome, cria como NULL. O funil default é buscado.
         const { data: stage } = await supabase.from('pipeline_stages')
             .select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
 
@@ -227,6 +236,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         return newLead?.id;
 
     } catch (e) {
+        // Se erro for de unique constraint, significa que outro processo criou, então ignoramos
         return null;
     } finally {
         setTimeout(() => leadLock.delete(lockKey), 2000);
