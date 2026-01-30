@@ -125,7 +125,6 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
     } catch (e) {
         // Erro silencioso após retries para não parar o loop do histórico
-        // console.error(`❌ [SYNC] Falha upsert contato ${jid}:`, e.message);
     }
 };
 
