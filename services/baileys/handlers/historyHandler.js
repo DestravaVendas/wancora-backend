@@ -1,5 +1,5 @@
 
-import { upsertContact, updateSyncStatus } from '../../crm/sync.js'; // REMOVIDO ensureLeadExists
+import { upsertContact, updateSyncStatus } from '../../crm/sync.js'; 
 import { handleMessage } from './messageHandler.js';
 import { unwrapMessage, normalizeJid } from '../../../utils/wppParsers.js';
 import { createClient } from '@supabase/supabase-js';
@@ -74,10 +74,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                     // Upsert seguro com a URL correta
                     await upsertContact(jid, companyId, bestName, finalImgUrl, !!c.name, c.lid);
-                    
-                    // CORREÇÃO CRÍTICA: NÃO chamamos ensureLeadExists aqui.
-                    // Contatos da agenda NÃO devem virar leads automaticamente no sync.
-                    // Leads só serão criados se houver mensagens novas (Realtime).
                 }));
                 
                 await sleep(50); // Respira
@@ -123,9 +119,12 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     try {
                         const options = { 
                             downloadMedia: true, 
-                            fetchProfilePic: false // Já buscamos no passo 1
+                            fetchProfilePic: false,
+                            // FORCE LEAD CREATION: Isso garante que o que aparece no chat vira lead
+                            // O ensureLeadExists vai filtrar grupos/canais e permitir NULLs no nome
+                            createLead: true 
                         };
-                        // isRealtime = false impede criação de lead aqui também
+                        
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {
                         // Ignora erro individual
