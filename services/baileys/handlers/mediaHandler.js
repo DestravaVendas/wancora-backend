@@ -9,7 +9,7 @@ const logger = pino({ level: 'silent' });
 
 export const handleMediaUpload = async (msg, companyId) => {
     try {
-        // PATCH: User-Agent Genérico e Moderno para evitar bloqueio 403 do WhatsApp
+        // PATCH: User-Agent Genérico e Moderno para evitar bloqueio 403
         const downloadOptions = {
             options: {
                 headers: {
@@ -17,7 +17,6 @@ export const handleMediaUpload = async (msg, companyId) => {
                     'Referer': 'https://web.whatsapp.com/',
                     'Origin': 'https://web.whatsapp.com/'
                 },
-                // Timeout curto (15s) para falhar rápido e não travar o loop de histórico se a mídia estiver pesada/lenta
                 timeout: 15000 
             }
         };
@@ -31,7 +30,7 @@ export const handleMediaUpload = async (msg, companyId) => {
 
         if (!buffer) return null;
 
-        // --- Determinação de Tipo ---
+        // --- Tipo ---
         let mimeType = 'application/octet-stream';
         const messageType = Object.keys(msg.message)[0];
 
@@ -48,13 +47,12 @@ export const handleMediaUpload = async (msg, companyId) => {
         const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
         const filePath = companyId ? `${companyId}/${fileName}` : fileName;
 
-        // Upload Supabase (Sem travar se der erro de duplicata)
+        // Upload
         const { error } = await supabase.storage
             .from('chat-media')
             .upload(filePath, buffer, { contentType: mimeType, upsert: false });
 
         if (error) {
-             // Ignora erro se arquivo já existe (idempotência)
             if (!error.message.includes('Duplicate')) {
                  console.error("[MEDIA] Erro Upload Supabase:", error.message);
             }
@@ -65,9 +63,8 @@ export const handleMediaUpload = async (msg, companyId) => {
         return data.publicUrl;
 
     } catch (e) {
-        // Silencia erros 403/404/410 (Mídia expirada ou bloqueada)
-        // Isso impede que o terminal fique cheio de logs inúteis e o sync prossiga
         const m = e.message || '';
+        // Silencia erros esperados de mídia antiga/expirada
         if (m.includes('403') || m.includes('401') || m.includes('404') || m.includes('410') || m.includes('timeout')) {
              return null; 
         }
