@@ -171,6 +171,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         leadLock.add(lockKey);
 
         // 2. BUSCA DADOS ATUAIS (Contacts)
+        // Precisamos verificar se foi ignorado explicitamente pelo usuário
         const { data: contact } = await safeSupabaseCall(() => 
             supabase.from('contacts')
                 .select('is_ignored, name, push_name, verified_name')
@@ -180,10 +181,10 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         );
 
         if (contact?.is_ignored) {
-            return null;
+            return null; // Respeita a decisão do usuário de ignorar
         }
 
-        // 3. DETERMINAÇÃO DO NOME (REAL NAME ONLY)
+        // 3. DETERMINAÇÃO DO NOME
         let finalName = null;
 
         if (contact) {
@@ -202,31 +203,33 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         );
 
         if (existing) {
-            // LÓGICA DE CURA: Se achamos um nome melhor agora, atualizamos o NULL ou genérico antigo
+            // Se já existe e temos um nome MELHOR, atualizamos o NULL
+            // Se existing.name for null, !existing.name é true, então atualizamos.
             const currentNameIsBad = !existing.name || isGenericName(existing.name, purePhone);
             const newNameIsGood = finalName && !isGenericName(finalName, purePhone);
 
             if (currentNameIsBad && newNameIsGood) {
-                console.log(`✨ [CRM] Auto-Healing nome do Lead ${purePhone}: "${existing.name || 'NULL'}" -> "${finalName}"`);
+                console.log(`✨ [CRM] Melhorando nome do Lead ${purePhone}: "${existing.name || 'NULL'}" -> "${finalName}"`);
                 await supabase.from('leads').update({ name: finalName }).eq('id', existing.id);
             }
             return existing.id;
         }
 
         // 5. CRIAÇÃO DO LEAD (PERMISSIVA: ACEITA NULL)
-        const { data: stage } = await supabase.from('pipeline_stages')
-            .select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
-
-        // Se finalName for inválido (apenas números), forçamos NULL para que o Frontend formate
+        // Se o nome for genérico/inválido, forçamos NULL explicitamente.
         if (finalName && isGenericName(finalName, purePhone)) {
             finalName = null;
         }
 
+        const { data: stage } = await supabase.from('pipeline_stages')
+            .select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
+
+        // INSERÇÃO: Enviamos NULL se não tiver nome. O SQL deve permitir (ALTER TABLE leads ALTER COLUMN name DROP NOT NULL).
         const { data: newLead } = await safeSupabaseCall(() => 
             supabase.from('leads').insert({
                 company_id: companyId,
                 phone: purePhone,
-                name: finalName, // Pode ser NULL, o frontend tratará
+                name: finalName, 
                 status: 'new',
                 pipeline_stage_id: stage?.id,
                 position: Date.now()
@@ -236,6 +239,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         return newLead?.id;
 
     } catch (e) {
+        console.error("Erro ao criar lead:", e.message);
         return null;
     } finally {
         setTimeout(() => leadLock.delete(lockKey), 2000);
