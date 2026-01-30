@@ -14,7 +14,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime = true, forcedName = null, options = {}) => {
     try {
-        const { downloadMedia = true, fetchProfilePic = false } = options;
+        const { downloadMedia = true, fetchProfilePic = false, createLead = false } = options;
 
         // 1. Normalização e Unwrap
         if (!msg.message) return;
@@ -28,7 +28,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const type = getContentType(unwrapped.message);
         const body = getBody(unwrapped.message);
 
-        // LID RESOLVER: Se a mensagem veio de um LID, tenta descobrir o número real
+        // LID RESOLVER
         if (jid.includes('@lid')) {
             const { data: mapping } = await supabase
                 .from('identity_map')
@@ -38,10 +38,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
                 .maybeSingle();
             
             if (mapping?.phone_jid) {
-                jid = mapping.phone_jid; // Usa o JID de telefone para tudo a partir de agora
-            } else {
-                // Se não achou mapeamento, tenta extrair se possível ou ignora criação de lead
-                // console.warn("LID sem mapeamento:", jid);
+                jid = mapping.phone_jid; 
             }
         }
 
@@ -57,19 +54,21 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             if (contact?.is_ignored) return;
         }
 
-        // 3. Garantia de Lead e DADOS FALTANTES (Regra: Buscar o que falta)
+        // 3. Garantia de Lead e DADOS FALTANTES
         let leadId = null;
         if (!fromMe) {
             const myJid = normalizeJid(sock.user?.id);
-            // Só cria lead se for Realtime (msg nova)
-            if (isRealtime) {
-                // Cria Lead se não existir (filtra grupos/canais internamente)
-                // Se o JID ainda for @lid aqui, ensureLeadExists vai rejeitar, evitando duplicação
+            
+            // CRITÉRIO DE CRIAÇÃO: Realtime OU Flag de Histórico explícita
+            // Se createLead for true, ensureLeadExists será chamado.
+            // ensureLeadExists agora aceita nome NULL, garantindo a criação.
+            if (isRealtime || createLead) {
                 leadId = await ensureLeadExists(jid, companyId, pushName, myJid);
                 
-                // TRIGGER DE DADOS FALTANTES:
-                // Sempre que chega mensagem, tentamos enriquecer o contato (Business/Foto)
-                refreshContactInfo(sock, jid, companyId, pushName).catch(err => console.error("Refresh Error", err));
+                // Refresh de dados (Foto/Business) apenas em realtime para performance
+                if (isRealtime) {
+                    refreshContactInfo(sock, jid, companyId, pushName).catch(err => console.error("Refresh Error", err));
+                }
             }
         }
 
@@ -85,7 +84,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const messageData = {
             company_id: companyId,
             session_id: sessionId,
-            remote_jid: jid, // Agora usa o JID normalizado (Phone JID se resolvido)
+            remote_jid: jid, 
             whatsapp_id: unwrapped.key.id,
             from_me: fromMe,
             content: body,
@@ -96,7 +95,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             lead_id: leadId
         };
 
-        // Parsers Especiais (Poll, Loc, Contact)
+        // Parsers Especiais
         if (type === 'pollCreationMessage' || type === 'pollCreationMessageV3') {
             const poll = unwrapped.message[type];
             messageData.message_type = 'poll';
@@ -126,7 +125,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         // 6. Persistência
         await upsertMessage(messageData);
 
-        // 7. Webhook
+        // 7. Webhook (APENAS REALTIME)
         if (isRealtime) {
             const { data: instance } = await supabase
                 .from('instances')
