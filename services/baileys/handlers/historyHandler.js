@@ -1,4 +1,3 @@
-
 import { upsertContact, ensureLeadExists, updateSyncStatus } from '../../crm/sync.js';
 import { handleMessage } from './messageHandler.js';
 import { unwrapMessage, normalizeJid } from '../../../utils/wppParsers.js';
@@ -53,24 +52,34 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     if (!jid) return;
                     
                     const bestName = c.name || c.verifiedName || c.notify;
+                    
+                    // --- SMART FETCH DE FOTO (FIX) ---
+                    let finalImgUrl = c.imgUrl || null;
+
+                    if (!finalImgUrl) {
+                        try {
+                            finalImgUrl = await sock.profilePictureUrl(jid, 'image');
+                        } catch (e) {
+                            finalImgUrl = null;
+                        }
+                    }
+
                     contactsMap.set(jid, { 
                         name: bestName, 
-                        imgUrl: c.imgUrl, 
+                        imgUrl: finalImgUrl, 
                         isFromBook: !!c.name,
                         lid: c.lid || null 
                     });
 
-                    // Upsert seguro
-                    await upsertContact(jid, companyId, bestName, c.imgUrl, !!c.name, c.lid);
+                    // Upsert seguro com a URL correta
+                    await upsertContact(jid, companyId, bestName, finalImgUrl, !!c.name, c.lid);
                     
-                    // Se tiver nome, já garante o Lead
-                    if (!jid.includes('@g.us') && !jid.includes('@newsletter') && bestName) {
-                        await ensureLeadExists(jid, companyId, bestName, sock.user?.id);
-                    }
+                    // CRÍTICO: Tenta criar Lead para TODOS (ensureLeadExists filtra grupos/ignores internamente)
+                    // Removemos a verificação `&& bestName` para garantir que números sem nome também virem leads
+                    await ensureLeadExists(jid, companyId, bestName, sock.user?.id);
                 }));
                 
-                // Respira para liberar o Event Loop e conexões do banco
-                await sleep(50); 
+                await sleep(50); // Respira
             }
         }
 
@@ -110,20 +119,18 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 topMessages.reverse(); 
                 
                 for (const msg of topMessages) {
-                    // Try/Catch por mensagem para que uma mídia falha não pare todo o histórico
                     try {
                         const options = { 
                             downloadMedia: true, 
                             fetchProfilePic: false // Já buscamos no passo 1
                         };
-                        // Passamos isRealtime=false para evitar disparar webhooks ou IAs durante o sync
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {
-                        // Ignora erro individual de mensagem
+                        // Ignora erro individual
                     }
                 }
                 
-                await sleep(20); // Micro-pausa entre chats
+                await sleep(20); 
             }
         }
 
