@@ -101,20 +101,17 @@ export const sendMessage = async ({
                 break;
 
             case 'audio':
-                // PTT LOGIC:
-                // Se ptt=true, forçamos o mimetype para OGG/Opus para garantir a onda sonora.
-                // O WhatsApp é chato com isso. Se mandar MP3 com ptt=true, as vezes falha.
+                // AUDIO FIX CRÍTICO:
+                // O WhatsApp falha ao reproduzir se enviarmos um MP4 (AAC) dizendo que é OGG (Opus).
+                // A correção é respeitar ESTRITAMENTE o mimetype que veio do frontend (recorder).
+                
                 const audioOptions = { 
                     audio: { url }, 
-                    ptt: !!ptt 
+                    ptt: !!ptt,
+                    // Se veio mimetype do front (ex: 'audio/mp4'), usa ele.
+                    // Se não veio, usa 'audio/mp4' como fallback seguro (maior compatibilidade que ogg).
+                    mimetype: mimetype || 'audio/mp4'
                 };
-
-                if (ptt) {
-                    // Força codec de voz para aparecer a onda verde
-                    audioOptions.mimetype = 'audio/ogg; codecs=opus';
-                } else if (mimetype) {
-                    audioOptions.mimetype = mimetype;
-                }
 
                 sentMsg = await sock.sendMessage(jid, audioOptions);
                 break;
