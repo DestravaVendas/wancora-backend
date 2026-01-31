@@ -29,29 +29,36 @@ export const sendMessage = async ({
     try {
         console.log(`🤖 [HUMAN-SEND] Iniciando protocolo para: ${jid} (Tipo: ${type})`);
 
-        // 1. Pausa Inicial
+        // 1. Pausa Inicial (Simula tempo de reação)
         await delay(randomDelay(500, 1000));
         
-        // 2. Simulação de Presença
+        // 2. Simulação de Presença (Digitando ou Gravando)
+        // Se for áudio PTT, mostra 'gravando áudio...', senão 'digitando...'
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
         await sock.sendPresenceUpdate(presenceType, jid);
 
         // 3. Cálculo de Tempo de Produção (Inteligente)
         let productionTime = 1000; 
+        
         if (type === 'text' && content) {
+            // ~50ms por caractere, mínimo 1s, máximo 5s (para não demorar demais)
             productionTime = Math.min(content.length * 50, 5000); 
+            if (productionTime < 1000) productionTime = 1000;
         } else if (type === 'audio' || ptt) {
+            // Simula tempo de gravação (3 a 6 segundos)
             productionTime = randomDelay(3000, 6000);
         }
 
         await delay(productionTime);
+
+        // 4. Pausa a presença antes de enviar (Comportamento natural)
         await sock.sendPresenceUpdate('paused', jid);
 
         let sentMsg;
 
         switch (type) {
             case 'pix':
-                // ... (Pix mantido igual)
+                // ... (Lógica PIX mantida igual)
                 const pixKey = content || "CHAVE_INVALIDA";
                 try {
                     const msgParams = {
@@ -76,6 +83,7 @@ export const sendMessage = async ({
                     await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
                     sentMsg = waMessage;
                 } catch (e) {
+                    // Fallback texto
                     sentMsg = await sock.sendMessage(jid, { text: `Chave Pix:\n\n${pixKey}` });
                 }
                 break;
@@ -93,20 +101,22 @@ export const sendMessage = async ({
                 break;
 
             case 'audio':
-                // AUDIO FIX: Respeita o mimetype original se possível.
-                // WhatsApp aceita MP4/AAC e OGG/Opus para PTT.
-                // Se o frontend mandou mp4, enviamos como mp4.
-                // Apenas se for 'ptt: true', o WhatsApp trata como voice note (onda verde).
-                
-                let finalMime = mimetype;
-                // Se não veio mimetype, assume mp4 (mais seguro que ogg)
-                if (!finalMime) finalMime = 'audio/mp4';
-                
-                sentMsg = await sock.sendMessage(jid, { 
+                // PTT LOGIC:
+                // Se ptt=true, forçamos o mimetype para OGG/Opus para garantir a onda sonora.
+                // O WhatsApp é chato com isso. Se mandar MP3 com ptt=true, as vezes falha.
+                const audioOptions = { 
                     audio: { url }, 
-                    ptt: !!ptt, 
-                    mimetype: finalMime 
-                });
+                    ptt: !!ptt 
+                };
+
+                if (ptt) {
+                    // Força codec de voz para aparecer a onda verde
+                    audioOptions.mimetype = 'audio/ogg; codecs=opus';
+                } else if (mimetype) {
+                    audioOptions.mimetype = mimetype;
+                }
+
+                sentMsg = await sock.sendMessage(jid, audioOptions);
                 break;
 
             case 'document':
@@ -125,6 +135,7 @@ export const sendMessage = async ({
             case 'poll':
                 if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
                 const cleanOptions = poll.options.map(opt => opt.trim()).filter(opt => opt.length > 0);
+                
                 if (cleanOptions.length < 2) throw new Error("Enquete precisa de pelo menos 2 opções válidas.");
 
                 sentMsg = await sock.sendMessage(jid, {
