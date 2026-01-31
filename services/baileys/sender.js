@@ -2,6 +2,7 @@
 import { sessions } from './connection.js';
 import { delay, generateWAMessageFromContent, proto } from '@whiskeysockets/baileys';
 import { normalizeJid } from '../../utils/wppParsers.js';
+import { convertAudioToOpus } from '../../utils/audioConverter.js'; // Novo Import
 
 // Helper: Delay Aleatório (Humanização)
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
@@ -101,19 +102,38 @@ export const sendMessage = async ({
                 break;
 
             case 'audio':
-                // AUDIO FIX CRÍTICO:
-                // O WhatsApp falha ao reproduzir se enviarmos um MP4 (AAC) dizendo que é OGG (Opus).
-                // A correção é respeitar ESTRITAMENTE o mimetype que veio do frontend (recorder).
+                // AUDIO FIX iOS (Definitivo):
+                // Se for PTT, o WhatsApp no iOS exige estritamente codec OPUS em container OGG.
+                // Arquivos MP4/WebM enviados como PTT corrompem.
+                // Fazemos a conversão via FFmpeg em tempo real.
                 
-                const audioOptions = { 
-                    audio: { url }, 
-                    ptt: !!ptt,
-                    // Se veio mimetype do front (ex: 'audio/mp4'), usa ele.
-                    // Se não veio, usa 'audio/mp4' como fallback seguro (maior compatibilidade que ogg).
-                    mimetype: mimetype || 'audio/mp4'
-                };
-
-                sentMsg = await sock.sendMessage(jid, audioOptions);
+                if (ptt) {
+                    try {
+                        console.log(`🎙️ [AUDIO] Convertendo para OGG/Opus: ${url}`);
+                        const audioBuffer = await convertAudioToOpus(url);
+                        
+                        sentMsg = await sock.sendMessage(jid, {
+                            audio: audioBuffer,
+                            ptt: true,
+                            mimetype: 'audio/ogg; codecs=opus' // Mimetype correto para PTT
+                        });
+                    } catch (conversionError) {
+                        console.error("❌ [AUDIO] Falha na conversão, enviando original:", conversionError.message);
+                        // Fallback: Tenta enviar original (pode falhar no iOS, mas funciona no Android)
+                        sentMsg = await sock.sendMessage(jid, { 
+                            audio: { url }, 
+                            ptt: true,
+                            mimetype: mimetype || 'audio/mp4' 
+                        });
+                    }
+                } else {
+                    // Áudio normal (música/arquivo) não precisa de conversão
+                    sentMsg = await sock.sendMessage(jid, { 
+                        audio: { url }, 
+                        ptt: false,
+                        mimetype: mimetype || 'audio/mp4'
+                    });
+                }
                 break;
 
             case 'document':
