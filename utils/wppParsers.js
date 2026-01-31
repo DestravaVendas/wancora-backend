@@ -53,6 +53,14 @@ export const getBody = (msg) => {
     // Contatos
     if (msg.contactMessage) return msg.contactMessage.displayName;
 
+    // Produtos (NOVO)
+    if (msg.productMessage) {
+        return `Produto: ${msg.productMessage.product?.title || 'Ver produto'}`;
+    }
+
+    // Sticker
+    if (msg.stickerMessage) return "Figurinha";
+
     if (msg.protocolMessage) return ''; // Ignora mensagens de protocolo (ex: delete)
     
     return ''; 
