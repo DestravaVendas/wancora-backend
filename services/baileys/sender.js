@@ -28,13 +28,12 @@ export const sendMessage = async ({
     const jid = normalizeJid(to);
 
     try {
-        console.log(`🤖 [HUMAN-SEND] Iniciando protocolo para: ${jid} (Tipo: ${type})`);
+        // console.log(`🤖 [HUMAN-SEND] Iniciando protocolo para: ${jid} (Tipo: ${type})`);
 
         // 1. Pausa Inicial (Simula tempo de reação)
         await delay(randomDelay(500, 1000));
         
         // 2. Simulação de Presença (Digitando ou Gravando)
-        // Se for áudio PTT, mostra 'gravando áudio...', senão 'digitando...'
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
         await sock.sendPresenceUpdate(presenceType, jid);
 
@@ -42,17 +41,15 @@ export const sendMessage = async ({
         let productionTime = 1000; 
         
         if (type === 'text' && content) {
-            // ~50ms por caractere, mínimo 1s, máximo 5s (para não demorar demais)
             productionTime = Math.min(content.length * 50, 5000); 
             if (productionTime < 1000) productionTime = 1000;
         } else if (type === 'audio' || ptt) {
-            // Simula tempo de gravação (3 a 6 segundos)
-            productionTime = randomDelay(3000, 6000);
+            productionTime = randomDelay(2000, 5000);
         }
 
         await delay(productionTime);
 
-        // 4. Pausa a presença antes de enviar (Comportamento natural)
+        // 4. Pausa a presença antes de enviar
         await sock.sendPresenceUpdate('paused', jid);
 
         let sentMsg;
@@ -100,28 +97,29 @@ export const sendMessage = async ({
                 break;
 
             case 'audio':
-                // --- LÓGICA DE ÁUDIO REESCRITA ---
+                // --- LÓGICA DE ÁUDIO PTT ---
                 if (ptt) {
                     try {
-                        // Converte para Buffer OGG/Opus usando o novo método seguro
+                        console.log(`🎤 [AUDIO] Convertendo para PTT (Opus): ${url}`);
+                        // Converte para Buffer OGG/Opus Limpo
                         const audioBuffer = await convertAudioToOpus(url);
                         
                         sentMsg = await sock.sendMessage(jid, {
                             audio: audioBuffer,
-                            ptt: true, // Força waveform
+                            ptt: true, // Flag fundamental para Waveform
                             mimetype: 'audio/ogg; codecs=opus'
                         });
                     } catch (conversionError) {
-                        console.error("❌ [AUDIO] Falha na conversão, enviando original como fallback:", conversionError.message);
-                        // Fallback: Envia como arquivo de áudio normal (sem PTT) se a conversão falhar
+                        console.error("❌ [AUDIO] Erro na conversão, enviando original como fallback:", conversionError.message);
+                        // Fallback: Envia como arquivo de áudio normal (Audio File)
                         sentMsg = await sock.sendMessage(jid, { 
                             audio: { url }, 
-                            ptt: false, // Desativa PTT para evitar corrupção se o formato não for Opus
+                            ptt: false, 
                             mimetype: mimetype || 'audio/mp4' 
                         });
                     }
                 } else {
-                    // Áudio normal (Música, Podcast) - Envia URL direta
+                    // Áudio normal (Música, Arquivo)
                     sentMsg = await sock.sendMessage(jid, { 
                         audio: { url }, 
                         ptt: false,
@@ -146,9 +144,7 @@ export const sendMessage = async ({
             case 'poll':
                 if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
                 const cleanOptions = poll.options.map(opt => opt.trim()).filter(opt => opt.length > 0);
-                
                 if (cleanOptions.length < 2) throw new Error("Enquete precisa de pelo menos 2 opções válidas.");
-
                 sentMsg = await sock.sendMessage(jid, {
                     poll: {
                         name: poll.name.trim(),
