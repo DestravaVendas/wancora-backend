@@ -1,0 +1,76 @@
+# 1. Imagem Base (Node 20 no Linux Debian Slim - Leve e Seguro)
+FROM node:20-slim
+
+# 2. Instalação de Dependências do Sistema (Obrigatório para Baileys e Mídia)
+# - ffmpeg: Para converter áudio PTT (MP4/AAC -> OGG/Opus) e processar vídeos.
+# - libvips: Para processamento de imagem rápido (Sharp).
+# - ca-certificates: Para conexões SSL seguras.
+# - chromium: Para spoofing de navegador (Opcional, mas recomendado para estabilidade).
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libvips \
+    ca-certificates \
+    chromium \
+    fonts-liberation \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libc6 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libexpat1 \
+    libfontconfig1 \
+    libgbm1 \
+    libgcc1 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libstdc++6 \
+    libx11-6 \
+    libx11-xcb1 \
+    libxcb1 \
+    libxcomposite1 \
+    libxcursor1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxi6 \
+    libxrandr2 \
+    libxrender1 \
+    libxss1 \
+    libxtst6 \
+    lsb-release \
+    wget \
+    xdg-utils \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3. Definição do Diretório de Trabalho
+WORKDIR /app
+
+# 4. Copia os arquivos de dependência primeiro (Cache Layering)
+COPY package*.json ./
+
+# 5. Instalação das Dependências Node.js
+# --production: Pula devDependencies para economizar espaço
+RUN npm ci --production
+
+# 6. Copia o restante do código fonte
+COPY . .
+
+# 7. Configurações de Ambiente
+ENV NODE_ENV=production
+ENV PORT=3001
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
+# 8. Expõe a porta da API
+EXPOSE 3001
+
+# 9. Comando de Inicialização (Usa PM2 se disponível ou node direto)
+# Recomendado usar node direto em contêineres simples, ou pm2-runtime
+CMD ["node", "--max-old-space-size=4096", "server.js"]

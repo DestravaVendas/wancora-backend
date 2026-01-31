@@ -1,7 +1,8 @@
 
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
-import { startSession, deleteSession } from "../services/baileys/connection.js";
+// CHANGE: Importando do Controller validado para manter o padrão MVC
+import { startSession, deleteSession } from "../controllers/whatsappController.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = express.Router();
@@ -20,6 +21,7 @@ router.post("/start", async (req, res) => {
     return res.status(400).json({ error: "Dados incompletos (sessionId/companyId faltando)" });
   }
 
+  // Fire and Forget: O Controller gerencia o log e o início
   startSession(sessionId, companyId).catch(err => {
     console.error(`❌ Erro fatal ao iniciar sessão ${sessionId}:`, err);
   });
@@ -48,8 +50,6 @@ router.post("/logout", async (req, res) => {
 // Status
 router.get("/status/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
-  // Apenas a empresa dona pode ver o status (validado pelo middleware se passarmos companyId na query, mas aqui é GET simples)
-  // TODO: Melhorar validação de GET para checar se sessionId pertence à empresa do usuário
   const { data, error } = await supabase.from("instances").select("*").eq("session_id", sessionId).maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ status: "not_found" });

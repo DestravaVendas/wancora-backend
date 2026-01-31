@@ -1,20 +1,20 @@
+
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import { sendMessage, sendPollVote, sendReaction, deleteMessage, markChatAsRead } from "../controllers/whatsappController.js"; 
 import { requireAuth } from "../middleware/auth.js";
 import { apiLimiter } from "../middleware/limiter.js";
-import { normalizeJid } from "../utils/wppParsers.js"; // Importando normalizador
+import { normalizeJid } from "../utils/wppParsers.js";
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
 
-// Middleware Global para este router
 router.use(requireAuth);
 router.use(apiLimiter);
 
-// Enviar Mensagem
+// Enviar Mensagem (Com Salvamento Otimista)
 router.post("/send", async (req, res) => {
   const { 
       sessionId, to, text, type, url, caption, 
@@ -26,9 +26,9 @@ router.post("/send", async (req, res) => {
   }
 
   try {
-    // Normalização Segura do Destinatário
     const cleanTo = normalizeJid(to);
     
+    // Payload padronizado
     const payload = {
         sessionId,
         to: cleanTo,
@@ -37,21 +37,19 @@ router.post("/send", async (req, res) => {
         url, caption, poll, location, contact, ptt, mimetype, fileName
     };
 
-    // 1. Envio via Baileys
+    // 1. Envio via Controller/Service
     const sentMsg = await sendMessage(payload);
     
-    // 2. Salvamento Otimista
-    // Isso garante que a mensagem apareça no chat instantaneamente para quem enviou
+    // 2. Salvamento Otimista (Critical Path)
     if (companyId && sentMsg?.key) {
         
-        // Tenta vincular ao Lead existente
         let leadId = null;
         const phoneClean = cleanTo.split('@')[0].replace(/\D/g, '');
         const { data: lead } = await supabase.from("leads").select("id").eq("phone", phoneClean).eq("company_id", companyId).maybeSingle();
         if (lead) leadId = lead.id;
 
-        // Prepara conteúdo para exibição no banco
         let displayContent = text || caption || `[${payload.type}]`;
+        
         if (payload.type === 'poll' && poll) displayContent = JSON.stringify(poll);
         else if (payload.type === 'location' && location) displayContent = JSON.stringify(location);
         else if (payload.type === 'contact' && contact) displayContent = JSON.stringify(contact);
@@ -84,7 +82,6 @@ router.post("/send", async (req, res) => {
 router.post("/vote", async (req, res) => {
     const { companyId, sessionId, remoteJid, pollId, optionId } = req.body;
     
-    // Validação estrita
     if(!pollId || optionId === undefined) {
         return res.status(400).json({ error: "PollId e OptionId obrigatórios" });
     }
@@ -109,7 +106,7 @@ router.post("/react", async (req, res) => {
     }
 });
 
-// Deletar
+// Deletar Mensagem
 router.post("/delete", async (req, res) => {
     const { sessionId, companyId, remoteJid, msgId, everyone } = req.body;
     try {
@@ -120,20 +117,13 @@ router.post("/delete", async (req, res) => {
     }
 });
 
-// --- NOVA ROTA: Marcar como Lido & Presença ---
+// Marcar como Lido & Presença
 router.post("/read", async (req, res) => {
     const { sessionId, companyId, remoteJid } = req.body;
-    
-    if (!sessionId || !remoteJid) {
-        return res.status(400).json({ error: "Parâmetros inválidos" });
-    }
-
     try {
         await markChatAsRead(sessionId, companyId, remoteJid);
         res.json({ success: true });
     } catch (error) {
-        // Loga mas não retorna 500 para não travar o frontend em loop
-        console.error("Erro rota /read:", error);
         res.json({ success: false });
     }
 });

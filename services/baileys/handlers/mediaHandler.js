@@ -3,13 +3,14 @@ import { downloadMediaMessage } from '@whiskeysockets/baileys';
 import { createClient } from '@supabase/supabase-js';
 import mime from 'mime-types';
 import pino from 'pino';
+import sharp from 'sharp'; 
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'silent' });
 
 export const handleMediaUpload = async (msg, companyId) => {
     try {
-        // PATCH: User-Agent Genérico e Moderno para evitar bloqueio 403
+        // PATCH: User-Agent Genérico
         const downloadOptions = {
             options: {
                 headers: {
@@ -21,7 +22,7 @@ export const handleMediaUpload = async (msg, companyId) => {
             }
         };
 
-        const buffer = await downloadMediaMessage(
+        let buffer = await downloadMediaMessage(
             msg,
             'buffer',
             downloadOptions,
@@ -40,9 +41,27 @@ export const handleMediaUpload = async (msg, companyId) => {
         else if (messageType === 'documentMessage') mimeType = msg.message.documentMessage?.mimetype || 'application/pdf';
         else if (messageType === 'stickerMessage') mimeType = 'image/webp';
 
+        // --- OTIMIZAÇÃO COM SHARP (IMAGENS) ---
+        // Se for imagem (exceto sticker que já vem otimizado ou gif animado), redimensiona
+        if (mimeType.startsWith('image/') && messageType !== 'stickerMessage' && !mimeType.includes('gif')) {
+            try {
+                // Redimensiona para max 1280px de largura/altura (HD), converte para JPEG com qualidade 80
+                // Isso previne que fotos de 10MB travem o storage ou o frontend
+                buffer = await sharp(buffer)
+                    .resize(1280, 1280, { fit: 'inside', withoutEnlargement: true })
+                    .toFormat('jpeg', { quality: 80 })
+                    .toBuffer();
+                
+                mimeType = 'image/jpeg'; // Força tipo para JPEG após conversão
+            } catch (sharpError) {
+                console.warn("[MEDIA] Falha na otimização Sharp, usando original:", sharpError.message);
+            }
+        }
+
         let ext = mime.extension(mimeType) || 'bin';
         if (mimeType === 'audio/mp4' || mimeType.includes('audio')) ext = 'm4a';
         if (mimeType.includes('opus')) ext = 'ogg';
+        if (mimeType === 'image/jpeg') ext = 'jpg';
 
         const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
         const filePath = companyId ? `${companyId}/${fileName}` : fileName;
@@ -64,7 +83,6 @@ export const handleMediaUpload = async (msg, companyId) => {
 
     } catch (e) {
         const m = e.message || '';
-        // Silencia erros esperados de mídia antiga/expirada
         if (m.includes('403') || m.includes('401') || m.includes('404') || m.includes('410') || m.includes('timeout')) {
              return null; 
         }
