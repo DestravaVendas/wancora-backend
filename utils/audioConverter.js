@@ -1,48 +1,70 @@
 
 import ffmpeg from 'fluent-ffmpeg';
 import axios from 'axios';
-import { PassThrough } from 'stream';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { promisify } from 'util';
+
+const writeFile = promisify(fs.writeFile);
+const readFile = promisify(fs.readFile);
+const unlink = promisify(fs.unlink);
 
 /**
  * Converte um arquivo de áudio (URL) para Buffer OGG/Opus compatível com WhatsApp PTT.
+ * Usa arquivos temporários para evitar corrupção de stream.
  * @param {string} url - URL pública do arquivo de áudio (Supabase/S3)
  * @returns {Promise<Buffer>} - Buffer do arquivo convertido
  */
 export const convertAudioToOpus = async (url) => {
-    return new Promise(async (resolve, reject) => {
-        try {
-            // 1. Baixa o arquivo original como Stream
-            const response = await axios({
-                method: 'GET',
-                url: url,
-                responseType: 'stream'
-            });
+    // Gera nomes de arquivo únicos
+    const tempId = Math.random().toString(36).substring(7);
+    const inputPath = path.join(os.tmpdir(), `input_${tempId}`);
+    const outputPath = path.join(os.tmpdir(), `output_${tempId}.ogg`);
 
-            // 2. Cria streams de passagem
-            const outStream = new PassThrough();
-            const chunks = [];
+    try {
+        // 1. Download do arquivo para o disco
+        const response = await axios({
+            method: 'GET',
+            url: url,
+            responseType: 'arraybuffer'
+        });
 
-            // 3. Coleta os dados convertidos
-            outStream.on('data', (chunk) => chunks.push(chunk));
-            outStream.on('end', () => resolve(Buffer.concat(chunks)));
-            outStream.on('error', (err) => reject(err));
+        await writeFile(inputPath, response.data);
 
-            // 4. Inicia conversão FFmpeg
-            ffmpeg(response.data)
+        // 2. Conversão via FFmpeg (File to File)
+        await new Promise((resolve, reject) => {
+            ffmpeg(inputPath)
                 .toFormat('ogg')
                 .audioCodec('libopus')
-                .audioBitrate('64k') // 64k é suficiente para voz e economiza banda
+                .audioBitrate('64k') // Qualidade de voz
                 .audioChannels(1)    // PTT deve ser Mono
-                .audioFrequency(16000) // Taxa de amostragem padrão do WA
-                .on('error', (err) => {
-                    console.error('[FFMPEG] Erro na conversão:', err.message);
-                    reject(err);
-                })
-                .pipe(outStream, { end: true });
+                .audioFrequency(16000) // Taxa padrão do WA
+                .on('end', () => resolve())
+                .on('error', (err) => reject(err))
+                .save(outputPath);
+        });
 
-        } catch (err) {
-            console.error('[CONVERTER] Falha no download ou setup:', err.message);
-            reject(err);
-        }
-    });
+        // 3. Lê o arquivo convertido para Buffer
+        const audioBuffer = await readFile(outputPath);
+
+        // 4. Limpeza (Fire and Forget)
+        cleanup(inputPath, outputPath);
+
+        return audioBuffer;
+
+    } catch (err) {
+        console.error('[CONVERTER] Falha crítica:', err.message);
+        cleanup(inputPath, outputPath);
+        throw err;
+    }
+};
+
+const cleanup = async (inPath, outPath) => {
+    try {
+        if (fs.existsSync(inPath)) await unlink(inPath);
+        if (fs.existsSync(outPath)) await unlink(outPath);
+    } catch (e) {
+        // Ignora erro de limpeza
+    }
 };
