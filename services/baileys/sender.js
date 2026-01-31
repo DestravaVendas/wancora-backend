@@ -1,3 +1,4 @@
+
 import { sessions } from './connection.js';
 import { delay, generateWAMessageFromContent, proto } from '@whiskeysockets/baileys';
 import { normalizeJid } from '../../utils/wppParsers.js';
@@ -25,8 +26,6 @@ export const sendMessage = async ({
     const sock = session.sock;
     const jid = normalizeJid(to);
 
-    // OTIMIZAÇÃO: Removemos a checagem sock.onWhatsApp(jid) para evitar latência desnecessária.
-
     try {
         console.log(`🤖 [HUMAN-SEND] Iniciando protocolo para: ${jid} (Tipo: ${type})`);
 
@@ -39,16 +38,10 @@ export const sendMessage = async ({
 
         // 3. Cálculo de Tempo de Produção (Inteligente)
         let productionTime = 1000; 
-        
         if (type === 'text' && content) {
-            // ~50ms por caractere para texto
             productionTime = Math.min(content.length * 50, 5000); 
         } else if (type === 'audio' || ptt) {
-            // Para áudio, simula um tempo de gravação realista
             productionTime = randomDelay(3000, 6000);
-        } else if (type === 'image' || type === 'video') {
-            // Tempo para "selecionar a mídia"
-            productionTime = 2000;
         }
 
         await delay(productionTime);
@@ -58,33 +51,21 @@ export const sendMessage = async ({
 
         switch (type) {
             case 'pix':
+                // ... (Pix mantido igual)
                 const pixKey = content || "CHAVE_INVALIDA";
-                console.log(`💲 [PIX] Gerando payload Native Flow para: ${pixKey}`);
-
                 try {
                     const msgParams = {
                         viewOnceMessage: {
                             message: {
-                                messageContextInfo: {
-                                    deviceListMetadata: {},
-                                    deviceListMetadataVersion: 2
-                                },
+                                messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 },
                                 interactiveMessage: {
-                                    body: { text: "Use o botão abaixo para copiar a chave Pix." },
+                                    header: { title: "CHAVE PIX", subtitle: "Pagamento", hasMediaAttachment: false },
+                                    body: { text: "Copie a chave abaixo para finalizar seu pedido." },
                                     footer: { text: "Pagamento Seguro" },
-                                    header: { 
-                                        title: "CHAVE PIX", 
-                                        subtitle: "Pagamento", 
-                                        hasMediaAttachment: false 
-                                    },
                                     nativeFlowMessage: {
                                         buttons: [{
                                             name: "cta_copy",
-                                            buttonParamsJson: JSON.stringify({
-                                                display_text: "COPIAR CHAVE PIX",
-                                                id: "copy_code",
-                                                copy_code: pixKey
-                                            })
+                                            buttonParamsJson: JSON.stringify({ display_text: "COPIAR CHAVE PIX", id: "copy_code", copy_code: pixKey })
                                         }]
                                     }
                                 }
@@ -95,10 +76,7 @@ export const sendMessage = async ({
                     await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
                     sentMsg = waMessage;
                 } catch (e) {
-                    console.error("Erro no Native Flow Pix, enviando fallback:", e);
-                    sentMsg = await sock.sendMessage(jid, { 
-                        text: `Chave Pix:\n\n${pixKey}` 
-                    });
+                    sentMsg = await sock.sendMessage(jid, { text: `Chave Pix:\n\n${pixKey}` });
                 }
                 break;
 
@@ -115,16 +93,19 @@ export const sendMessage = async ({
                 break;
 
             case 'audio':
+                // AUDIO FIX: Respeita o mimetype original se possível.
+                // WhatsApp aceita MP4/AAC e OGG/Opus para PTT.
+                // Se o frontend mandou mp4, enviamos como mp4.
+                // Apenas se for 'ptt: true', o WhatsApp trata como voice note (onda verde).
+                
                 let finalMime = mimetype;
-                // Tratamento Especial para PTT (Gravador Web)
-                if (ptt && (mimetype === 'audio/webm' || mimetype?.includes('opus'))) {
-                    finalMime = 'audio/ogg; codecs=opus';
-                }
+                // Se não veio mimetype, assume mp4 (mais seguro que ogg)
+                if (!finalMime) finalMime = 'audio/mp4';
                 
                 sentMsg = await sock.sendMessage(jid, { 
                     audio: { url }, 
                     ptt: !!ptt, 
-                    mimetype: finalMime || 'audio/mp4' 
+                    mimetype: finalMime 
                 });
                 break;
 
@@ -142,10 +123,7 @@ export const sendMessage = async ({
                 break;
 
             case 'poll':
-                // LÓGICA NOVA DE ENQUETES (Implementada Corretamente)
                 if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
-                
-                // Sanitização Proativa
                 const cleanOptions = poll.options.map(opt => opt.trim()).filter(opt => opt.length > 0);
                 if (cleanOptions.length < 2) throw new Error("Enquete precisa de pelo menos 2 opções válidas.");
 
