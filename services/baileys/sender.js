@@ -101,9 +101,9 @@ export const sendMessage = async ({
                         sentMsg = await sock.sendMessage(jid, {
                             audio: buffer,
                             ptt: true, 
-                            seconds: duration, // VITAL: Informa ao WA a duração para desenhar a barra
+                            seconds: duration, // VITAL: Duração correta
                             mimetype: 'audio/ogg; codecs=opus',
-                            waveform: new Uint8Array(waveform)
+                            waveform: Buffer.from(waveform) // VITAL: Passar como Buffer Node.js
                         });
 
                         // Dispara transcrição
