@@ -86,7 +86,8 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     }
 };
 
-export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false, lid = null, isBusiness = false, verifiedName = null) => {
+// Atualizado para aceitar 'metadata' e 'parent_jid'
+export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false, lid = null, isBusiness = false, verifiedName = null, extraData = {}) => {
     try {
         if (!jid || !companyId) return;
         if (jid.includes('status@broadcast')) return;
@@ -98,7 +99,8 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             jid: cleanJid,
             phone: purePhone, 
             company_id: companyId,
-            updated_at: new Date()
+            updated_at: new Date(),
+            ...extraData // Injeta is_community, is_newsletter, parent_jid, metadata
         };
 
         if (isBusiness) updateData.is_business = true;
@@ -248,6 +250,14 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
 export const upsertMessage = async (msgData) => {
     try {
+        // CORREÇÃO STATUS BROADCAST
+        // Permitimos salvar status no banco para visualização futura, 
+        // mas o remote_jid deve ser o do autor, não o broadcast.
+        // O Baileys envia remoteJid='status@broadcast' e participant='autor'.
+        // O upsertMessage precisa lidar com isso se quisermos salvar Stories.
+        // Por enquanto, seguimos a regra de não poluir messages com status, a menos que especificado.
+        // Se msgData.remote_jid for status, vamos ignorar por padrão no sync, mas o handler de status trataria separado.
+        
         const cleanRemoteJid = normalizeJid(msgData.remote_jid);
         const finalData = { ...msgData, remote_jid: cleanRemoteJid };
 
