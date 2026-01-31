@@ -2,9 +2,14 @@
 import { sessions } from './connection.js';
 import { delay, generateWAMessageFromContent, proto } from '@whiskeysockets/baileys';
 import { normalizeJid } from '../../utils/wppParsers.js';
-import { convertAudioToOpus } from '../../utils/audioConverter.js'; 
+import { convertAudioToOpus } from '../../utils/audioConverter.js';
+import { transcribeAudio } from '../../services/ai/transcriber.js';
+import { createClient } from "@supabase/supabase-js";
 
-// Helper: Delay Aleatório (Humanização)
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+    auth: { persistSession: false }
+});
+
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
 
 export const sendMessage = async ({
@@ -19,7 +24,8 @@ export const sendMessage = async ({
     ptt = false,
     poll,
     location,
-    contact
+    contact,
+    companyId // Importante para salvar transcrição
 }) => {
     const session = sessions.get(sessionId);
     if (!session || !session.sock) throw new Error(`Sessão ${sessionId} não encontrada.`);
@@ -28,31 +34,20 @@ export const sendMessage = async ({
     const jid = normalizeJid(to);
 
     try {
-        // console.log(`🤖 [HUMAN-SEND] Iniciando protocolo para: ${jid} (Tipo: ${type})`);
-
-        // 1. Pausa Inicial (Simula tempo de reação)
         await delay(randomDelay(500, 1000));
         
-        // 2. Simulação de Presença (Digitando ou Gravando)
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
         await sock.sendPresenceUpdate(presenceType, jid);
 
-        // 3. Cálculo de Tempo de Produção (Inteligente)
-        let productionTime = 1000; 
-        
-        if (type === 'text' && content) {
-            productionTime = Math.min(content.length * 50, 5000); 
-            if (productionTime < 1000) productionTime = 1000;
-        } else if (type === 'audio' || ptt) {
-            productionTime = randomDelay(2000, 5000);
-        }
+        let productionTime = 1000;
+        if (type === 'text' && content) productionTime = Math.min(content.length * 50, 5000);
+        else if (type === 'audio' || ptt) productionTime = randomDelay(2000, 5000);
 
         await delay(productionTime);
-
-        // 4. Pausa a presença antes de enviar
         await sock.sendPresenceUpdate('paused', jid);
 
         let sentMsg;
+        let transcriptionText = null;
 
         switch (type) {
             case 'pix':
@@ -97,44 +92,42 @@ export const sendMessage = async ({
                 break;
 
             case 'audio':
-                // --- LÓGICA DE ÁUDIO PTT ---
                 if (ptt) {
                     try {
                         console.log(`🎤 [AUDIO] Convertendo para PTT (Opus): ${url}`);
-                        // Converte para Buffer OGG/Opus Limpo
-                        const audioBuffer = await convertAudioToOpus(url);
+                        // AGORA RETORNA BUFFER E WAVEFORM
+                        const { buffer, waveform } = await convertAudioToOpus(url);
                         
                         sentMsg = await sock.sendMessage(jid, {
-                            audio: audioBuffer,
-                            ptt: true, // Flag fundamental para Waveform
-                            mimetype: 'audio/ogg; codecs=opus'
+                            audio: buffer,
+                            ptt: true, 
+                            mimetype: 'audio/ogg; codecs=opus',
+                            waveform: new Uint8Array(waveform) // Onda sonora visual no WhatsApp
                         });
+
+                        // Dispara transcrição em background (sem await para não travar envio)
+                        if (companyId) {
+                            transcribeAudio(buffer, 'audio/ogg', companyId).then(text => {
+                                if (text && sentMsg.key.id) {
+                                    supabase.from('messages')
+                                        .update({ transcription: text })
+                                        .eq('whatsapp_id', sentMsg.key.id)
+                                        .then();
+                                }
+                            });
+                        }
+
                     } catch (conversionError) {
-                        console.error("❌ [AUDIO] Erro na conversão, enviando original como fallback:", conversionError.message);
-                        // Fallback: Envia como arquivo de áudio normal (Audio File)
-                        sentMsg = await sock.sendMessage(jid, { 
-                            audio: { url }, 
-                            ptt: false, 
-                            mimetype: mimetype || 'audio/mp4' 
-                        });
+                        console.error("❌ [AUDIO] Falha na conversão:", conversionError.message);
+                        sentMsg = await sock.sendMessage(jid, { audio: { url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
                     }
                 } else {
-                    // Áudio normal (Música, Arquivo)
-                    sentMsg = await sock.sendMessage(jid, { 
-                        audio: { url }, 
-                        ptt: false,
-                        mimetype: mimetype || 'audio/mp4'
-                    });
+                    sentMsg = await sock.sendMessage(jid, { audio: { url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
                 }
                 break;
 
             case 'document':
-                sentMsg = await sock.sendMessage(jid, { 
-                    document: { url }, 
-                    mimetype: mimetype || 'application/pdf', 
-                    fileName: fileName || 'documento', 
-                    caption: caption 
-                });
+                sentMsg = await sock.sendMessage(jid, { document: { url }, mimetype: mimetype || 'application/pdf', fileName: fileName || 'documento', caption: caption });
                 break;
 
             case 'sticker':
@@ -146,32 +139,18 @@ export const sendMessage = async ({
                 const cleanOptions = poll.options.map(opt => opt.trim()).filter(opt => opt.length > 0);
                 if (cleanOptions.length < 2) throw new Error("Enquete precisa de pelo menos 2 opções válidas.");
                 sentMsg = await sock.sendMessage(jid, {
-                    poll: {
-                        name: poll.name.trim(),
-                        values: cleanOptions, 
-                        selectableCount: Number(poll.selectableOptionsCount) || 1
-                    }
+                    poll: { name: poll.name.trim(), values: cleanOptions, selectableCount: Number(poll.selectableOptionsCount) || 1 }
                 });
                 break;
 
             case 'location':
                 if (!location) throw new Error("Dados de localização inválidos");
-                sentMsg = await sock.sendMessage(jid, {
-                    location: {
-                        degreesLatitude: location.latitude,
-                        degreesLongitude: location.longitude
-                    }
-                });
+                sentMsg = await sock.sendMessage(jid, { location: { degreesLatitude: location.latitude, degreesLongitude: location.longitude } });
                 break;
 
             case 'contact':
                 if (!contact || !contact.vcard) throw new Error("Dados de contato inválidos");
-                sentMsg = await sock.sendMessage(jid, {
-                    contacts: {
-                        displayName: contact.displayName,
-                        contacts: [{ vcard: contact.vcard }]
-                    }
-                });
+                sentMsg = await sock.sendMessage(jid, { contacts: { displayName: contact.displayName, contacts: [{ vcard: contact.vcard }] } });
                 break;
 
             default:
