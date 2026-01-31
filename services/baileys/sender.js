@@ -5,12 +5,26 @@ import { normalizeJid } from '../../utils/wppParsers.js';
 import { convertAudioToOpus } from '../../utils/audioConverter.js';
 import { transcribeAudio } from '../../services/ai/transcriber.js';
 import { createClient } from "@supabase/supabase-js";
+import sharp from 'sharp';
+import axios from 'axios';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
 
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
+
+// Helper para converter imagem em Sticker WebP (512x512)
+const convertToSticker = async (url) => {
+    const response = await axios.get(url, { responseType: 'arraybuffer' });
+    const buffer = Buffer.from(response.data);
+
+    // Usa Sharp para redimensionar e converter
+    return await sharp(buffer)
+        .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }) // Fundo transparente
+        .toFormat('webp')
+        .toBuffer();
+};
 
 export const sendMessage = async ({
     sessionId,
@@ -25,6 +39,7 @@ export const sendMessage = async ({
     poll,
     location,
     contact,
+    product,
     companyId 
 }) => {
     const session = sessions.get(sessionId);
@@ -34,7 +49,7 @@ export const sendMessage = async ({
     const jid = normalizeJid(to);
 
     try {
-        // Pausa Inicial
+        // Pausa Inicial Humanizada
         await delay(randomDelay(500, 1000));
         
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
@@ -43,6 +58,7 @@ export const sendMessage = async ({
         let productionTime = 1000;
         if (type === 'text' && content) productionTime = Math.min(content.length * 50, 5000);
         else if (type === 'audio' || ptt) productionTime = randomDelay(2000, 4000);
+        else if (type === 'sticker') productionTime = 1500;
 
         await delay(productionTime);
         await sock.sendPresenceUpdate('paused', jid);
@@ -50,37 +66,12 @@ export const sendMessage = async ({
         let sentMsg;
 
         switch (type) {
-            case 'pix':
-                const pixKey = content || "CHAVE_INVALIDA";
-                try {
-                    const msgParams = {
-                        viewOnceMessage: {
-                            message: {
-                                messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 },
-                                interactiveMessage: {
-                                    header: { title: "CHAVE PIX", subtitle: "Pagamento", hasMediaAttachment: false },
-                                    body: { text: "Copie a chave abaixo para finalizar seu pedido." },
-                                    footer: { text: "Pagamento Seguro" },
-                                    nativeFlowMessage: {
-                                        buttons: [{
-                                            name: "cta_copy",
-                                            buttonParamsJson: JSON.stringify({ display_text: "COPIAR CHAVE PIX", id: "copy_code", copy_code: pixKey })
-                                        }]
-                                    }
-                                }
-                            }
-                        }
-                    };
-                    const waMessage = await generateWAMessageFromContent(jid, msgParams, { userJid: sock.user.id });
-                    await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
-                    sentMsg = waMessage;
-                } catch (e) {
-                    sentMsg = await sock.sendMessage(jid, { text: `Chave Pix:\n\n${pixKey}` });
-                }
-                break;
-
             case 'text':
-                sentMsg = await sock.sendMessage(jid, { text: content || "" });
+                // Envia como extendedTextMessage para garantir preview de link
+                sentMsg = await sock.sendMessage(jid, { 
+                    text: content || "",
+                    // O Baileys gerencia o linkPreview automaticamente se configurado na conexão
+                });
                 break;
 
             case 'image':
@@ -94,32 +85,24 @@ export const sendMessage = async ({
             case 'audio':
                 if (ptt) {
                     try {
-                        console.log(`🎤 [AUDIO] Processando PTT: ${url}`);
-                        // RETORNA BUFFER, WAVEFORM E DURAÇÃO
                         const { buffer, waveform, duration } = await convertAudioToOpus(url);
                         
                         sentMsg = await sock.sendMessage(jid, {
                             audio: buffer,
                             ptt: true, 
-                            seconds: duration, // VITAL: Duração correta
+                            seconds: duration,
                             mimetype: 'audio/ogg; codecs=opus',
-                            waveform: Buffer.from(waveform) // VITAL: Passar como Buffer Node.js
+                            waveform: Buffer.from(waveform)
                         });
 
-                        // Dispara transcrição
                         if (companyId) {
                             transcribeAudio(buffer, 'audio/ogg', companyId).then(text => {
                                 if (text && sentMsg.key.id) {
-                                    supabase.from('messages')
-                                        .update({ transcription: text })
-                                        .eq('whatsapp_id', sentMsg.key.id)
-                                        .then();
+                                    supabase.from('messages').update({ transcription: text }).eq('whatsapp_id', sentMsg.key.id).then();
                                 }
                             });
                         }
-
                     } catch (conversionError) {
-                        console.error("❌ [AUDIO] Falha PTT:", conversionError.message);
                         sentMsg = await sock.sendMessage(jid, { audio: { url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
                     }
                 } else {
@@ -132,7 +115,15 @@ export const sendMessage = async ({
                 break;
 
             case 'sticker':
-                sentMsg = await sock.sendMessage(jid, { sticker: { url } });
+                try {
+                    // Converte a imagem (JPG/PNG) para WebP 512x512 antes de enviar
+                    const stickerBuffer = await convertToSticker(url);
+                    sentMsg = await sock.sendMessage(jid, { sticker: stickerBuffer });
+                } catch (stickerErr) {
+                    console.error("Erro ao converter sticker:", stickerErr);
+                    // Fallback tenta enviar a URL direto (se já for webp)
+                    sentMsg = await sock.sendMessage(jid, { sticker: { url } });
+                }
                 break;
 
             case 'poll':
@@ -152,6 +143,33 @@ export const sendMessage = async ({
             case 'contact':
                 if (!contact || !contact.vcard) throw new Error("Dados de contato inválidos");
                 sentMsg = await sock.sendMessage(jid, { contacts: { displayName: contact.displayName, contacts: [{ vcard: contact.vcard }] } });
+                break;
+
+            case 'product':
+                if (!product || !product.productId) throw new Error("Produto inválido.");
+                
+                // Construção de Product Message Nativa
+                // O productMessage deve ser enviado dentro de um template ou directly dependendo da versão
+                // A forma mais segura hoje é via relayMessage ou construction simples se a lib suportar
+                
+                // Vamos tentar enviar como mensagem de produto padrão
+                // Nota: O productMessage requer que o produto exista no catálogo do userJid (owner)
+                
+                // Método simples suportado pelo Baileys
+                sentMsg = await sock.sendMessage(jid, { 
+                    product: {
+                        productImage: product.productImageCount ? { url: url || '' } : undefined, // Se tiver imagem, tenta usar a url passada
+                        productId: product.productId,
+                        title: product.title || 'Produto',
+                        description: product.description,
+                        currencyCode: product.currencyCode || 'BRL',
+                        priceAmount1000: product.priceAmount1000 || 0,
+                        retailerId: "WhatsApp",
+                        url: "", // Opcional
+                        productImageCount: 1 
+                    },
+                    businessOwnerJid: sock.user.id // Obrigatório ser o dono da sessão
+                });
                 break;
 
             default:
