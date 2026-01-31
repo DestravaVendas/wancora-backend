@@ -11,9 +11,9 @@ const readFile = promisify(fs.readFile);
 const unlink = promisify(fs.unlink);
 
 /**
- * Converte áudio para OGG/Opus e gera Waveform.
+ * Converte áudio para OGG/Opus, gera Waveform e extrai Duração.
  * @param {string} url - URL do áudio
- * @returns {Promise<{ buffer: Buffer, waveform: number[] }>}
+ * @returns {Promise<{ buffer: Buffer, waveform: number[], duration: number }>}
  */
 export const convertAudioToOpus = async (url) => {
     const tempId = Math.random().toString(36).substring(7);
@@ -48,18 +48,22 @@ export const convertAudioToOpus = async (url) => {
                 .save(outputPath);
         });
 
+        // 3. Extrair Duração Real (Metadado Crítico para Waveform)
+        const duration = await new Promise((resolve, reject) => {
+            ffmpeg.ffprobe(outputPath, (err, metadata) => {
+                if (err) resolve(0); // Fallback se falhar
+                else resolve(Math.ceil(metadata.format.duration || 0));
+            });
+        });
+
         const audioBuffer = await readFile(outputPath);
 
-        // 3. Gerar Waveform (Simplificado)
-        // O WhatsApp espera um array de 64 bytes (inteiros 0-99) representando a amplitude.
-        // Extrair isso precisamente com FFmpeg exige parsing complexo de PCM.
-        // Vamos gerar um waveform pseudo-randômico baseado no tamanho do buffer para performance e efeito visual.
-        // Isso garante que a mensagem PTT tenha a "aparência" correta.
+        // 4. Gerar Waveform (Padrão WhatsApp: 64 barras)
         const waveform = generateFakeWaveform(audioBuffer.length);
 
         cleanup(inputPath, outputPath);
 
-        return { buffer: audioBuffer, waveform };
+        return { buffer: audioBuffer, waveform, duration };
 
     } catch (err) {
         console.error('[CONVERTER] Erro:', err.message);
@@ -68,17 +72,16 @@ export const convertAudioToOpus = async (url) => {
     }
 };
 
-// Gera um padrão visual de onda sonora para o WhatsApp
-// (Extração real exigiria decodificar o PCM completo, o que é lento para Node puro)
+// Gera um padrão visual de onda sonora para o WhatsApp (64 samples)
 const generateFakeWaveform = (seed) => {
-    const length = 64; // WhatsApp usa ~64 barras
+    const length = 64; 
     const waveform = new Uint8Array(length);
     for (let i = 0; i < length; i++) {
-        // Gera valores entre 0 e 100 com alguma variação "natural"
-        const val = Math.floor(Math.random() * 60) + 10;
+        // Gera valores variados para parecer voz natural (picos e vales)
+        const val = Math.floor(Math.random() * 50) + (i % 2 === 0 ? 30 : 10);
         waveform[i] = val;
     }
-    return Array.from(waveform); // Retorna array normal para JSON
+    return Array.from(waveform); 
 };
 
 const cleanup = async (inPath, outPath) => {
