@@ -25,7 +25,7 @@ export const sendMessage = async ({
     poll,
     location,
     contact,
-    companyId // Importante para salvar transcrição
+    companyId 
 }) => {
     const session = sessions.get(sessionId);
     if (!session || !session.sock) throw new Error(`Sessão ${sessionId} não encontrada.`);
@@ -34,6 +34,7 @@ export const sendMessage = async ({
     const jid = normalizeJid(to);
 
     try {
+        // Pausa Inicial
         await delay(randomDelay(500, 1000));
         
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
@@ -41,13 +42,12 @@ export const sendMessage = async ({
 
         let productionTime = 1000;
         if (type === 'text' && content) productionTime = Math.min(content.length * 50, 5000);
-        else if (type === 'audio' || ptt) productionTime = randomDelay(2000, 5000);
+        else if (type === 'audio' || ptt) productionTime = randomDelay(2000, 4000);
 
         await delay(productionTime);
         await sock.sendPresenceUpdate('paused', jid);
 
         let sentMsg;
-        let transcriptionText = null;
 
         switch (type) {
             case 'pix':
@@ -94,18 +94,19 @@ export const sendMessage = async ({
             case 'audio':
                 if (ptt) {
                     try {
-                        console.log(`🎤 [AUDIO] Convertendo para PTT (Opus): ${url}`);
-                        // AGORA RETORNA BUFFER E WAVEFORM
-                        const { buffer, waveform } = await convertAudioToOpus(url);
+                        console.log(`🎤 [AUDIO] Processando PTT: ${url}`);
+                        // RETORNA BUFFER, WAVEFORM E DURAÇÃO
+                        const { buffer, waveform, duration } = await convertAudioToOpus(url);
                         
                         sentMsg = await sock.sendMessage(jid, {
                             audio: buffer,
                             ptt: true, 
+                            seconds: duration, // VITAL: Informa ao WA a duração para desenhar a barra
                             mimetype: 'audio/ogg; codecs=opus',
-                            waveform: new Uint8Array(waveform) // Onda sonora visual no WhatsApp
+                            waveform: new Uint8Array(waveform)
                         });
 
-                        // Dispara transcrição em background (sem await para não travar envio)
+                        // Dispara transcrição
                         if (companyId) {
                             transcribeAudio(buffer, 'audio/ogg', companyId).then(text => {
                                 if (text && sentMsg.key.id) {
@@ -118,7 +119,7 @@ export const sendMessage = async ({
                         }
 
                     } catch (conversionError) {
-                        console.error("❌ [AUDIO] Falha na conversão:", conversionError.message);
+                        console.error("❌ [AUDIO] Falha PTT:", conversionError.message);
                         sentMsg = await sock.sendMessage(jid, { audio: { url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
                     }
                 } else {
