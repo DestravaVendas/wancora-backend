@@ -1,3 +1,4 @@
+
 import { createClient } from "@supabase/supabase-js";
 import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
 import { sendMessage as sendService } from '../services/baileys/sender.js';
@@ -8,8 +9,14 @@ import {
     updateGroupPicture as updatePictureService,
     getGroupInviteCode as getInviteService,
     createChannel as createChannelService,
-    deleteChannel as deleteChannelService
+    deleteChannel as deleteChannelService,
+    createCommunity as createCommunityService,
+    searchChannels as searchChannelsService,
+    followChannel as followChannelService
 } from '../services/baileys/community.js';
+import { sendStatusText, sendStatusMedia } from '../services/baileys/status.js';
+import { updateProfileName, updateProfileStatus, updateProfilePic } from '../services/baileys/profile.js';
+import { fetchCatalog } from '../services/baileys/catalog.js';
 import { normalizeJid } from '../utils/wppParsers.js';
 import { proto } from '@whiskeysockets/baileys';
 
@@ -17,8 +24,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-// --- GERENCIAMENTO DE SESSÃO ---
-
+// --- SESSÃO & MENSAGEM (Core Mantido) ---
 export const startSession = async (sessionId, companyId) => {
     try {
         console.log(`[Controller] Solicitando início da sessão ${sessionId}`);
@@ -39,27 +45,16 @@ export const deleteSession = async (sessionId, companyId) => {
     }
 };
 
-// --- ENVIO DE MENSAGENS ---
+export const sendMessage = async (payload) => sendService(payload);
 
-export const sendMessage = async (payload) => {
-    try {
-        return await sendService(payload);
-    } catch (error) {
-        console.error(`[Controller] Erro ao enviar mensagem:`, error);
-        throw error; 
-    }
-};
-
-// --- GRUPOS & CANAIS (Community Module) ---
+// --- COMUNIDADES, GRUPOS E CANAIS ---
 
 export const createGroup = async (req, res) => {
     const { sessionId, companyId, subject, participants } = req.body;
     try {
         const group = await createGroupService(sessionId, companyId, subject, participants);
         res.json({ success: true, group });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+    } catch (error) { res.status(500).json({ error: error.message }); }
 };
 
 export const updateGroup = async (req, res) => {
@@ -71,15 +66,20 @@ export const updateGroup = async (req, res) => {
         } else if (action === 'invite_code') {
             result = { code: await getInviteService(sessionId, groupId) };
         } else if (action === 'picture') {
-            // value aqui deve ser a URL da imagem
             result = await updatePictureService(sessionId, groupId, value);
         } else {
             result = await updateGroupService(sessionId, groupId, action, value);
         }
         res.json({ success: true, result });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+    } catch (error) { res.status(500).json({ error: error.message }); }
+};
+
+export const createCommunity = async (req, res) => {
+    const { sessionId, companyId, subject, description } = req.body;
+    try {
+        const community = await createCommunityService(sessionId, companyId, subject, description);
+        res.json({ success: true, community });
+    } catch (error) { res.status(500).json({ error: error.message }); }
 };
 
 export const createChannel = async (req, res) => {
@@ -87,9 +87,23 @@ export const createChannel = async (req, res) => {
     try {
         const channel = await createChannelService(sessionId, companyId, name, description);
         res.json({ success: true, channel });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+    } catch (error) { res.status(500).json({ error: error.message }); }
+};
+
+export const searchChannels = async (req, res) => {
+    const { sessionId, query } = req.body;
+    try {
+        const results = await searchChannelsService(sessionId, query);
+        res.json({ success: true, results });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+};
+
+export const followChannel = async (req, res) => {
+    const { sessionId, companyId, channelJid } = req.body;
+    try {
+        await followChannelService(sessionId, companyId, channelJid);
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ error: error.message }); }
 };
 
 export const deleteChannel = async (req, res) => {
@@ -97,13 +111,50 @@ export const deleteChannel = async (req, res) => {
     try {
         await deleteChannelService(sessionId, channelId);
         res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+    } catch (error) { res.status(500).json({ error: error.message }); }
 };
 
-// --- INTERATIVIDADE (Enquetes, Reações, Delete) ---
+// --- STATUS (STORIES) ---
 
+export const postStatus = async (req, res) => {
+    const { sessionId, type, content, options } = req.body; // type: 'text' | 'image' | 'video'
+    try {
+        if (type === 'text') {
+            await sendStatusText(sessionId, content, options?.color, options?.font);
+        } else {
+            await sendStatusMedia(sessionId, content, type, options?.caption);
+        }
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+};
+
+// --- PERFIL & SETTINGS ---
+
+export const updateProfile = async (req, res) => {
+    const { sessionId, action, value } = req.body; // action: 'name' | 'status' | 'picture'
+    try {
+        if (action === 'name') await updateProfileName(sessionId, value);
+        else if (action === 'status') await updateProfileStatus(sessionId, value);
+        else if (action === 'picture') await updateProfilePic(sessionId, value);
+        else throw new Error("Ação de perfil inválida");
+        
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+};
+
+// --- CATÁLOGO ---
+
+export const syncCatalog = async (req, res) => {
+    const { sessionId, companyId } = req.body;
+    try {
+        const result = await fetchCatalog(sessionId, companyId);
+        res.json({ success: true, result });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+};
+
+
+// --- INTERATIVIDADE (Polls, Reactions, Delete) ---
+// ... Mantido código existente de sendPollVote, sendReaction, deleteMessage, markChatAsRead, getSessionId
 export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, optionId) => {
     try {
         const session = sessions.get(sessionId);
@@ -147,8 +198,6 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         if (!cleanOptionText) {
             throw new Error("Opção de voto vazia ou inválida.");
         }
-
-        console.log(`🗳️ [VOTE] Votando em: "${cleanOptionText}" (Index: ${optionId})`);
 
         const chatJid = normalizeJid(remoteJid);
         
@@ -244,25 +293,14 @@ export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, ever
     }
 };
 
-// --- UX: CHECK AZUL & ONLINE (NOVO) ---
-
-/**
- * Executado quando o usuário abre o chat no Frontend.
- * 1. Assina o evento de presença (Online/Digitando).
- * 2. Envia Read Receipt (Check Azul) para mensagens não lidas.
- */
 export const markChatAsRead = async (sessionId, companyId, remoteJid) => {
     try {
         const session = sessions.get(sessionId);
         if (!session?.sock) return; 
         
         const jid = normalizeJid(remoteJid);
-
-        // 1. Inscreve para receber eventos "Online" e "Digitando..."
-        // O Baileys não envia isso por padrão para economizar banda.
         await session.sock.presenceSubscribe(jid);
 
-        // 2. Busca mensagens não lidas deste chat no banco
         const { data: unreadMsgs } = await supabase
             .from('messages')
             .select('whatsapp_id, from_me')
@@ -279,10 +317,8 @@ export const markChatAsRead = async (sessionId, companyId, remoteJid) => {
                 fromMe: false 
             }));
 
-            // Envia o recibo de leitura (Check Azul)
             await session.sock.readMessages(keys);
 
-            // Atualiza status no banco (Otimista)
             await supabase
                 .from('messages')
                 .update({ status: 'read', read_at: new Date() })
@@ -290,7 +326,6 @@ export const markChatAsRead = async (sessionId, companyId, remoteJid) => {
                 .eq('remote_jid', jid)
                 .in('whatsapp_id', unreadMsgs.map(m => m.whatsapp_id));
             
-            // Zera contador de não lidas do contato
             await supabase
                 .from('contacts')
                 .update({ unread_count: 0 })
@@ -300,7 +335,6 @@ export const markChatAsRead = async (sessionId, companyId, remoteJid) => {
 
         return { success: true };
     } catch (error) {
-        console.error(`[Controller] Erro ao marcar lido:`, error.message);
         return { success: false, error: error.message };
     }
 };
