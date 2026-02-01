@@ -11,7 +11,14 @@ export const fetchCatalog = async (sessionId, companyId) => {
     const session = sessions.get(sessionId);
     if (!session?.sock) throw new Error("Sessão desconectada.");
 
-    const myJid = normalizeJid(session.sock.user?.id);
+    // FIX: Remove o sufixo de dispositivo (ex: :24) para chamadas de catálogo
+    // O Baileys sock.user?.id pode vir como '551199999999@s.whatsapp.net:2'
+    const rawJid = session.sock.user?.id || '';
+    const myJid = rawJid.split(':')[0]; // Remove :2, :24, etc.
+
+    if (!myJid || !myJid.includes('@s.whatsapp.net')) {
+        throw new Error("JID da sessão inválido para catálogo.");
+    }
 
     try {
         // Busca produtos da própria conta
