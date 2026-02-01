@@ -112,6 +112,18 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             // Processa conversas sequencialmente para não matar o banco
             for (const jid of chatJids) {
                 chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0));
+                
+                // Pega a mensagem mais recente para atualizar o last_message_at do contato
+                const latestMsg = chats[jid][chats[jid].length - 1];
+                if (latestMsg && latestMsg.messageTimestamp) {
+                    const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
+                    // Atualiza o contato com a data REAL da mensagem, não Date.now()
+                    await supabase.from('contacts')
+                        .update({ last_message_at: ts })
+                        .eq('company_id', companyId)
+                        .eq('jid', jid);
+                }
+
                 const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT);
                 topMessages.reverse(); 
                 
