@@ -10,20 +10,16 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 // 1. Auth Flow
 export const connectDrive = async (req, res) => {
-    // FIX CRÍTICO: O companyId vem do body (enviado pelo frontend), validado pelo middleware.
-    // req.user não tem companyId na raiz.
     const { companyId } = req.body; 
 
     console.log(`🔌 [CLOUD] Iniciando conexão Drive para empresa: ${companyId}`);
 
     if (!companyId) {
-        console.error("❌ [CLOUD] Erro: CompanyID não fornecido no body da requisição.");
         return res.status(400).json({ error: "Company ID é obrigatório para conectar." });
     }
 
     try {
         const url = generateAuthUrl(companyId);
-        console.log(`🔗 [CLOUD] URL de Auth gerada (State incluso): ${url.substring(0, 50)}...`);
         res.json({ url });
     } catch (e) {
         console.error("❌ [CLOUD] Erro ao gerar URL:", e);
@@ -34,53 +30,35 @@ export const connectDrive = async (req, res) => {
 export const callbackDrive = async (req, res) => {
     const { code, state } = req.query; // state = companyId
     
-    // Logs de Diagnóstico para ver o que o Google mandou
-    console.log(`📥 [CLOUD] Callback recebido.`);
-    console.log(`   - Code: ${code ? 'Presente' : 'AUSENTE'}`);
-    console.log(`   - State (CompanyId): ${state ? state : 'AUSENTE'}`);
-
     try {
         if (!code || !state) {
-            throw new Error(`Parâmetros inválidos do Google. Code: ${!!code}, State: ${!!state}`);
+            throw new Error(`Parâmetros inválidos do Google.`);
         }
         
         console.log(`🔑 [GOOGLE] Processando troca de token para empresa: ${state}`);
         const userInfo = await handleAuthCallback(code, state);
         
-        // Lógica Inteligente de Redirecionamento
+        // Dispara um sync inicial em background para popular o cache
+        syncDriveFiles(state).catch(err => console.error("Initial Sync Error:", err));
+
+        // Lógica de Redirecionamento
         const host = req.get('host');
         let frontendBaseUrl;
 
-        // Detecta se está rodando localmente ou em produção
         if (host.includes('localhost') || host.includes('127.0.0.1')) {
             frontendBaseUrl = 'http://localhost:3000';
         } else {
-            // Tenta pegar do env, senão usa o hardcoded do Netlify
             frontendBaseUrl = process.env.FRONTEND_URL || 'https://wancora-crm.netlify.app';
         }
 
         if (frontendBaseUrl.endsWith('/')) frontendBaseUrl = frontendBaseUrl.slice(0, -1);
         
         const redirectUrl = `${frontendBaseUrl}/cloud?google=success&email=${encodeURIComponent(userInfo.email)}`;
-        console.log(`➡️ [GOOGLE] Redirecionando usuário para: ${redirectUrl}`);
-        
         res.redirect(redirectUrl);
 
     } catch (e) {
         console.error("❌ [GOOGLE] Erro Fatal no Callback:", e);
-        res.status(500).send(`
-            <div style="font-family: sans-serif; text-align: center; padding: 50px;">
-                <h1 style="color: #ef4444;">Falha na Autenticação</h1>
-                <p>Ocorreu um erro técnico ao processar o retorno do Google.</p>
-                <div style="background: #f4f4f5; padding: 15px; border-radius: 8px; display: inline-block; margin: 20px 0; text-align: left; max-width: 80%;">
-                    <strong>Erro Técnico:</strong><br/>
-                    <code style="color: #c026d3;">${e.message}</code>
-                </div>
-                <br/>
-                <p style="font-size: 12px; color: #666;">Dica: Tente conectar novamente clicando no botão do painel.</p>
-                <a href="/" style="color: #3b82f6; text-decoration: none; font-weight: bold; margin-top: 20px; display: inline-block;">Voltar para Home</a>
-            </div>
-        `);
+        res.status(500).send(`Erro na autenticação: ${e.message}`);
     }
 };
 
@@ -90,17 +68,26 @@ export const listFiles = async (req, res) => {
     const { folderId } = req.query;
 
     try {
-        // Primeiro tenta buscar do cache rápido
+        // Tenta buscar do cache
         let query = supabase.from('drive_cache').select('*').eq('company_id', companyId);
         if (folderId) query = query.eq('parent_id', folderId);
         else query = query.is('parent_id', null); // Root
 
-        const { data: cached } = await query;
+        let { data: cached } = await query;
 
-        // Dispara sync em background (Fire and Forget) para atualizar cache
-        syncDriveFiles(companyId, folderId).catch(err => console.error("Background Sync Error:", err.message));
+        // FIX: Se o cache estiver vazio (Cold Start), força o sync AGORA antes de responder
+        if ((!cached || cached.length === 0) && !folderId) {
+            console.log("📭 [CLOUD] Cache vazio. Forçando sincronização...");
+            await syncDriveFiles(companyId, folderId);
+            // Re-busca após sync
+            const { data: refreshed } = await supabase.from('drive_cache').select('*').eq('company_id', companyId).is('parent_id', null);
+            cached = refreshed;
+        } else {
+            // Se já tem dados, faz sync em background (Stale-while-revalidate)
+            syncDriveFiles(companyId, folderId).catch(err => console.error("Background Sync Error:", err.message));
+        }
 
-        res.json({ files: cached, source: 'cache_with_background_sync' });
+        res.json({ files: cached || [], source: 'hybrid' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -116,7 +103,25 @@ export const syncNow = async (req, res) => {
     }
 };
 
-// 3. Send to WhatsApp (The Magic)
+// [NOVO] Upload via Base64 (Simples e compatível com estrutura atual)
+export const uploadFileToDrive = async (req, res) => {
+    const { companyId, name, mimeType, base64, folderId } = req.body;
+
+    if (!companyId || !name || !base64) {
+        return res.status(400).json({ error: "Dados incompletos para upload." });
+    }
+
+    try {
+        const buffer = Buffer.from(base64, 'base64');
+        const fileData = await uploadFile(companyId, buffer, name, mimeType || 'application/octet-stream', folderId);
+        res.json({ success: true, file: fileData });
+    } catch (e) {
+        console.error("Erro Upload Drive:", e);
+        res.status(500).json({ error: e.message });
+    }
+};
+
+// 3. Send to WhatsApp
 export const sendFileToContact = async (req, res) => {
     const { companyId, fileId, to, caption } = req.body;
 
@@ -129,20 +134,17 @@ export const sendFileToContact = async (req, res) => {
         // Obtém Stream do Google
         const { stream, fileName, mimeType } = await getFileStream(companyId, fileId);
 
-        // Converte Stream para Buffer (Baileys precisa de buffer ou url publica)
         const chunks = [];
         for await (const chunk of stream) {
             chunks.push(chunk);
         }
         const buffer = Buffer.concat(chunks);
 
-        // Determina tipo de mensagem
         let type = 'document';
         if (mimeType.startsWith('image/')) type = 'image';
         else if (mimeType.startsWith('video/')) type = 'video';
         else if (mimeType.startsWith('audio/')) type = 'audio';
 
-        // Prepara payload
         const payload = {
             sessionId,
             to,
@@ -153,7 +155,6 @@ export const sendFileToContact = async (req, res) => {
             mimetype: mimeType,
         };
 
-        // Upload para Supabase Storage para gerar URL pública rápida para o Baileys
         const tempName = `temp_${Date.now()}_${fileName}`;
         await supabase.storage.from('chat-media').upload(`${companyId}/${tempName}`, buffer, { contentType: mimeType });
         const { data: publicData } = supabase.storage.from('chat-media').getPublicUrl(`${companyId}/${tempName}`);
