@@ -1,7 +1,7 @@
 
 {
   "name": "wancora-backend-service",
-  "version": "5.2.0",
+  "version": "5.3.0",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -31,6 +31,7 @@
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "fluent-ffmpeg": "^2.1.2",
+    "googleapis": "^144.0.0",
     "helmet": "^8.0.0",
     "ioredis": "^5.4.2",
     "mime-types": "^2.1.35",
