@@ -38,13 +38,45 @@ const fetchAudioAsBase64 = async (url) => {
     }
 };
 
+/**
+ * TOOLS DEFINITION: Ferramentas que a IA pode usar
+ */
+const TOOLS = [
+    {
+        name: "search_files",
+        description: "Busca arquivos no Google Drive da empresa pelo nome. Use isso quando o usuário pedir documentos, fotos, catálogos ou preços.",
+        parameters: {
+            type: "OBJECT",
+            properties: {
+                query: {
+                    type: "STRING",
+                    description: "Termo de busca (ex: 'catálogo', 'preços', 'foto da loja')"
+                }
+            },
+            required: ["query"]
+        }
+    },
+    {
+        name: "send_file",
+        description: "Envia um arquivo específico para o usuário. Use após encontrar o arquivo correto com search_files.",
+        parameters: {
+            type: "OBJECT",
+            properties: {
+                google_id: {
+                    type: "STRING",
+                    description: "O ID do arquivo (google_id) retornado pela busca."
+                }
+            },
+            required: ["google_id"]
+        }
+    }
+];
+
 const processAIResponse = async (payload) => {
     const { id, content, remote_jid, company_id, from_me, message_type, media_url, created_at } = payload.new;
 
-    // 1. Filtros de Segurança Básicos
     if (from_me) return; 
     
-    // Aceita texto e áudio agora
     const isText = message_type === 'text';
     const isAudio = message_type === 'audio' || message_type === 'ptt' || message_type === 'voice';
     
@@ -52,13 +84,10 @@ const processAIResponse = async (payload) => {
     if (isText && !content) return;
     if (isAudio && !media_url) return;
 
-    // 🔴 HORIZONTE DE EVENTOS (CRÍTICO)
-    // Ignora mensagens antigas (> 2 minutos) que entraram via Sync de Histórico
+    // Horizonte de Eventos
     const msgTime = new Date(created_at).getTime();
     const now = Date.now();
-    if (now - msgTime > 2 * 60 * 1000) {
-        return;
-    }
+    if (now - msgTime > 2 * 60 * 1000) return;
 
     // Debounce
     const lockKey = `${remote_jid}-${id}`;
@@ -66,7 +95,7 @@ const processAIResponse = async (payload) => {
     processingLock.add(lockKey);
     setTimeout(() => processingLock.delete(lockKey), 10000); 
 
-    // 2. Verificar se o Lead existe e tem Bot Ativo
+    // Verificações de Lead e Bot Status
     const phone = remote_jid.split('@')[0];
     const { data: lead } = await supabase
         .from('leads')
@@ -77,7 +106,6 @@ const processAIResponse = async (payload) => {
 
     if (!lead || lead.bot_status !== 'active') return;
 
-    // 3. Buscar Configuração do Agente e Empresa
     const [agentRes, companyRes] = await Promise.all([
         supabase.from('agents').select('*').eq('company_id', company_id).eq('is_active', true).maybeSingle(),
         supabase.from('companies').select('ai_config').eq('id', company_id).single()
@@ -88,133 +116,186 @@ const processAIResponse = async (payload) => {
 
     if (!agent) return; 
 
-    // 🔴 AUTO-HANDOFF CHECK (Text Only)
+    // Auto-Handoff Check
     if (isText) {
         const stopWords = agent.stop_words || ['falar com humano', 'atendente', 'humano', 'suporte'];
         const lowerContent = content.toLowerCase();
-        const shouldStop = stopWords.some(word => lowerContent.includes(word.toLowerCase()));
-
-        if (shouldStop) {
-            console.log(`🛑 [SENTINEL] Handoff detectado para ${lead.name}. Pausando robô.`);
+        if (stopWords.some(word => lowerContent.includes(word.toLowerCase()))) {
+            console.log(`🛑 [SENTINEL] Handoff detectado.`);
             await supabase.from('leads').update({ bot_status: 'paused' }).eq('id', lead.id);
             const sessionId = await getSessionId(company_id);
-            if (sessionId) {
-                await sendMessage({
-                    sessionId,
-                    to: remote_jid,
-                    type: 'text',
-                    content: "Entendido. Vou transferir você para um de nossos especialistas. Um momento."
-                });
-            }
+            if (sessionId) await sendMessage({ sessionId, to: remote_jid, type: 'text', content: "Transferindo para um humano..." });
             return; 
         }
     }
 
     try {
-        console.log(`🤖 [SENTINEL] IA Acionada para ${lead.name} (${message_type})...`);
-
         let activeApiKey = companyConfig?.apiKey || process.env.API_KEY;
-        // Se for áudio, força um modelo que suporte multimodal se o configurado for apenas texto (opcional, Gemini 3 Flash suporta ambos)
         let activeModel = companyConfig?.model || agent.model || 'gemini-3-flash-preview';
 
-        if (!activeApiKey) {
-            console.error("❌ [SENTINEL] Erro: Nenhuma API Key encontrada.");
-            return;
-        }
+        if (!activeApiKey) return;
 
         const ai = getAIClient(activeApiKey);
 
-        // 4. Carregar Contexto (Histórico Recente)
+        // Carregar Contexto
         const { data: history } = await supabase
             .from('messages')
             .select('content, from_me, message_type')
             .eq('company_id', company_id)
             .eq('remote_jid', remote_jid)
-            .neq('id', id) // Exclui a atual para não duplicar no contexto
+            .neq('id', id)
             .order('created_at', { ascending: false })
             .limit(10); 
 
         const chatHistory = (history || []).reverse().map(m => ({
             role: m.from_me ? 'model' : 'user',
-            parts: [{ text: m.message_type === 'text' ? (m.content || "") : "[Áudio/Mídia]" }]
+            parts: [{ text: m.message_type === 'text' ? (m.content || "") : "[Arquivo]" }]
         }));
 
-        // 5. Preparar Input Atual (Texto ou Áudio)
         const currentParts = [];
         if (isAudio) {
             const audioBase64 = await fetchAudioAsBase64(media_url);
             if (audioBase64) {
-                currentParts.push({
-                    inlineData: {
-                        mimeType: "audio/mp3", // Gemini aceita MP3/WAV/AAC. O backend converte PTT para MP4/OGG, mas mime genérico audio/* costuma passar
-                        data: audioBase64
-                    }
-                });
-                // Instrução implícita para o modelo entender que recebeu um áudio
-                currentParts.push({ text: "O usuário enviou este áudio. Ouça e responda em texto." });
-            } else {
-                return; // Falha no download
-            }
+                currentParts.push({ inlineData: { mimeType: "audio/mp3", data: audioBase64 } });
+                currentParts.push({ text: "O usuário enviou este áudio." });
+            } else return;
         } else {
             currentParts.push({ text: content });
         }
 
         const fullContents = [...chatHistory, { role: 'user', parts: currentParts }];
 
-        // 6. System Prompt
         const systemInstruction = `
         ${agent.prompt_instruction}
         
-        INFORMAÇÕES DO CLIENTE ATUAL:
-        Nome: ${lead.name}
-        Telefone: ${lead.phone}
+        CLIENTE: ${lead.name} (${lead.phone})
         
         BASE DE CONHECIMENTO:
         ${agent.knowledge_base}
         
         DIRETRIZES:
-        - Você é capaz de ouvir áudios e deve transcrevê-los mentalmente para entender o contexto.
-        - Responda SEMPRE em texto.
-        - Mantenha o tom natural de WhatsApp.
-        - Se não souber ou não entender o áudio, sugira falar com um humano.
+        - Responda em texto curto e natural.
+        - Se o usuário pedir um arquivo (catálogo, foto, pdf), USE A FERRAMENTA search_files.
+        - Se encontrar o arquivo, USE A FERRAMENTA send_file para enviá-lo.
+        - NÃO envie links do Google Drive, use a ferramenta send_file para envio nativo.
         `;
 
-        // 7. Generate
-        const response = await ai.models.generateContent({
+        // ---------------------------------------------------------
+        // GEMINI TOOL USE LOOP
+        // ---------------------------------------------------------
+        
+        // Configuração com Tools
+        const toolConfig = { 
+            tools: [{ functionDeclarations: TOOLS }]
+        };
+
+        // 1. Primeira Chamada
+        let response = await ai.models.generateContent({
             model: activeModel,
             contents: fullContents,
             config: {
                 systemInstruction: systemInstruction,
-                maxOutputTokens: 400, 
-                temperature: 0.7 
+                temperature: 0.7,
+                ...toolConfig
             }
         });
 
-        const replyText = response.text;
+        // Loop de processamento de Tools (Multi-Turn)
+        let toolResponse = response;
+        let functionCalls = toolResponse.functionCalls;
 
-        if (replyText) {
+        while (functionCalls && functionCalls.length > 0) {
+            const parts = [];
+
+            for (const call of functionCalls) {
+                console.log(`🔧 [AI TOOL] Chamando: ${call.name} args:`, call.args);
+                let result = {};
+
+                // --- EXECUÇÃO DAS TOOLS ---
+                if (call.name === 'search_files') {
+                    const query = call.args.query;
+                    // Chama RPC do Supabase
+                    const { data: files } = await supabase.rpc('search_drive_files', { 
+                        p_company_id: company_id, 
+                        p_query: query,
+                        p_limit: 5 
+                    });
+                    
+                    if (files && files.length > 0) {
+                        result = { found: true, files: files.map(f => ({ google_id: f.google_id, name: f.name, type: f.mime_type })) };
+                    } else {
+                        result = { found: false, message: "Nenhum arquivo encontrado com esse nome." };
+                    }
+                } 
+                else if (call.name === 'send_file') {
+                    const googleId = call.args.google_id;
+                    const sessionId = await getSessionId(company_id);
+                    if (sessionId) {
+                        // Dispara envio Assíncrono via Sender (Não bloqueia a IA)
+                        // O Sender agora sabe lidar com driveFileId
+                        sendMessage({
+                            sessionId,
+                            to: remote_jid,
+                            driveFileId: googleId, // ID Real do Google
+                            companyId
+                        }).catch(err => console.error("Erro ao enviar arquivo via IA:", err));
+                        
+                        result = { success: true, message: "Arquivo enviado para o chat." };
+                    } else {
+                        result = { success: false, message: "WhatsApp desconectado." };
+                    }
+                }
+
+                // Adiciona resposta da função ao histórico da conversa para a próxima volta
+                parts.push({
+                    functionResponse: {
+                        name: call.name,
+                        response: { result: result }
+                    }
+                });
+            }
+
+            // Adiciona a resposta da função ao contexto
+            fullContents.push({ role: "model", parts: toolResponse.candidates[0].content.parts }); // O que a IA pediu
+            fullContents.push({ role: "function", parts: parts }); // O que respondemos
+
+            // 2. Chamada Subsequente (Com o resultado da função)
+            toolResponse = await ai.models.generateContent({
+                model: activeModel,
+                contents: fullContents,
+                config: {
+                    systemInstruction: systemInstruction,
+                    temperature: 0.7,
+                    ...toolConfig
+                }
+            });
+            
+            // Verifica se a IA quer chamar mais funções
+            functionCalls = toolResponse.functionCalls;
+        }
+
+        // Resposta Final (Texto)
+        const finalReply = toolResponse.text;
+        
+        if (finalReply) {
             const sessionId = await getSessionId(company_id);
             if (sessionId) {
-                await new Promise(r => setTimeout(r, isAudio ? 4000 : 2000)); // Delay maior para áudio (simular 'ouvindo')
-                
                 await sendMessage({
                     sessionId,
                     to: remote_jid,
                     type: 'text',
-                    content: replyText
+                    content: finalReply
                 });
-                console.log(`✅ [SENTINEL] Resposta enviada para ${lead.name}.`);
             }
         }
 
     } catch (error) {
-        console.error("❌ [SENTINEL] Erro IA:", error.message);
+        console.error("❌ [SENTINEL] Erro IA:", error);
     }
 };
 
 export const startSentinel = () => {
-    console.log("🛡️ [SENTINEL] Agente de IA iniciado (Multimodal Ready).");
-    
+    console.log("🛡️ [SENTINEL] Agente de IA iniciado (Tools Enabled).");
     supabase
         .channel('ai-sentinel-global')
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
