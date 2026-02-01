@@ -4,7 +4,7 @@ import { upsertMessage, ensureLeadExists, updateInstanceStatus } from '../../crm
 import { handleMediaUpload } from './mediaHandler.js';
 import { refreshContactInfo } from './contactHandler.js'; 
 import { dispatchWebhook } from '../../integrations/webhook.js';
-import { transcribeAudio } from '../../ai/transcriber.js'; // NOVO IMPORT
+import { transcribeAudio } from '../../ai/transcriber.js'; 
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
 
@@ -17,7 +17,8 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const { downloadMedia = true, fetchProfilePic = false, createLead = false } = options;
 
         if (!msg.message) return;
-        if (msg.key.remoteJid === 'status@broadcast') return;
+        // BLOQUEIO TOTAL DE STATUS (STORIES) E NEWSLETTERS
+        if (msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid.includes('@newsletter')) return;
 
         const unwrapped = unwrapMessage(msg);
         let jid = normalizeJid(unwrapped.key.remoteJid);
@@ -57,19 +58,14 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             mediaUrl = await handleMediaUpload(unwrapped, companyId);
         }
 
-        // ----------------------------------------------------
-        // LOGICA DE TRANSCRIÇÃO (AUDIO RECEBIDO)
-        // ----------------------------------------------------
+        // Transcrição de Áudio
         let transcription = null;
         if (isRealtime && mediaUrl && type === 'audioMessage') {
-             // Baixa o áudio para transcrever (Buffer)
              try {
                  const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
                  const buffer = Buffer.from(response.data);
-                 // Fire and Forget (Promise)
                  transcribeAudio(buffer, 'audio/ogg', companyId).then(async (text) => {
                      if (text) {
-                         // Atualiza mensagem no banco com a transcrição
                          await supabase.from('messages')
                              .update({ transcription: text })
                              .eq('whatsapp_id', unwrapped.key.id)
@@ -80,7 +76,6 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
                  console.error("[HANDLER] Erro ao baixar audio para transcrição:", err.message);
              }
         }
-        // ----------------------------------------------------
 
         // Payload
         const messageData = {
@@ -95,7 +90,6 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             status: fromMe ? 'sent' : 'delivered',
             created_at: new Date( (unwrapped.messageTimestamp || Date.now() / 1000) * 1000 ),
             lead_id: leadId
-            // transcription: será atualizado via update acima
         };
 
         // Parsers Especiais
@@ -135,7 +129,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 };
 
 export const handleMessageUpdate = async (updates, companyId) => {
-    // ... mantido igual (Poll Logic)
+    // Lógica de Polls mantida
     for (const update of updates) {
         if (update.pollUpdates) {
             for (const pollUpdate of update.pollUpdates) {
