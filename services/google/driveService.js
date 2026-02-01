@@ -114,3 +114,38 @@ export const getFileStream = async (companyId, fileId) => {
         size: meta.data.size
     };
 };
+
+/**
+ * [NOVO] Baixa arquivo completo para Buffer (Para envio nativo no WhatsApp)
+ * Cuidado com arquivos grandes. Use getFileStream se possível, mas Baileys prefere buffer para Thumbnails.
+ */
+export const getFileBuffer = async (companyId, fileId) => {
+    const auth = await getAuthenticatedClient(companyId);
+    const drive = google.drive({ version: 'v3', auth });
+
+    const meta = await drive.files.get({ fileId, fields: 'name, mimeType, size, webViewLink' });
+    const size = parseInt(meta.data.size || '0');
+
+    // Limite de segurança (40MB para buffer RAM). Acima disso, retorna apenas o link.
+    if (size > 40 * 1024 * 1024) {
+        return {
+            isLargeFile: true,
+            link: meta.data.webViewLink,
+            fileName: meta.data.name,
+            mimeType: meta.data.mimeType
+        };
+    }
+
+    const res = await drive.files.get(
+        { fileId, alt: 'media' },
+        { responseType: 'arraybuffer' }
+    );
+
+    return {
+        isLargeFile: false,
+        buffer: Buffer.from(res.data),
+        fileName: meta.data.name,
+        mimeType: meta.data.mimeType,
+        size: size
+    };
+};
