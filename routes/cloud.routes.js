@@ -5,12 +5,21 @@ import { requireAuth } from "../middleware/auth.js";
 
 const router = express.Router();
 
-// --- ZONA PÚBLICA (CRÍTICO) ---
-// O Google redireciona para cá sem Headers de Auth. Deve vir ANTES do requireAuth.
-router.get("/google/callback", callbackDrive);
+// ==============================================================================
+// 🔓 ZONA PÚBLICA (CRÍTICO: NÃO MOVER)
+// O Google redireciona o navegador para cá. Navegadores NÃO enviam token JWT no Header.
+// Esta rota DEVE ficar antes de router.use(requireAuth).
+// ==============================================================================
+router.get("/google/callback", (req, res, next) => {
+    console.log("🔗 [CLOUD] Callback do Google recebido. Processando...");
+    next();
+}, callbackDrive);
 
-// --- ZONA PROTEGIDA ---
-// Tudo abaixo desta linha exige Token JWT
+
+// ==============================================================================
+// 🔒 ZONA PROTEGIDA (REQUER LOGIN)
+// Tudo abaixo desta linha exige Header 'Authorization: Bearer ...'
+// ==============================================================================
 router.use(requireAuth);
 
 router.post("/google/connect", connectDrive);
