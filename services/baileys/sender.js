@@ -4,6 +4,7 @@ import { delay, generateWAMessageFromContent, proto } from '@whiskeysockets/bail
 import { normalizeJid } from '../../utils/wppParsers.js';
 import { convertAudioToOpus } from '../../utils/audioConverter.js';
 import { transcribeAudio } from '../../services/ai/transcriber.js';
+import { getFileBuffer } from '../../services/google/driveService.js';
 import { createClient } from "@supabase/supabase-js";
 import sharp from 'sharp';
 import axios from 'axios';
@@ -57,6 +58,7 @@ export const sendMessage = async ({
     contact,
     product,
     card,
+    driveFileId, // [NOVO] ID do arquivo na tabela drive_cache (ou Google ID)
     companyId 
 }) => {
     const session = sessions.get(sessionId);
@@ -66,6 +68,53 @@ export const sendMessage = async ({
     const jid = normalizeJid(to);
 
     try {
+        // [NOVO] Lógica de Drive Streaming
+        // Se vier um driveFileId, baixamos o arquivo e sobrescrevemos os parâmetros de envio
+        if (driveFileId && companyId) {
+            console.log(`☁️ [SENDER] Buscando arquivo do Drive: ${driveFileId}`);
+            try {
+                // Busca ID real do Google se for UUID do Supabase
+                let realGoogleId = driveFileId;
+                if (driveFileId.length === 36) { // UUID check simples
+                     const { data: fileData } = await supabase.from('drive_cache').select('google_id').eq('id', driveFileId).single();
+                     if (fileData) realGoogleId = fileData.google_id;
+                }
+
+                const driveData = await getFileBuffer(companyId, realGoogleId);
+                
+                if (driveData.isLargeFile) {
+                    // Fallback para Link se for muito grande
+                    type = 'text';
+                    content = `📁 *Arquivo Grande (${Math.round(driveData.size / 1024 / 1024)}MB)*\n\nO arquivo solicitada é muito grande para enviar por aqui. Acesse pelo link:\n${driveData.link}`;
+                } else {
+                    // Modo Streaming Nativo
+                    const mime = driveData.mimeType;
+                    fileName = driveData.fileName;
+                    mimetype = mime;
+                    
+                    // Mapeia MIME do Drive para Tipo do Baileys
+                    if (mime.startsWith('image/')) {
+                        type = 'image';
+                        url = driveData.buffer; // Baileys aceita Buffer no campo 'url' ou 'image'
+                    } else if (mime.startsWith('video/')) {
+                        type = 'video';
+                        url = driveData.buffer;
+                    } else if (mime.startsWith('audio/')) {
+                        type = 'audio';
+                        url = driveData.buffer;
+                        ptt = false; // Áudio de arquivo, não PTT
+                    } else {
+                        type = 'document';
+                        url = driveData.buffer;
+                    }
+                }
+            } catch (driveErr) {
+                console.error("❌ [SENDER] Falha ao baixar do Drive:", driveErr);
+                await sock.sendMessage(jid, { text: "⚠️ Desculpe, não consegui baixar o arquivo solicitado do Drive." });
+                return;
+            }
+        }
+
         // Pausa Inicial Humanizada
         await delay(randomDelay(500, 1000));
         
@@ -77,11 +126,15 @@ export const sendMessage = async ({
         else if (type === 'audio' || ptt) productionTime = randomDelay(2000, 4000);
         else if (type === 'sticker') productionTime = 1500;
         else if (type === 'card') productionTime = 2000;
+        else if (driveFileId) productionTime = 2500; // Tempo de "upload" fake
 
         await delay(productionTime);
         await sock.sendPresenceUpdate('paused', jid);
 
         let sentMsg;
+        
+        // Ajuste: Baileys aceita Buffer diretamente nas chaves (image, video, document)
+        // Se 'url' for um Buffer, o Baileys lida corretamente.
 
         switch (type) {
             case 'text':
@@ -91,15 +144,15 @@ export const sendMessage = async ({
                 break;
 
             case 'image':
-                sentMsg = await sock.sendMessage(jid, { image: { url }, caption: caption });
+                sentMsg = await sock.sendMessage(jid, { image: url, caption: caption });
                 break;
 
             case 'video':
-                sentMsg = await sock.sendMessage(jid, { video: { url }, caption: caption, gifPlayback: false });
+                sentMsg = await sock.sendMessage(jid, { video: url, caption: caption, gifPlayback: false });
                 break;
 
             case 'audio':
-                if (ptt) {
+                if (ptt && typeof url === 'string') { // Só converte se for URL, se for Buffer (Drive) assume que já é audio
                     try {
                         const { buffer, waveform, duration } = await convertAudioToOpus(url);
                         
@@ -122,20 +175,21 @@ export const sendMessage = async ({
                         sentMsg = await sock.sendMessage(jid, { audio: { url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
                     }
                 } else {
-                    sentMsg = await sock.sendMessage(jid, { audio: { url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
+                    // Áudio genérico (Buffer ou URL)
+                    sentMsg = await sock.sendMessage(jid, { audio: url, ptt: false, mimetype: mimetype || 'audio/mp4' });
                 }
                 break;
 
             case 'document':
-                sentMsg = await sock.sendMessage(jid, { document: { url }, mimetype: mimetype || 'application/pdf', fileName: fileName || 'documento', caption: caption });
+                sentMsg = await sock.sendMessage(jid, { document: url, mimetype: mimetype || 'application/pdf', fileName: fileName || 'documento', caption: caption });
                 break;
 
             case 'sticker':
                 try {
-                    const stickerBuffer = await convertToSticker(url);
+                    const stickerBuffer = typeof url === 'string' ? await convertToSticker(url) : url; // Se já vier buffer? Sharp lida.
                     sentMsg = await sock.sendMessage(jid, { sticker: stickerBuffer });
                 } catch (stickerErr) {
-                    sentMsg = await sock.sendMessage(jid, { sticker: { url } });
+                    sentMsg = await sock.sendMessage(jid, { sticker: url });
                 }
                 break;
 
