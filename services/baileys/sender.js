@@ -19,11 +19,27 @@ const convertToSticker = async (url) => {
     const response = await axios.get(url, { responseType: 'arraybuffer' });
     const buffer = Buffer.from(response.data);
 
-    // Usa Sharp para redimensionar e converter
     return await sharp(buffer)
-        .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }) // Fundo transparente
+        .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }) 
         .toFormat('webp')
         .toBuffer();
+};
+
+// Helper para gerar Thumbnail JPEG (Pequena) para Rich Link
+const generateThumbnail = async (url) => {
+    try {
+        const response = await axios.get(url, { responseType: 'arraybuffer' });
+        const buffer = Buffer.from(response.data);
+        
+        // WhatsApp exige thumbnail pequena e leve (< 10KB idealmente)
+        return await sharp(buffer)
+            .resize(300, 157, { fit: 'cover' }) // Proporção aproximada de link preview
+            .jpeg({ quality: 60 })
+            .toBuffer();
+    } catch (e) {
+        console.error("[SENDER] Falha ao gerar thumbnail:", e.message);
+        return null;
+    }
 };
 
 export const sendMessage = async ({
@@ -40,6 +56,7 @@ export const sendMessage = async ({
     location,
     contact,
     product,
+    card,
     companyId 
 }) => {
     const session = sessions.get(sessionId);
@@ -59,6 +76,7 @@ export const sendMessage = async ({
         if (type === 'text' && content) productionTime = Math.min(content.length * 50, 5000);
         else if (type === 'audio' || ptt) productionTime = randomDelay(2000, 4000);
         else if (type === 'sticker') productionTime = 1500;
+        else if (type === 'card') productionTime = 2000;
 
         await delay(productionTime);
         await sock.sendPresenceUpdate('paused', jid);
@@ -67,10 +85,8 @@ export const sendMessage = async ({
 
         switch (type) {
             case 'text':
-                // Envia como extendedTextMessage para garantir preview de link
                 sentMsg = await sock.sendMessage(jid, { 
                     text: content || "",
-                    // O Baileys gerencia o linkPreview automaticamente se configurado na conexão
                 });
                 break;
 
@@ -116,12 +132,9 @@ export const sendMessage = async ({
 
             case 'sticker':
                 try {
-                    // Converte a imagem (JPG/PNG) para WebP 512x512 antes de enviar
                     const stickerBuffer = await convertToSticker(url);
                     sentMsg = await sock.sendMessage(jid, { sticker: stickerBuffer });
                 } catch (stickerErr) {
-                    console.error("Erro ao converter sticker:", stickerErr);
-                    // Fallback tenta enviar a URL direto (se já for webp)
                     sentMsg = await sock.sendMessage(jid, { sticker: { url } });
                 }
                 break;
@@ -147,28 +160,44 @@ export const sendMessage = async ({
 
             case 'product':
                 if (!product || !product.productId) throw new Error("Produto inválido.");
-                
-                // Construção de Product Message Nativa
-                // O productMessage deve ser enviado dentro de um template ou directly dependendo da versão
-                // A forma mais segura hoje é via relayMessage ou construction simples se a lib suportar
-                
-                // Vamos tentar enviar como mensagem de produto padrão
-                // Nota: O productMessage requer que o produto exista no catálogo do userJid (owner)
-                
-                // Método simples suportado pelo Baileys
                 sentMsg = await sock.sendMessage(jid, { 
                     product: {
-                        productImage: product.productImageCount ? { url: url || '' } : undefined, // Se tiver imagem, tenta usar a url passada
+                        productImage: product.productImageCount ? { url: url || '' } : undefined,
                         productId: product.productId,
                         title: product.title || 'Produto',
                         description: product.description,
                         currencyCode: product.currencyCode || 'BRL',
                         priceAmount1000: product.priceAmount1000 || 0,
                         retailerId: "WhatsApp",
-                        url: "", // Opcional
+                        url: "", 
                         productImageCount: 1 
                     },
-                    businessOwnerJid: sock.user.id // Obrigatório ser o dono da sessão
+                    businessOwnerJid: sock.user.id 
+                });
+                break;
+
+            case 'card':
+                if (!card || !card.link) throw new Error("Card precisa de um link.");
+                
+                let thumbBuffer = undefined;
+                if (card.thumbnailUrl) {
+                    thumbBuffer = await generateThumbnail(card.thumbnailUrl);
+                }
+
+                // Rich Link Construction (O "Card" Seguro)
+                sentMsg = await sock.sendMessage(jid, {
+                    text: card.description ? `${card.title}\n\n${card.description}` : card.title,
+                    contextInfo: {
+                        externalAdReply: {
+                            title: card.title,
+                            body: card.description || "Clique para abrir",
+                            thumbnail: thumbBuffer, // Buffer da imagem
+                            sourceUrl: card.link,
+                            mediaType: 1, // 1 = Imagem (Thumbnail), 2 = Vídeo
+                            renderLargerThumbnail: true, // Força o card grande
+                            showAdAttribution: true // Mostra etiqueta "Link" ou similar, opcional
+                        }
+                    }
                 });
                 break;
 
