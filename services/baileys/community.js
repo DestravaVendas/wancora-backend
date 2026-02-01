@@ -1,6 +1,6 @@
 
 import { sessions } from './connection.js';
-import { normalizeJid, upsertContact } from '../crm/sync.js';
+import { normalizeJid, upsertContact, upsertMessage } from '../crm/sync.js';
 import axios from 'axios';
 
 // --- COMUNIDADES & GRUPOS ---
@@ -20,8 +20,23 @@ export const createCommunity = async (sessionId, companyId, subject, description
         await session.sock.groupUpdateDescription(group.id, description);
     }
 
-    // Salva no banco marcando como comunidade
+    // 1. Salva no banco marcando como comunidade
     await upsertContact(group.id, companyId, subject, null, true, null, false, null, { is_community: true });
+
+    // 2. INJEÇÃO DE MENSAGEM DE SISTEMA (CRÍTICO)
+    // A RPC get_my_chat_list filtra contatos que não tem mensagens.
+    // Inserimos uma mensagem "fake" para garantir que a comunidade apareça na lista.
+    await upsertMessage({
+        company_id: companyId,
+        session_id: sessionId,
+        remote_jid: group.id,
+        whatsapp_id: `sys-comm-${Date.now()}`,
+        from_me: true,
+        content: `Comunidade "${subject}" criada.`,
+        message_type: 'protocol', // Tipo especial para não quebrar UI
+        status: 'read',
+        created_at: new Date()
+    });
 
     return group;
 };
@@ -34,6 +49,20 @@ export const createGroup = async (sessionId, companyId, subject, participants) =
     const group = await session.sock.groupCreate(subject, pJids);
     
     await upsertContact(group.id, companyId, subject, null, true);
+
+    // Injeta mensagem de sistema para grupo também
+    await upsertMessage({
+        company_id: companyId,
+        session_id: sessionId,
+        remote_jid: group.id,
+        whatsapp_id: `sys-group-${Date.now()}`,
+        from_me: true,
+        content: `Grupo "${subject}" criado.`,
+        message_type: 'protocol',
+        status: 'read',
+        created_at: new Date()
+    });
+
     return group;
 };
 
