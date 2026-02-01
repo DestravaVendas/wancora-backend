@@ -1,9 +1,9 @@
 
 import express from "express";
 import { 
-    createGroup, updateGroup, createChannel, deleteChannel,
-    createCommunity, searchChannels, followChannel,
-    postStatus, updateProfile, syncCatalog
+    createGroup, updateGroup, 
+    createCommunity, 
+    syncCatalog
 } from "../controllers/whatsappController.js";
 import { requireAuth } from "../middleware/auth.js";
 
@@ -15,22 +15,10 @@ router.use(requireAuth);
 router.post("/group/create", createGroup);
 router.post("/group/update", updateGroup); 
 
-// Comunidades (Novo)
+// Comunidades
 router.post("/community/create", createCommunity);
 
-// Canais (Novo)
-router.post("/channel/create", createChannel);
-router.post("/channel/delete", deleteChannel);
-router.post("/channel/search", searchChannels);
-router.post("/channel/follow", followChannel);
-
-// Status / Stories (Novo)
-router.post("/status/post", postStatus);
-
-// Perfil (Novo)
-router.post("/profile/update", updateProfile);
-
-// Catálogo (Novo)
+// Catálogo
 router.post("/catalog/sync", syncCatalog);
 
 export default router;
