@@ -36,26 +36,21 @@ const safeSupabaseCall = async (operation, retries = 3) => {
 export const normalizeJid = (jid) => {
     if (!jid) return null;
     if (jid.includes('@g.us')) return jid;
-    if (jid.includes('@newsletter')) return jid;
-    // CORREÇÃO: Remove sufixo de dispositivo (:2, :3) que pode causar duplicidade
+    // Removido suporte a newsletter
     const clean = jid.split(':')[0];
     return clean.includes('@') ? clean : `${clean}@s.whatsapp.net`;
 };
 
 // Validador Estrito de Nomes
-// Retorna TRUE se o nome for inválido (nulo, vazio, apenas números ou igual ao telefone)
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
     if (cleanName.length < 1) return true;
     
-    // Se o nome for apenas números ou caracteres especiais
     if (/^[\d\s\+\-\(\)]*$/.test(cleanName)) return true;
 
-    // Se o nome for igual ao telefone (mesmo com formatação diferente)
     if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true;
     
-    // Deve conter pelo menos uma letra para ser considerado um nome real
     return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName);
 };
 
@@ -86,13 +81,15 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     }
 };
 
-// Atualizado para aceitar 'metadata' e 'parent_jid'
 export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false, lid = null, isBusiness = false, verifiedName = null, extraData = {}) => {
     try {
         if (!jid || !companyId) return;
-        if (jid.includes('status@broadcast')) return;
+        if (jid.includes('status@broadcast')) return; // Ignora Status
+        if (jid.includes('@newsletter')) return; // Ignora Canais
 
         const cleanJid = normalizeJid(jid);
+        if (!cleanJid) return;
+
         const purePhone = cleanJid.split('@')[0].replace(/\D/g, ''); 
         
         const updateData = {
@@ -100,7 +97,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             phone: purePhone, 
             company_id: companyId,
             updated_at: new Date(),
-            ...extraData // Injeta is_community, is_newsletter, parent_jid, metadata
+            ...extraData // Injeta is_community, parent_jid (metadata removido)
         };
 
         if (isBusiness) updateData.is_business = true;
@@ -139,19 +136,18 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
 // --- GUARDIÃO DE LEADS (The Gatekeeper) ---
 export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
-    // 1. REGRAS DE EXCLUSÃO (Hard Rules)
     if (!jid) return null;
     
     // Tratamento de LID
     if (jid.includes('@lid')) return null;
 
-    if (jid.includes('@g.us')) return null; // Grupos não viram Leads
-    if (jid.includes('@newsletter')) return null; // Canais não viram Leads
-    if (jid.includes('status@broadcast')) return null; // Status não vira Lead
+    if (jid.includes('@g.us')) return null; 
+    if (jid.includes('@newsletter')) return null; // Hard Block
+    if (jid.includes('status@broadcast')) return null; // Hard Block
     
     const cleanJid = normalizeJid(jid);
     
-    // Auto-exclusão (Não cria lead para mim mesmo)
+    // Auto-exclusão
     if (myJid) {
         const cleanMyJid = normalizeJid(myJid);
         const myNum = cleanMyJid?.split('@')[0];
@@ -161,7 +157,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
     const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
     
-    // VALIDACAO RÍGIDA DE TELEFONE (Anti-LID Leak)
     if (purePhone.length < 8 || purePhone.length > 15) {
         return null;
     }
@@ -172,8 +167,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     try {
         leadLock.add(lockKey);
 
-        // 2. BUSCA DADOS ATUAIS (Contacts)
-        // Precisamos verificar se foi ignorado explicitamente pelo usuário
         const { data: contact } = await safeSupabaseCall(() => 
             supabase.from('contacts')
                 .select('is_ignored, name, push_name, verified_name')
@@ -183,30 +176,26 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         );
 
         if (contact?.is_ignored) {
-            return null; // Respeita a decisão do usuário de ignorar
+            return null; 
         }
 
-        // 3. DETERMINAÇÃO DO NOME
         let finalName = null;
 
         if (contact) {
-            if (!isGenericName(contact.name, purePhone)) finalName = contact.name; // Agenda
-            else if (!isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name; // Business
-            else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name; // Perfil
+            if (!isGenericName(contact.name, purePhone)) finalName = contact.name; 
+            else if (!isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name;
+            else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
         }
         
         if (!finalName && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
         }
 
-        // 4. VERIFICAÇÃO E ATUALIZAÇÃO (AUTO-HEALING)
         const { data: existing } = await safeSupabaseCall(() => 
             supabase.from('leads').select('id, name').eq('phone', purePhone).eq('company_id', companyId).maybeSingle()
         );
 
         if (existing) {
-            // Se já existe e temos um nome MELHOR, atualizamos o NULL
-            // Se existing.name for null, !existing.name é true, então atualizamos.
             const currentNameIsBad = !existing.name || isGenericName(existing.name, purePhone);
             const newNameIsGood = finalName && !isGenericName(finalName, purePhone);
 
@@ -217,8 +206,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             return existing.id;
         }
 
-        // 5. CRIAÇÃO DO LEAD (PERMISSIVA: ACEITA NULL)
-        // Se o nome for genérico/inválido, forçamos NULL explicitamente.
         if (finalName && isGenericName(finalName, purePhone)) {
             finalName = null;
         }
@@ -226,7 +213,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         const { data: stage } = await supabase.from('pipeline_stages')
             .select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
 
-        // INSERÇÃO: Enviamos NULL se não tiver nome. O SQL deve permitir (ALTER TABLE leads ALTER COLUMN name DROP NOT NULL).
         const { data: newLead } = await safeSupabaseCall(() => 
             supabase.from('leads').insert({
                 company_id: companyId,
@@ -250,13 +236,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
 export const upsertMessage = async (msgData) => {
     try {
-        // CORREÇÃO STATUS BROADCAST
-        // Permitimos salvar status no banco para visualização futura, 
-        // mas o remote_jid deve ser o do autor, não o broadcast.
-        // O Baileys envia remoteJid='status@broadcast' e participant='autor'.
-        // O upsertMessage precisa lidar com isso se quisermos salvar Stories.
-        // Por enquanto, seguimos a regra de não poluir messages com status, a menos que especificado.
-        // Se msgData.remote_jid for status, vamos ignorar por padrão no sync, mas o handler de status trataria separado.
+        if (msgData.remote_jid.includes('status@broadcast')) return; // Bloqueio Extra de Segurança
         
         const cleanRemoteJid = normalizeJid(msgData.remote_jid);
         const finalData = { ...msgData, remote_jid: cleanRemoteJid };
