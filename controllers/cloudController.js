@@ -24,21 +24,42 @@ export const callbackDrive = async (req, res) => {
     try {
         if (!code || !state) throw new Error("Parâmetros inválidos do Google.");
         
+        console.log(`🔑 [GOOGLE] Processando callback para empresa: ${state}`);
         const userInfo = await handleAuthCallback(code, state);
         
-        // Redireciona para o frontend (Página de Arquivos) com flag de sucesso
-        const frontendUrl = process.env.FRONTEND_URL || 'https://wancora-crm.netlify.app'; // Ajuste se necessário ou use env
-        // Fallback seguro se a env não estiver definida
-        const safeUrl = frontendUrl.includes('localhost') ? 'http://localhost:3000' : frontendUrl;
+        // Lógica Inteligente de Redirecionamento
+        // Se o Host do backend for localhost, redireciona para localhost:3000
+        // Se for produção (Render), usa a variável FRONTEND_URL ou fallback
         
-        res.redirect(`${safeUrl}/cloud?google=success&email=${encodeURIComponent(userInfo.email)}`);
+        const host = req.get('host');
+        let frontendBaseUrl;
+
+        if (host.includes('localhost') || host.includes('127.0.0.1')) {
+            frontendBaseUrl = 'http://localhost:3000';
+        } else {
+            frontendBaseUrl = process.env.FRONTEND_URL || 'https://wancora-crm.netlify.app';
+        }
+
+        // Garante que não tenha barra no final
+        if (frontendBaseUrl.endsWith('/')) frontendBaseUrl = frontendBaseUrl.slice(0, -1);
+        
+        const redirectUrl = `${frontendBaseUrl}/cloud?google=success&email=${encodeURIComponent(userInfo.email)}`;
+        console.log(`➡️ [GOOGLE] Redirecionando para: ${redirectUrl}`);
+        
+        res.redirect(redirectUrl);
+
     } catch (e) {
-        console.error("Erro Callback Google:", e);
+        console.error("❌ [GOOGLE] Erro Callback:", e);
         res.status(500).send(`
-            <h1>Falha na Autenticação</h1>
-            <p>Ocorreu um erro ao conectar com o Google Drive.</p>
-            <p>Erro: ${e.message}</p>
-            <a href="/">Voltar</a>
+            <div style="font-family: sans-serif; text-align: center; padding: 50px;">
+                <h1 style="color: #ef4444;">Falha na Autenticação</h1>
+                <p>Ocorreu um erro ao conectar com o Google Drive.</p>
+                <div style="background: #f4f4f5; padding: 15px; border-radius: 8px; display: inline-block; margin: 20px 0; text-align: left;">
+                    <code>${e.message}</code>
+                </div>
+                <br/>
+                <a href="/" style="color: #3b82f6; text-decoration: none; font-weight: bold;">Voltar para Home</a>
+            </div>
         `);
     }
 };
