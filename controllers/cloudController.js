@@ -4,7 +4,7 @@ import { syncDriveFiles, uploadFile, getFileStream } from "../services/google/dr
 import { sendMessage } from "../services/baileys/sender.js";
 import { getSessionId } from "./whatsappController.js";
 import { createClient } from "@supabase/supabase-js";
-import fs from 'fs'; // Apenas para manipulação temporária se necessário
+import fs from 'fs'; 
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
@@ -26,13 +26,20 @@ export const callbackDrive = async (req, res) => {
         
         const userInfo = await handleAuthCallback(code, state);
         
-        // Redireciona para o frontend com sucesso
-        // Ajuste a URL conforme seu ambiente de produção
-        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-        res.redirect(`${frontendUrl}/settings?google=success&email=${userInfo.email}`);
+        // Redireciona para o frontend (Página de Arquivos) com flag de sucesso
+        const frontendUrl = process.env.FRONTEND_URL || 'https://wancora-crm.netlify.app'; // Ajuste se necessário ou use env
+        // Fallback seguro se a env não estiver definida
+        const safeUrl = frontendUrl.includes('localhost') ? 'http://localhost:3000' : frontendUrl;
+        
+        res.redirect(`${safeUrl}/cloud?google=success&email=${encodeURIComponent(userInfo.email)}`);
     } catch (e) {
         console.error("Erro Callback Google:", e);
-        res.status(500).send("Falha na autenticação com Google Drive.");
+        res.status(500).send(`
+            <h1>Falha na Autenticação</h1>
+            <p>Ocorreu um erro ao conectar com o Google Drive.</p>
+            <p>Erro: ${e.message}</p>
+            <a href="/">Voltar</a>
+        `);
     }
 };
 
@@ -82,10 +89,6 @@ export const sendFileToContact = async (req, res) => {
         const { stream, fileName, mimeType } = await getFileStream(companyId, fileId);
 
         // Converte Stream para Buffer (Baileys precisa de buffer ou url publica)
-        // Nota: Para arquivos GIGANTES, isso pode ser perigoso. 
-        // Idealmente, usaríamos stream diretamente se o Baileys suportasse bem, ou salvaríamos temp.
-        // Como o Wancora foca em envio rápido, vamos converter para buffer com limite seguro.
-        
         const chunks = [];
         for await (const chunk of stream) {
             chunks.push(chunk);
@@ -107,14 +110,9 @@ export const sendFileToContact = async (req, res) => {
             caption: caption || fileName,
             fileName: fileName,
             mimetype: mimeType,
-            // Truque: O sendMessage do Baileys (sender.js) espera 'url' ou lógica interna.
-            // Vamos precisar adaptar o sender.js para aceitar 'buffer' direto se não tiver URL.
-            // Mas o nosso sender.js atual já lida com 'url'.
-            // Vamos hackear passando o buffer como uma propriedade extra que o sender.js precisa tratar,
-            // OU (solução mais limpa agora) fazer upload para o Supabase Storage temporário e mandar a URL.
         };
 
-        // Opção Rápida: Upload para Supabase Storage para gerar URL pública rápida para o Baileys
+        // Upload para Supabase Storage para gerar URL pública rápida para o Baileys
         const tempName = `temp_${Date.now()}_${fileName}`;
         await supabase.storage.from('chat-media').upload(`${companyId}/${tempName}`, buffer, { contentType: mimeType });
         const { data: publicData } = supabase.storage.from('chat-media').getPublicUrl(`${companyId}/${tempName}`);
