@@ -5,10 +5,12 @@ import { requireAuth } from "../middleware/auth.js";
 
 const router = express.Router();
 
-// Rotas Públicas (Callback do Google)
+// --- ZONA PÚBLICA (CRÍTICO) ---
+// O Google redireciona para cá sem Headers de Auth. Deve vir ANTES do requireAuth.
 router.get("/google/callback", callbackDrive);
 
-// Rotas Protegidas
+// --- ZONA PROTEGIDA ---
+// Tudo abaixo desta linha exige Token JWT
 router.use(requireAuth);
 
 router.post("/google/connect", connectDrive);
