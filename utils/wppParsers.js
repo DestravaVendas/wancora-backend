@@ -4,7 +4,7 @@
 export const normalizeJid = (jid) => {
     if (!jid) return null;
     if (jid.includes('@g.us')) return jid;
-    if (jid.includes('@newsletter')) return jid;
+    // Removido suporte a newsletter
     return jid.includes('@') ? jid : `${jid}@s.whatsapp.net`;
 };
 
