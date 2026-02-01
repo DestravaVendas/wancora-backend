@@ -80,7 +80,8 @@ export const startSession = async (sessionId, companyId) => {
             defaultQueryTimeoutMs: 60000,
             retryRequestDelayMs: 2500,
             keepAliveIntervalMs: 30000, 
-            shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter'),
+            // IGNORE NEWSLETTERS AT ROOT LEVEL
+            shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter') || jid.includes('status@broadcast'),
             
             // --- IMPLEMENTAÇÃO OBRIGATÓRIA DO MANUAL (getMessage) ---
             // Recupera mensagens antigas caso o outro lado solicite reenvio (Criptografia)
