@@ -7,6 +7,13 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 });
 
 export const requireAuth = async (req, res, next) => {
+    // 🔓 WHITELIST: Rotas que NÃO precisam de autenticação
+    // O Callback do Google é público e vem do navegador do usuário sem headers customizados
+    if (req.path.includes('/google/callback') || req.originalUrl.includes('/google/callback')) {
+        console.log("🔓 [AUTH] Permitindo acesso público ao Callback Google.");
+        return next();
+    }
+
     try {
         const authHeader = req.headers.authorization;
         if (!authHeader) {
