@@ -17,6 +17,7 @@ import sessionRoutes from './routes/session.routes.js';
 import messageRoutes from './routes/message.routes.js';
 import automationRoutes from './routes/automation.routes.js';
 import managementRoutes from './routes/management.routes.js';
+import cloudRoutes from './routes/cloud.routes.js'; // [NOVO]
 
 // 🔥 PATCH CRÍTICO: USER-AGENT SPOOFING (INTERCEPTOR) 🔥
 const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -56,6 +57,7 @@ app.use('/api/v1/session', sessionRoutes);
 app.use('/api/v1/message', messageRoutes);
 app.use('/api/v1', automationRoutes); 
 app.use('/api/v1/management', managementRoutes);
+app.use('/api/v1/cloud', cloudRoutes); // [NOVO]
 
 // Sentry Error Handler (Deve vir depois das rotas)
 Sentry.setupExpressErrorHandler(app);
@@ -109,7 +111,7 @@ const restoreSessions = async () => {
 const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, () => {
-    console.log(`🚀 Wancora Backend v5.3 (Secure & Optimized) rodando na porta ${PORT}`);
+    console.log(`🚀 Wancora Backend v5.4 (Cloud Module) rodando na porta ${PORT}`);
     console.log(`🔗 Endpoint: http://localhost:${PORT}/api/v1`);
     
     restoreSessions();     
