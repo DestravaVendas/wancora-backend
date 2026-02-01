@@ -8,14 +8,8 @@ import {
     updateGroupSettings as updateGroupService,
     updateGroupPicture as updatePictureService,
     getGroupInviteCode as getInviteService,
-    createChannel as createChannelService,
-    deleteChannel as deleteChannelService,
-    createCommunity as createCommunityService,
-    searchChannels as searchChannelsService,
-    followChannel as followChannelService
+    createCommunity as createCommunityService
 } from '../services/baileys/community.js';
-import { sendStatusText, sendStatusMedia } from '../services/baileys/status.js';
-import { updateProfileName, updateProfileStatus, updateProfilePic } from '../services/baileys/profile.js';
 import { fetchCatalog } from '../services/baileys/catalog.js';
 import { normalizeJid } from '../utils/wppParsers.js';
 import { proto } from '@whiskeysockets/baileys';
@@ -24,7 +18,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-// --- SESSÃO & MENSAGEM (Core Mantido) ---
+// --- SESSÃO & MENSAGEM ---
 export const startSession = async (sessionId, companyId) => {
     try {
         console.log(`[Controller] Solicitando início da sessão ${sessionId}`);
@@ -47,7 +41,7 @@ export const deleteSession = async (sessionId, companyId) => {
 
 export const sendMessage = async (payload) => sendService(payload);
 
-// --- COMUNIDADES, GRUPOS E CANAIS ---
+// --- COMUNIDADES & GRUPOS ---
 
 export const createGroup = async (req, res) => {
     const { sessionId, companyId, subject, participants } = req.body;
@@ -82,66 +76,6 @@ export const createCommunity = async (req, res) => {
     } catch (error) { res.status(500).json({ error: error.message }); }
 };
 
-export const createChannel = async (req, res) => {
-    const { sessionId, companyId, name, description } = req.body;
-    try {
-        const channel = await createChannelService(sessionId, companyId, name, description);
-        res.json({ success: true, channel });
-    } catch (error) { res.status(500).json({ error: error.message }); }
-};
-
-export const searchChannels = async (req, res) => {
-    const { sessionId, query } = req.body;
-    try {
-        const results = await searchChannelsService(sessionId, query);
-        res.json({ success: true, results });
-    } catch (error) { res.status(500).json({ error: error.message }); }
-};
-
-export const followChannel = async (req, res) => {
-    const { sessionId, companyId, channelJid } = req.body;
-    try {
-        await followChannelService(sessionId, companyId, channelJid);
-        res.json({ success: true });
-    } catch (error) { res.status(500).json({ error: error.message }); }
-};
-
-export const deleteChannel = async (req, res) => {
-    const { sessionId, channelId } = req.body;
-    try {
-        await deleteChannelService(sessionId, channelId);
-        res.json({ success: true });
-    } catch (error) { res.status(500).json({ error: error.message }); }
-};
-
-// --- STATUS (STORIES) ---
-
-export const postStatus = async (req, res) => {
-    const { sessionId, type, content, options } = req.body; // type: 'text' | 'image' | 'video'
-    try {
-        if (type === 'text') {
-            await sendStatusText(sessionId, content, options?.color, options?.font);
-        } else {
-            await sendStatusMedia(sessionId, content, type, options?.caption);
-        }
-        res.json({ success: true });
-    } catch (error) { res.status(500).json({ error: error.message }); }
-};
-
-// --- PERFIL & SETTINGS ---
-
-export const updateProfile = async (req, res) => {
-    const { sessionId, action, value } = req.body; // action: 'name' | 'status' | 'picture'
-    try {
-        if (action === 'name') await updateProfileName(sessionId, value);
-        else if (action === 'status') await updateProfileStatus(sessionId, value);
-        else if (action === 'picture') await updateProfilePic(sessionId, value);
-        else throw new Error("Ação de perfil inválida");
-        
-        res.json({ success: true });
-    } catch (error) { res.status(500).json({ error: error.message }); }
-};
-
 // --- CATÁLOGO ---
 
 export const syncCatalog = async (req, res) => {
@@ -152,9 +86,7 @@ export const syncCatalog = async (req, res) => {
     } catch (error) { res.status(500).json({ error: error.message }); }
 };
 
-
-// --- INTERATIVIDADE (Polls, Reactions, Delete) ---
-// ... Mantido código existente de sendPollVote, sendReaction, deleteMessage, markChatAsRead, getSessionId
+// --- INTERATIVIDADE ---
 export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, optionId) => {
     try {
         const session = sessions.get(sessionId);
@@ -193,12 +125,6 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error(`Opção inválida: Index ${optionId} não existe.`);
         }
 
-        const cleanOptionText = selectedOptionText; 
-        
-        if (!cleanOptionText) {
-            throw new Error("Opção de voto vazia ou inválida.");
-        }
-
         const chatJid = normalizeJid(remoteJid);
         
         // 3. Payload de Voto
@@ -210,7 +136,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
                         id: pollMsg.whatsapp_id,
                         fromMe: pollMsg.from_me,
                     },
-                    selectedOptions: [cleanOptionText] 
+                    selectedOptions: [selectedOptionText] 
                 }
             }
         });
@@ -226,7 +152,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         votes.push({
             voterJid: myJid,
             ts: Date.now(),
-            selectedOptions: [cleanOptionText]
+            selectedOptions: [selectedOptionText]
         });
 
         await supabase.from('messages')
