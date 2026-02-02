@@ -1,89 +1,59 @@
 
-import { upsertContact, updateSyncStatus } from '../../crm/sync.js'; 
+import { upsertContact, updateSyncStatus, normalizeJid } from '../../crm/sync.js'; 
 import { handleMessage } from './messageHandler.js';
-import { unwrapMessage, normalizeJid } from '../../../utils/wppParsers.js';
+import { unwrapMessage } from '../../../utils/wppParsers.js';
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const HISTORY_MSG_LIMIT = 10;
-const HISTORY_MONTHS_LIMIT = 8;
-const processedHistoryChunks = new Set();
+const HISTORY_MSG_LIMIT = 15; // Aumentado ligeiramente para garantir contexto
+const HISTORY_MONTHS_LIMIT = 6; // Otimização de tempo
 
-// Helper: Pausa para não sufocar o banco/CPU
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// Helper: Pausa mínima para Event Loop (Heartbeat)
+const tick = () => new Promise(r => setImmediate(r));
 
 export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
     
-    const chunkKey = `${sessionId}-chunk-${chunkCounter}`;
-    if (processedHistoryChunks.has(chunkKey)) {
-        return;
-    }
-    processedHistoryChunks.add(chunkKey);
-
-    // Se já completou no banco, aborta (Fast Exit)
-    const { data: currentInstance } = await supabase.from('instances')
-        .select('sync_status')
-        .eq('session_id', sessionId)
-        .eq('company_id', companyId)
-        .single();
-        
-    if (currentInstance?.sync_status === 'completed') return;
-
-    // UX FIX: Progresso mais conservador (2% por chunk em vez de 5%)
-    // Isso garante que a barra suba devagar e constantemente.
-    // Limitado a 98% para não dar falso positivo de conclusão antes do status 'completed'.
-    const estimatedProgress = progress || Math.min((chunkCounter * 2), 98);
-    console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
+    // Calcula progresso real (Se isLatest=true, força 100%)
+    const currentProgress = isLatest ? 100 : (progress || 10);
+    console.log(`📚 [SYNC] Processando Histórico... (${currentProgress}%)`);
     
-    // Atualiza status no banco para a barra se mover
-    await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
+    await updateSyncStatus(sessionId, 'importing_messages', currentProgress);
 
     try {
         const contactsMap = new Map();
 
         // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS (Lotes de 50)
+        // ETAPA 1: CONTATOS (Carga Rápida)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
-            const BATCH_SIZE = 50;
-            for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
-                const batch = contacts.slice(i, i + BATCH_SIZE);
+            // Processa TODOS os contatos recebidos neste pacote de uma vez
+            // O Promise.all em map é rápido, mas adicionamos um 'tick' a cada 50 para não bloquear
+            
+            const contactPromises = contacts.map(async (c, index) => {
+                if (index % 50 === 0) await tick(); // Respiro para a CPU
+
+                const jid = normalizeJid(c.id);
+                if (!jid) return;
                 
-                await Promise.all(batch.map(async (c) => {
-                    const jid = normalizeJid(c.id);
-                    if (!jid) return;
-                    
-                    const bestName = c.name || c.verifiedName || c.notify;
-                    
-                    // --- SMART FETCH DE FOTO (FIX) ---
-                    let finalImgUrl = c.imgUrl || null;
-
-                    if (!finalImgUrl) {
-                        try {
-                            finalImgUrl = await sock.profilePictureUrl(jid, 'image');
-                        } catch (e) {
-                            finalImgUrl = null;
-                        }
-                    }
-
-                    contactsMap.set(jid, { 
-                        name: bestName, 
-                        imgUrl: finalImgUrl, 
-                        isFromBook: !!c.name,
-                        lid: c.lid || null 
-                    });
-
-                    // Upsert seguro com a URL correta
-                    await upsertContact(jid, companyId, bestName, finalImgUrl, !!c.name, c.lid);
-                }));
+                const bestName = c.name || c.verifiedName || c.notify;
                 
-                await sleep(50); // Respira
-            }
+                // Mapeia para uso nas mensagens abaixo
+                contactsMap.set(jid, { 
+                    name: bestName, 
+                    imgUrl: c.imgUrl, 
+                    isFromBook: !!c.name 
+                });
+
+                // Upsert Imediato (Trigger no banco avisará o Frontend via INSERT)
+                await upsertContact(jid, companyId, bestName, c.imgUrl || null, !!c.name, c.lid);
+            });
+
+            await Promise.all(contactPromises);
         }
 
         // -----------------------------------------------------------
-        // ETAPA 2: MENSAGENS (Por Conversa)
+        // ETAPA 2: MENSAGENS (Processamento & Name Hunting)
         // -----------------------------------------------------------
         if (messages && messages.length > 0) {
             
@@ -91,72 +61,76 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             cutoffDate.setMonth(cutoffDate.getMonth() - HISTORY_MONTHS_LIMIT);
             const cutoffTimestamp = Math.floor(cutoffDate.getTime() / 1000);
 
-            // Agrupa por chat
+            // Agrupamento por Chat
             const chats = {}; 
-            messages.forEach(msg => {
+            
+            for (const msg of messages) {
                 const clean = unwrapMessage(msg);
-                if (!clean.key?.remoteJid) return;
+                if (!clean.key?.remoteJid) continue;
                 
                 const msgTs = Number(clean.messageTimestamp);
-                if (msgTs < cutoffTimestamp) return;
+                if (msgTs < cutoffTimestamp) continue;
 
                 const jid = normalizeJid(clean.key.remoteJid);
-                if (jid === 'status@broadcast') return;
+                if (jid === 'status@broadcast') continue;
 
                 if (!chats[jid]) chats[jid] = [];
+                
+                // --- NAME HUNTER V4 ---
+                // Se a mensagem tem pushName e o contato não tem nome na agenda,
+                // forçamos esse nome na mensagem para que o handler atualize o contato.
                 const knownContact = contactsMap.get(jid);
-                clean._forcedName = knownContact ? knownContact.name : clean.pushName;
+                const forcedName = (knownContact && knownContact.name) ? knownContact.name : clean.pushName;
+                
+                clean._forcedName = forcedName; // Injeta propriedade temporária
                 chats[jid].push(clean);
-            });
+            }
 
             const chatJids = Object.keys(chats);
 
-            // Processa conversas sequencialmente para não matar o banco
+            // Processa cada chat
             for (const jid of chatJids) {
-                chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0));
+                // Ordena cronologicamente
+                chats[jid].sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                 
-                // Pega a mensagem mais recente para atualizar o last_message_at do contato
-                const latestMsg = chats[jid][chats[jid].length - 1];
-                if (latestMsg && latestMsg.messageTimestamp) {
-                    const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
-                    // Atualiza o contato com a data REAL da mensagem, não Date.now()
-                    await supabase.from('contacts')
+                // Pega apenas as últimas mensagens para salvar no banco
+                const messagesToSave = chats[jid].slice(-HISTORY_MSG_LIMIT);
+                
+                // Se tiver mensagens, atualiza data do contato para ordenação correta no Frontend
+                const lastMsg = messagesToSave[messagesToSave.length - 1];
+                if (lastMsg) {
+                    const ts = new Date(Number(lastMsg.messageTimestamp) * 1000);
+                    // Atualização "Fire and Forget" para não travar
+                    supabase.from('contacts')
                         .update({ last_message_at: ts })
                         .eq('company_id', companyId)
-                        .eq('jid', jid);
+                        .eq('jid', jid)
+                        .then(() => {});
                 }
 
-                const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT);
-                topMessages.reverse(); 
-                
-                for (const msg of topMessages) {
-                    try {
-                        const options = { 
-                            downloadMedia: true, 
-                            fetchProfilePic: false,
-                            // FORCE LEAD CREATION: Isso garante que o que aparece no chat vira lead
-                            // O ensureLeadExists vai filtrar grupos/canais e permitir NULLs no nome
-                            createLead: true 
-                        };
-                        
-                        await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
-                    } catch (msgError) {
-                        // Ignora erro individual
-                    }
+                // Salva as mensagens
+                for (const msg of messagesToSave) {
+                    // Opções de Performance: Não baixar mídia histórica, mas baixar foto de perfil se não tiver
+                    const options = { 
+                        downloadMedia: false, // Mídia histórica não baixa auto para economizar espaço
+                        fetchProfilePic: true, // Tenta pegar foto se não tiver
+                        createLead: true // Garante que chats ativos virem leads
+                    };
+                    
+                    // Chama o handler padrão
+                    await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                 }
-                
-                await sleep(20); 
+
+                await tick(); // Evita travar loop
             }
         }
 
     } catch (e) {
         console.error("❌ [SYNC ERROR]", e);
     } finally {
-        // SE FOR O FIM, MARCA COMO COMPLETO
         if (isLatest) {
-            console.log(`✅ [HISTÓRICO] Sincronização 100% Concluída.`);
+            console.log(`✅ [HISTÓRICO] Sincronização Finalizada.`);
             await updateSyncStatus(sessionId, 'completed', 100);
-            processedHistoryChunks.clear();
         }
     }
 };
