@@ -3,13 +3,10 @@ import { updateSyncStatus } from '../crm/sync.js';
 import { handlePresenceUpdate, handleContactsUpsert } from './handlers/contactHandler.js';
 import { handleReceiptUpdate, handleMessageUpdate, handleReaction } from './handlers/messageHandler.js';
 import { handleHistorySync } from './handlers/historyHandler.js';
-import { enqueueMessage } from './messageQueue.js'; // Import da Fila
+import { enqueueMessage } from './messageQueue.js'; 
 
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
-    let historyChunkCounter = 0;
-    let totalHistoryMessages = 0; // Contador acumulativo da sessão
-
     // -----------------------------------------------------------
     // 1. CONEXÃO & GATILHOS
     // -----------------------------------------------------------
@@ -17,8 +14,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         const { connection } = update;
         if (connection === 'open') {
             console.log(`⚡ [LISTENER] Conexão aberta! Iniciando monitoramento.`);
-            // Feedback imediato para o usuário
-            await updateSyncStatus(sessionId, 'importing_contacts', 5);
+            await updateSyncStatus(sessionId, 'importing_contacts', 1);
         }
     });
 
@@ -30,10 +26,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     sock.ev.on('contacts.upsert', (contacts) => handleContactsUpsert(contacts, companyId));
     
     sock.ev.on('contacts.update', async (updates) => {
-        // Updates parciais (ex: foto nova)
         for (const update of updates) {
             if (update.imgUrl) {
-                // Reutiliza função do handler, passando array de 1
                 handleContactsUpsert([update], companyId);
             }
         }
@@ -42,37 +36,22 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // -----------------------------------------------------------
     // 3. MENSAGENS (CORE)
     // -----------------------------------------------------------
-    
-    // Novas Mensagens (Upsert)
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        // type: 'notify' (Realtime) | 'append' (Histórico/Outro device)
         const isRealtime = type === 'notify';
-        
         for (const msg of messages) {
-            // SUBSTITUIÇÃO: Em vez de await handleMessage(...), usamos a fila.
-            // Isso libera o listener imediatamente para receber mais eventos.
             enqueueMessage(msg, sock, companyId, sessionId, isRealtime);
         }
     });
 
-    // Atualizações (Polls, Edições)
     sock.ev.on('messages.update', (updates) => handleMessageUpdate(updates, companyId));
-
-    // Status de Leitura (Ticks)
     sock.ev.on('message-receipt.update', (events) => handleReceiptUpdate(events, companyId));
-
-    // Reações (Emojis)
     sock.ev.on('messages.reaction', (reactions) => handleReaction(reactions, sock, companyId));
 
     // -----------------------------------------------------------
-    // 4. HISTÓRICO (SYNC)
+    // 4. HISTÓRICO (SYNC LINEAR)
     // -----------------------------------------------------------
     sock.ev.on('messaging-history.set', (data) => {
-        historyChunkCounter++;
-        // Incrementa o contador total com as mensagens deste pacote
-        if (data.messages) {
-            totalHistoryMessages += data.messages.length;
-        }
-        handleHistorySync(data, sock, sessionId, companyId, historyChunkCounter, totalHistoryMessages);
+        // Passa o pacote inteiro para o handler que vai filtrar e processar de uma vez
+        handleHistorySync(data, sock, sessionId, companyId);
     });
 };
