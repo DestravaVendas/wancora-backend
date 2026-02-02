@@ -26,7 +26,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     
     sock.ev.on('contacts.update', async (updates) => {
         for (const update of updates) {
-            // Se veio imagem nova, processa como upsert completo
             if (update.imgUrl || update.notify) {
                 handleContactsUpsert([update], companyId);
             }
