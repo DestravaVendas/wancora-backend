@@ -6,93 +6,65 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const HISTORY_MSG_LIMIT = 10;
-const HISTORY_MONTHS_LIMIT = 8;
-const processedHistoryChunks = new Set();
-
-// Helper: Pausa para não sufocar o banco/CPU
+// CONFIGURAÇÕES
+const MSG_LIMIT_PER_CHAT = 20; // Aumentado para pegar mais contexto
+const HISTORY_MONTHS_LIMIT = 6;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
+export const handleHistorySync = async ({ contacts, messages, isLatest }, sock, sessionId, companyId, chunkCounter) => {
     
-    const chunkKey = `${sessionId}-chunk-${chunkCounter}`;
-    if (processedHistoryChunks.has(chunkKey)) {
-        return;
-    }
-    processedHistoryChunks.add(chunkKey);
-
-    // Se já completou no banco, aborta (Fast Exit)
-    const { data: currentInstance } = await supabase.from('instances')
-        .select('sync_status')
-        .eq('session_id', sessionId)
-        .eq('company_id', companyId)
-        .single();
-        
-    if (currentInstance?.sync_status === 'completed') return;
-
-    // UX FIX: Progresso mais conservador (2% por chunk em vez de 5%)
-    // Isso garante que a barra suba devagar e constantemente.
-    // Limitado a 98% para não dar falso positivo de conclusão antes do status 'completed'.
-    const estimatedProgress = progress || Math.min((chunkCounter * 2), 98);
-    console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
+    // LOG & FEEDBACK INICIAL
+    console.log(`📚 [SYNC] Lote #${chunkCounter} recebido. Contatos: ${contacts?.length || 0}, Msgs: ${messages?.length || 0}`);
     
-    // Atualiza status no banco para a barra se mover
-    await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
+    // Se tiver mensagens, já avisa que estamos na fase de mensagens (destrava o frontend)
+    // Se não tiver, mantém em contatos.
+    const currentStatus = (messages && messages.length > 0) ? 'importing_messages' : 'importing_contacts';
+    
+    // Atualiza status imediatamente para o frontend reagir
+    await updateSyncStatus(sessionId, currentStatus, 5);
 
     try {
         const contactsMap = new Map();
 
         // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS (Lotes de 50)
+        // 1. CONTATOS (Prioridade Absoluta)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
+            
             const BATCH_SIZE = 50;
             for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
                 const batch = contacts.slice(i, i + BATCH_SIZE);
-                
                 await Promise.all(batch.map(async (c) => {
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
                     
                     const bestName = c.name || c.verifiedName || c.notify;
                     
-                    // --- SMART FETCH DE FOTO (FIX) ---
+                    // Busca foto apenas nos primeiros lotes para não gargalar
                     let finalImgUrl = c.imgUrl || null;
-
-                    if (!finalImgUrl) {
-                        try {
-                            finalImgUrl = await sock.profilePictureUrl(jid, 'image');
-                        } catch (e) {
-                            finalImgUrl = null;
-                        }
+                    if (!finalImgUrl && chunkCounter <= 1) { 
+                        try { finalImgUrl = await sock.profilePictureUrl(jid, 'image'); } catch (e) {}
                     }
 
-                    contactsMap.set(jid, { 
-                        name: bestName, 
-                        imgUrl: finalImgUrl, 
-                        isFromBook: !!c.name,
-                        lid: c.lid || null 
-                    });
-
-                    // Upsert seguro com a URL correta
+                    contactsMap.set(jid, { name: bestName });
                     await upsertContact(jid, companyId, bestName, finalImgUrl, !!c.name, c.lid);
                 }));
-                
-                await sleep(50); // Respira
             }
         }
 
+        // Delay tático para o banco absorver os contatos antes das mensagens
+        await sleep(200); 
+
         // -----------------------------------------------------------
-        // ETAPA 2: MENSAGENS (Por Conversa)
+        // 2. MENSAGENS DO LOTE (Processamento Imediato)
         // -----------------------------------------------------------
+        let messagesToProcess = [];
+        
         if (messages && messages.length > 0) {
-            
             const cutoffDate = new Date();
             cutoffDate.setMonth(cutoffDate.getMonth() - HISTORY_MONTHS_LIMIT);
             const cutoffTimestamp = Math.floor(cutoffDate.getTime() / 1000);
 
-            // Agrupa por chat
-            const chats = {}; 
             messages.forEach(msg => {
                 const clean = unwrapMessage(msg);
                 if (!clean.key?.remoteJid) return;
@@ -103,60 +75,62 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 const jid = normalizeJid(clean.key.remoteJid);
                 if (jid === 'status@broadcast') return;
 
-                if (!chats[jid]) chats[jid] = [];
-                const knownContact = contactsMap.get(jid);
-                clean._forcedName = knownContact ? knownContact.name : clean.pushName;
-                chats[jid].push(clean);
+                // Injeta nome conhecido para facilitar criação do Lead
+                const known = contactsMap.get(jid);
+                if(known) clean._forcedName = known.name;
+                else if (clean.pushName) clean._forcedName = clean.pushName;
+                
+                messagesToProcess.push(clean);
             });
+        }
 
-            const chatJids = Object.keys(chats);
+        const total = messagesToProcess.length;
+        
+        if (total > 0) {
+            // Se vamos processar mensagens, garanta que o status no banco é esse
+            await updateSyncStatus(sessionId, 'importing_messages', 10);
 
-            // Processa conversas sequencialmente para não matar o banco
-            for (const jid of chatJids) {
-                chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0));
-                
-                // Pega a mensagem mais recente para atualizar o last_message_at do contato
-                const latestMsg = chats[jid][chats[jid].length - 1];
-                if (latestMsg && latestMsg.messageTimestamp) {
-                    const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
-                    // Atualiza o contato com a data REAL da mensagem, não Date.now()
-                    await supabase.from('contacts')
-                        .update({ last_message_at: ts })
-                        .eq('company_id', companyId)
-                        .eq('jid', jid);
-                }
+            let processed = 0;
+            // Log a cada 10% ou mínimo 10 mensagens
+            const logInterval = Math.max(Math.floor(total * 0.1), 10); 
 
-                const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT);
-                topMessages.reverse(); 
-                
-                for (const msg of topMessages) {
-                    try {
-                        const options = { 
-                            downloadMedia: true, 
-                            fetchProfilePic: false,
-                            // FORCE LEAD CREATION: Isso garante que o que aparece no chat vira lead
-                            // O ensureLeadExists vai filtrar grupos/canais e permitir NULLs no nome
-                            createLead: true 
-                        };
+            for (const msg of messagesToProcess) {
+                try {
+                    await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, { 
+                        downloadMedia: true, 
+                        createLead: true 
+                    });
+                    
+                    processed++;
+
+                    if (processed % logInterval === 0 || processed === total) {
+                        const percent = Math.floor((processed / total) * 100);
                         
-                        await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
-                    } catch (msgError) {
-                        // Ignora erro individual
+                        console.log(`⏳ [SYNC Lote ${chunkCounter}] ${processed}/${total} (${percent}%)`);
+                        
+                        // Atualiza a barra real no frontend
+                        await updateSyncStatus(sessionId, 'importing_messages', percent);
                     }
+                } catch (err) {
+                    // Ignora erro individual
                 }
-                
-                await sleep(20); 
+                // Throttle leve
+                if (processed % 50 === 0) await sleep(50);
             }
         }
 
     } catch (e) {
-        console.error("❌ [SYNC ERROR]", e);
+        console.error("❌ [SYNC FATAL]", e);
     } finally {
-        // SE FOR O FIM, MARCA COMO COMPLETO
+        // -----------------------------------------------------------
+        // 3. FINALIZAÇÃO
+        // -----------------------------------------------------------
         if (isLatest) {
-            console.log(`✅ [HISTÓRICO] Sincronização 100% Concluída.`);
+            console.log(`✅ [SYNC FINAL] Histórico 100% concluído.`);
+            await sleep(1000); 
+            
+            // Força fechamento
             await updateSyncStatus(sessionId, 'completed', 100);
-            processedHistoryChunks.clear();
         }
     }
 };
