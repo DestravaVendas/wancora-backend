@@ -1,6 +1,6 @@
 
 import { getContentType, normalizeJid, unwrapMessage, getBody } from '../../../utils/wppParsers.js';
-import { upsertMessage, ensureLeadExists, updateInstanceStatus } from '../../crm/sync.js';
+import { upsertMessage, ensureLeadExists } from '../../crm/sync.js';
 import { handleMediaUpload } from './mediaHandler.js';
 import { refreshContactInfo } from './contactHandler.js'; 
 import { dispatchWebhook } from '../../integrations/webhook.js';
@@ -17,12 +17,12 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const { downloadMedia = true, fetchProfilePic = false, createLead = false } = options;
 
         if (!msg.message) return;
-        // BLOQUEIO TOTAL DE STATUS (STORIES) E NEWSLETTERS
         if (msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid.includes('@newsletter')) return;
 
         const unwrapped = unwrapMessage(msg);
         let jid = normalizeJid(unwrapped.key.remoteJid);
         const fromMe = unwrapped.key.fromMe;
+        // Usa o nome forçado (do histórico) ou o pushName da mensagem
         const pushName = forcedName || unwrapped.pushName;
         
         const type = getContentType(unwrapped.message);
@@ -40,13 +40,19 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             if (contact?.is_ignored) return;
         }
 
-        // Lead Guard
+        // Lead Guard & Info Refresh
         let leadId = null;
         if (!fromMe) {
             const myJid = normalizeJid(sock.user?.id);
             if (isRealtime || createLead) {
+                // Cria Lead se não existir
                 leadId = await ensureLeadExists(jid, companyId, pushName, myJid);
-                if (isRealtime) refreshContactInfo(sock, jid, companyId, pushName).catch(err => console.error("Refresh Error", err));
+                
+                // ATUALIZAÇÃO DE INFORMAÇÕES (NOME/FOTO)
+                // Se for realtime ou se pedimos fetchProfilePic (no histórico)
+                if (isRealtime || fetchProfilePic) {
+                    refreshContactInfo(sock, jid, companyId, pushName).catch(err => console.error("Refresh Error", err));
+                }
             }
         }
 
@@ -58,23 +64,17 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             mediaUrl = await handleMediaUpload(unwrapped, companyId);
         }
 
-        // Transcrição de Áudio
-        let transcription = null;
+        // Transcrição
         if (isRealtime && mediaUrl && type === 'audioMessage') {
              try {
                  const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
                  const buffer = Buffer.from(response.data);
                  transcribeAudio(buffer, 'audio/ogg', companyId).then(async (text) => {
                      if (text) {
-                         await supabase.from('messages')
-                             .update({ transcription: text })
-                             .eq('whatsapp_id', unwrapped.key.id)
-                             .eq('company_id', companyId);
+                         await supabase.from('messages').update({ transcription: text }).eq('whatsapp_id', unwrapped.key.id).eq('company_id', companyId);
                      }
                  });
-             } catch (err) {
-                 console.error("[HANDLER] Erro ao baixar audio para transcrição:", err.message);
-             }
+             } catch (err) {}
         }
 
         // Payload
@@ -125,67 +125,5 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
     } catch (e) {
         console.error(`❌ [HANDLER] Erro msg ${msg.key?.id}:`, e.message);
-    }
-};
-
-export const handleMessageUpdate = async (updates, companyId) => {
-    // Lógica de Polls mantida
-    for (const update of updates) {
-        if (update.pollUpdates) {
-            for (const pollUpdate of update.pollUpdates) {
-                const pollMsgId = pollUpdate.pollCreationMessageKey.id;
-                const vote = pollUpdate.vote;
-                const voterJid = normalizeJid(pollUpdate.pollUpdateMessageKey.participant || pollUpdate.pollUpdateMessageKey.remoteJid);
-                
-                const { data: originalMsg } = await supabase.from('messages').select('poll_votes, content').eq('whatsapp_id', pollMsgId).eq('company_id', companyId).maybeSingle();
-
-                if (originalMsg) {
-                    try {
-                        let currentVotes = Array.isArray(originalMsg.poll_votes) ? originalMsg.poll_votes : [];
-                        currentVotes = currentVotes.filter(v => v.voterJid !== voterJid);
-                        const selectedOptions = vote.selectedOptions.map(opt => Buffer.isBuffer(opt) ? opt.toString('hex') : opt);
-                        currentVotes.push({ voterJid, selectedOptions, ts: Date.now() });
-                        await supabase.from('messages').update({ poll_votes: currentVotes }).eq('whatsapp_id', pollMsgId).eq('company_id', companyId);
-                    } catch (e) {}
-                }
-            }
-        }
-    }
-};
-
-export const handleReceiptUpdate = async (events, companyId) => {
-    for (const event of events) {
-        const { key, receipt } = event;
-        let statusStr = 'sent';
-        if (receipt.userJid) continue; 
-        const type = event.type; 
-        if (type === 'read' || type === 'read-self') statusStr = 'read';
-        else if (type === 'delivery') statusStr = 'delivered';
-        else return;
-
-        await supabase.from('messages').update({ status: statusStr, [statusStr === 'read' ? 'read_at' : 'delivered_at']: new Date() }).eq('whatsapp_id', key.id).eq('company_id', companyId);
-    }
-};
-
-export const handleReaction = async (reactions, sock, companyId) => {
-    for (const reaction of reactions) {
-        const { key, reaction: r } = reaction;
-        const msgId = key.id;
-        const participant = key.participant || key.remoteJid;
-        const actor = normalizeJid(participant);
-        const emoji = r.text;
-
-        if (!msgId || !companyId) continue;
-
-        try {
-            const { data: msg } = await supabase.from('messages').select('id, reactions').eq('whatsapp_id', msgId).eq('company_id', companyId).maybeSingle();
-
-            if (msg) {
-                let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
-                currentReactions = currentReactions.filter(rx => rx.actor !== actor);
-                if (emoji) currentReactions.push({ text: emoji, actor: actor, ts: Date.now() });
-                await supabase.from('messages').update({ reactions: currentReactions }).eq('id', msg.id);
-            }
-        } catch (e) {}
     }
 };
