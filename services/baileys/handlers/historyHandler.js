@@ -30,8 +30,10 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         
     if (currentInstance?.sync_status === 'completed') return;
 
-    // Calcula progresso estimado se o Baileys não enviar
-    const estimatedProgress = progress || Math.min((chunkCounter * 5), 99);
+    // UX FIX: Progresso mais conservador (2% por chunk em vez de 5%)
+    // Isso garante que a barra suba devagar e constantemente.
+    // Limitado a 98% para não dar falso positivo de conclusão antes do status 'completed'.
+    const estimatedProgress = progress || Math.min((chunkCounter * 2), 98);
     console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
     
     // Atualiza status no banco para a barra se mover
