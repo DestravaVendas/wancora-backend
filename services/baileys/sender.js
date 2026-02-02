@@ -17,7 +17,7 @@ const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + m
 
 // Helper para converter imagem em Sticker WebP (512x512)
 const convertToSticker = async (url) => {
-    const response = await axios.get(url, { responseType: 'arraybuffer' });
+    const response = await axios.get(url, { responseType: 'arraybuffer', timeout: 10000 });
     const buffer = Buffer.from(response.data);
 
     return await sharp(buffer)
@@ -29,7 +29,8 @@ const convertToSticker = async (url) => {
 // Helper para gerar Thumbnail JPEG (Pequena) para Rich Link
 const generateThumbnail = async (url) => {
     try {
-        const response = await axios.get(url, { responseType: 'arraybuffer' });
+        // Timeout de 5s para não travar o envio se a imagem for pesada ou lenta
+        const response = await axios.get(url, { responseType: 'arraybuffer', timeout: 5000 });
         const buffer = Buffer.from(response.data);
         
         // WhatsApp exige thumbnail pequena e leve (< 10KB idealmente)
@@ -38,7 +39,7 @@ const generateThumbnail = async (url) => {
             .jpeg({ quality: 60 })
             .toBuffer();
     } catch (e) {
-        console.error("[SENDER] Falha ao gerar thumbnail:", e.message);
+        console.error("[SENDER] Falha ao gerar thumbnail (ignorando):", e.message);
         return null;
     }
 };
