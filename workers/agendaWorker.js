@@ -3,6 +3,7 @@ import cron from 'node-cron';
 import { createClient } from "@supabase/supabase-js";
 import { sendMessage } from '../services/baileys/sender.js';
 import { getSessionId } from '../controllers/whatsappController.js';
+import getRedisClient from '../services/redisClient.js'; // Import Redis
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -11,8 +12,21 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const cleanPhone = (phone) => phone.replace(/\D/g, '');
 
 const processReminders = async () => {
+    const redis = getRedisClient();
+    const LOCK_KEY = 'worker:agenda:lock';
+    const LOCK_TTL = 290; // 4 minutos e 50 segundos (pouco menos que o intervalo do cron)
+
     try {
-         // Desativado     console.log('⏰ [Agenda Worker] Verificando lembretes pendentes...'); 
+        // 1. Tenta adquirir o Lock (Atomicamente)
+        if (redis) {
+            const acquired = await redis.set(LOCK_KEY, 'LOCKED', 'EX', LOCK_TTL, 'NX');
+            if (!acquired) {
+                console.warn('🔒 [Agenda Worker] Execução anterior ainda ativa. Pulando ciclo.');
+                return;
+            }
+        }
+
+        console.log('⏰ [Agenda Worker] Verificando lembretes pendentes...');
         
         // 1. Busca agendamentos das próximas 24h que ainda não foram notificados
         const now = new Date();
@@ -32,7 +46,10 @@ const processReminders = async () => {
             .lte('start_time', tomorrow.toISOString());
 
         if (error) throw error;
-        if (!appointments || appointments.length === 0) return;
+        if (!appointments || appointments.length === 0) {
+            console.log(`💤 [Agenda Worker] Nenhum lembrete pendente.`);
+            return;
+        }
 
         console.log(`🔍 [Agenda Worker] ${appointments.length} agendamentos futuros encontrados.`);
 
@@ -99,11 +116,6 @@ const processReminders = async () => {
                         });
 
                         // D. Marca como Enviado
-                        // Nota: Se houver múltiplos lembretes (ex: 24h antes e 1h antes), 
-                        // esta flag única 'reminder_sent' impede o segundo.
-                        // Para suporte a múltiplos lembretes, precisaríamos de uma tabela auxiliar 'appointment_logs'.
-                        // No MVP, assumimos que o mais próximo (ex: 1h) vai ganhar se o cron pegar, ou o primeiro que bater.
-                        // Para segurança, marcamos true.
                         await supabase.from('appointments')
                             .update({ reminder_sent: true })
                             .eq('id', app.id);
@@ -129,6 +141,11 @@ const processReminders = async () => {
 
     } catch (e) {
         console.error("❌ [Agenda Worker] Falha crítica:", e);
+    } finally {
+        // Libera o Lock se tiver terminado antes do TTL
+        if (redis) {
+            await redis.del(LOCK_KEY);
+        }
     }
 };
 
