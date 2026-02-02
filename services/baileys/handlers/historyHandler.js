@@ -1,3 +1,4 @@
+
 import { upsertContact, updateSyncStatus } from '../../crm/sync.js'; 
 import { handleMessage } from './messageHandler.js';
 import { unwrapMessage, normalizeJid } from '../../../utils/wppParsers.js';
@@ -33,7 +34,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
     // Isso garante que a barra suba devagar e constantemente.
     // Limitado a 98% para não dar falso positivo de conclusão antes do status 'completed'.
     const estimatedProgress = progress || Math.min((chunkCounter * 2), 98);
-    console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso Geral: ${estimatedProgress}% | Latest: ${isLatest}`);
+    console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
     
     // Atualiza status no banco para a barra se mover
     await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
@@ -110,20 +111,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
             const chatJids = Object.keys(chats);
 
-            // --- LÓGICA DE PORCENTAGEM (CALCULAR TOTAL ANTES) ---
-            let totalMessagesToProcess = 0;
-            let processedCount = 0;
-
-            // Calcula quantas mensagens vamos processar realmente (após o slice do limite)
-            // Isso evita mostrar 100% antes da hora
-            chatJids.forEach(jid => {
-                const count = Math.min(chats[jid].length, HISTORY_MSG_LIMIT);
-                totalMessagesToProcess += count;
-            });
-
-            // Define intervalo de log para não poluir o terminal (ex: a cada 10% ou mínimo 5 msgs)
-            const logInterval = Math.max(5, Math.floor(totalMessagesToProcess / 10));
-
             // Processa conversas sequencialmente para não matar o banco
             for (const jid of chatJids) {
                 chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0));
@@ -144,28 +131,17 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 
                 for (const msg of topMessages) {
                     try {
-                        processedCount++; // Incrementa contador
-
                         const options = { 
                             downloadMedia: true, 
                             fetchProfilePic: false,
                             // FORCE LEAD CREATION: Isso garante que o que aparece no chat vira lead
+                            // O ensureLeadExists vai filtrar grupos/canais e permitir NULLs no nome
                             createLead: true 
                         };
-
-                        // LOG DE PORCENTAGEM CORRIGIDO
-                        if (processedCount % logInterval === 0 || processedCount === totalMessagesToProcess) {
-                            const percent = Math.floor((processedCount / totalMessagesToProcess) * 100);
-                            // Log local do lote
-                            console.log(`⏳ [SYNC Lote ${chunkCounter}] ${processedCount}/${totalMessagesToProcess} mensagens (${percent}%)`);
-                        }
-                                                
-                        // IMPORTANTE: O handleMessage fica FORA do if do log
+                        
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
-
                     } catch (msgError) {
-                        // Ignora erro individual para não travar o lote
-                        console.error(`Erro msg individual: ${msgError.message}`);
+                        // Ignora erro individual
                     }
                 }
                 
