@@ -3,68 +3,58 @@ import { updateSyncStatus } from '../crm/sync.js';
 import { handlePresenceUpdate, handleContactsUpsert } from './handlers/contactHandler.js';
 import { handleReceiptUpdate, handleMessageUpdate, handleReaction } from './handlers/messageHandler.js';
 import { handleHistorySync } from './handlers/historyHandler.js';
-import { enqueueMessage } from './messageQueue.js'; // Import da Fila
+import { enqueueMessage } from './messageQueue.js'; 
 
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
     let historyChunkCounter = 0;
 
     // -----------------------------------------------------------
-    // 1. CONEXÃO & GATILHOS
+    // 1. CONEXÃO & FEEDBACK
     // -----------------------------------------------------------
     sock.ev.on('connection.update', async (update) => {
         const { connection } = update;
         if (connection === 'open') {
-            console.log(`⚡ [LISTENER] Conexão aberta! Iniciando monitoramento.`);
-            // Feedback imediato para o usuário
+            console.log(`⚡ [LISTENER] Conexão aberta!`);
             await updateSyncStatus(sessionId, 'importing_contacts', 5);
         }
     });
 
     // -----------------------------------------------------------
-    // 2. PRESENÇA & CONTATOS
+    // 2. CONTATOS & PRESENÇA
     // -----------------------------------------------------------
     sock.ev.on('presence.update', (update) => handlePresenceUpdate(update, companyId));
     
     sock.ev.on('contacts.upsert', (contacts) => handleContactsUpsert(contacts, companyId));
     
     sock.ev.on('contacts.update', async (updates) => {
-        // Updates parciais (ex: foto nova)
         for (const update of updates) {
-            if (update.imgUrl) {
-                // Reutiliza função do handler, passando array de 1
+            if (update.imgUrl || update.notify) {
                 handleContactsUpsert([update], companyId);
             }
         }
     });
 
     // -----------------------------------------------------------
-    // 3. MENSAGENS (CORE)
+    // 3. MENSAGENS (FILA DE PROCESSAMENTO)
     // -----------------------------------------------------------
-    
-    // Novas Mensagens (Upsert)
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        // type: 'notify' (Realtime) | 'append' (Histórico/Outro device)
+        // 'notify' = Mensagem nova em tempo real
+        // 'append' = Mensagem de histórico ou sincronizada de outro device
         const isRealtime = type === 'notify';
         
         for (const msg of messages) {
-            // SUBSTITUIÇÃO: Em vez de await handleMessage(...), usamos a fila.
-            // Isso libera o listener imediatamente para receber mais eventos.
+            // Usa a fila para evitar sobrecarga do banco e garantir ordem
             enqueueMessage(msg, sock, companyId, sessionId, isRealtime);
         }
     });
 
-    // Atualizações (Polls, Edições)
     sock.ev.on('messages.update', (updates) => handleMessageUpdate(updates, companyId));
-
-    // Status de Leitura (Ticks)
     sock.ev.on('message-receipt.update', (events) => handleReceiptUpdate(events, companyId));
-
-    // Reações (Emojis)
     sock.ev.on('messages.reaction', (reactions) => handleReaction(reactions, sock, companyId));
 
     // -----------------------------------------------------------
-    // 4. HISTÓRICO (SYNC)
+    // 4. HISTÓRICO (SYNC INICIAL)
     // -----------------------------------------------------------
     sock.ev.on('messaging-history.set', (data) => {
         historyChunkCounter++;
