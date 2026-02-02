@@ -8,6 +8,7 @@ import { enqueueMessage } from './messageQueue.js'; // Import da Fila
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
     let historyChunkCounter = 0;
+    let totalHistoryMessages = 0; // Contador acumulativo da sessão
 
     // -----------------------------------------------------------
     // 1. CONEXÃO & GATILHOS
@@ -68,6 +69,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // -----------------------------------------------------------
     sock.ev.on('messaging-history.set', (data) => {
         historyChunkCounter++;
-        handleHistorySync(data, sock, sessionId, companyId, historyChunkCounter);
+        // Incrementa o contador total com as mensagens deste pacote
+        if (data.messages) {
+            totalHistoryMessages += data.messages.length;
+        }
+        handleHistorySync(data, sock, sessionId, companyId, historyChunkCounter, totalHistoryMessages);
     });
 };
