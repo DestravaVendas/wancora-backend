@@ -6,59 +6,51 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const HISTORY_MSG_LIMIT = 20; // Aumentado para garantir contexto
-const HISTORY_MONTHS_LIMIT = 12; // 1 ano de histórico
+const HISTORY_MSG_LIMIT = 20; 
+const HISTORY_MONTHS_LIMIT = 12;
 
-// Helper: Pausa para não bloquear o Event Loop e evitar Rate Limit do WhatsApp
+// Helper: Pausa para não bloquear o Event Loop
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
     
     // Calcula progresso visual
     const currentProgress = isLatest ? 100 : (progress || 10);
-    console.log(`📚 [SYNC] Processando Histórico... (${currentProgress}%)`);
+    console.log(`📚 [SYNC] Processando Histórico (Chunk ${chunkCounter})... (${currentProgress}%)`);
     await updateSyncStatus(sessionId, 'importing_messages', currentProgress);
 
     try {
         const contactsMap = new Map();
 
         // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS & FOTOS (O Segredo da Identidade)
+        // ETAPA 1: CONTATOS (Agenda & Notify)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
-            console.log(`👤 [SYNC] Enriquecendo ${contacts.length} contatos...`);
+            console.log(`👤 [SYNC] Salvando ${contacts.length} contatos da agenda...`);
             
-            // Processa em série para não tomar ban por flood de requests de foto
+            // Processa sequencialmente para garantir DB
             for (const c of contacts) {
                 const jid = normalizeJid(c.id);
                 if (!jid) continue;
                 
-                const bestName = c.name || c.verifiedName || c.notify;
-                
-                // Tenta pegar foto se não vier no payload (Comum no History Sync)
-                let profilePic = c.imgUrl || null;
-                
-                // Se não tem foto, tenta buscar ativamente (Smart Fetch)
-                if (!profilePic && !jid.includes('@g.us')) {
-                    try {
-                        // Delay minúsculo para não floodar
-                        await sleep(200); 
-                        profilePic = await sock.profilePictureUrl(jid, 'image');
-                    } catch (e) {
-                        // 401/404 é normal (sem foto ou privado)
-                    }
-                }
+                // EXTRAÇÃO AGRESSIVA DE NOME
+                // c.name = Nome na Agenda do Celular
+                // c.notify = Nome do Perfil (PushName) - MUITO IMPORTANTE SE NÃO TIVER AGENDA
+                // c.verifiedName = Nome Business
+                const bestName = c.name || c.notify || c.verifiedName;
+                const isFromBook = !!c.name; // Só é da agenda se tiver c.name
 
-                // Armazena em memória para uso rápido nas mensagens
-                contactsMap.set(jid, { name: bestName, imgUrl: profilePic });
+                // Mapeia para uso rápido
+                contactsMap.set(jid, { name: bestName });
 
-                // Salva no Banco IMEDIATAMENTE
-                await upsertContact(jid, companyId, bestName, profilePic, !!c.name, c.lid);
+                // Se não tiver foto, tentamos pegar depois, mas salvamos o contato AGORA
+                // para que as mensagens tenham onde se ligar
+                await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook, c.lid);
             }
         }
 
         // -----------------------------------------------------------
-        // ETAPA 2: MENSAGENS (Com Garantia de Contato)
+        // ETAPA 2: MENSAGENS & NAME HUNTING
         // -----------------------------------------------------------
         if (messages && messages.length > 0) {
             
@@ -81,8 +73,14 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Name Hunter V2: Se temos o nome no mapa (Etapa 1), injetamos na mensagem
-                // Isso ajuda o messageHandler a criar o Lead com nome certo
+                // NAME HUNTER: Se o contato ainda não tem nome no mapa, tenta pegar da mensagem
+                if (!contactsMap.has(jid) && clean.pushName) {
+                    contactsMap.set(jid, { name: clean.pushName });
+                    // Atualiza contato no banco "on the fly" para garantir que apareça na lista
+                    await upsertContact(jid, companyId, clean.pushName, null, false, null);
+                }
+
+                // Injeta o nome descoberto na mensagem para o messageHandler usar
                 if (contactsMap.has(jid)) {
                     clean._forcedName = contactsMap.get(jid).name;
                 } else if (clean.pushName) {
@@ -96,13 +94,12 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
             // Processa cada chat
             for (const jid of chatJids) {
-                // Ordena cronologicamente
+                // Ordena (Antigas -> Recentes)
                 chats[jid].sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                 
-                // Pega as últimas X mensagens
                 const messagesToSave = chats[jid].slice(-HISTORY_MSG_LIMIT);
                 
-                // Atualiza data do contato para ordenação (Last Message At)
+                // Atualiza data do contato
                 const lastMsg = messagesToSave[messagesToSave.length - 1];
                 if (lastMsg) {
                     const ts = new Date(Number(lastMsg.messageTimestamp) * 1000);
@@ -114,15 +111,14 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 // Salva mensagens
                 for (const msg of messagesToSave) {
-                    // Configuração: createLead: true garante que quem mandou mensagem vire lead
                     await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, { 
-                        downloadMedia: false, // Histórico não baixa mídia auto (economia)
-                        fetchProfilePic: false, // Já fizemos na Etapa 1
-                        createLead: true 
+                        downloadMedia: false, // Performance
+                        fetchProfilePic: true, // Tenta buscar foto se não tiver (Corrige falta de avatar)
+                        createLead: true // Garante que apareça no Kanban
                     });
                 }
                 
-                await sleep(50); // Respiro para o banco
+                await sleep(20); // Respiro
             }
         }
 
