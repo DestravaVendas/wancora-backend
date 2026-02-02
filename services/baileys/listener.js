@@ -9,9 +9,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     
     let historyChunkCounter = 0;
 
-    // -----------------------------------------------------------
-    // 1. CONEXÃO & FEEDBACK
-    // -----------------------------------------------------------
+    // 1. CONEXÃO
     sock.ev.on('connection.update', async (update) => {
         const { connection } = update;
         if (connection === 'open') {
@@ -20,31 +18,25 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         }
     });
 
-    // -----------------------------------------------------------
     // 2. CONTATOS & PRESENÇA
-    // -----------------------------------------------------------
     sock.ev.on('presence.update', (update) => handlePresenceUpdate(update, companyId));
     
+    // Upsert: Quando o WA notifica mudança de contato (ex: foto nova)
     sock.ev.on('contacts.upsert', (contacts) => handleContactsUpsert(contacts, companyId));
     
     sock.ev.on('contacts.update', async (updates) => {
         for (const update of updates) {
+            // Se veio imagem nova, processa como upsert completo
             if (update.imgUrl || update.notify) {
                 handleContactsUpsert([update], companyId);
             }
         }
     });
 
-    // -----------------------------------------------------------
-    // 3. MENSAGENS (FILA DE PROCESSAMENTO)
-    // -----------------------------------------------------------
+    // 3. MENSAGENS (FILA)
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        // 'notify' = Mensagem nova em tempo real
-        // 'append' = Mensagem de histórico ou sincronizada de outro device
         const isRealtime = type === 'notify';
-        
         for (const msg of messages) {
-            // Usa a fila para evitar sobrecarga do banco e garantir ordem
             enqueueMessage(msg, sock, companyId, sessionId, isRealtime);
         }
     });
@@ -53,11 +45,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     sock.ev.on('message-receipt.update', (events) => handleReceiptUpdate(events, companyId));
     sock.ev.on('messages.reaction', (reactions) => handleReaction(reactions, sock, companyId));
 
-    // -----------------------------------------------------------
-    // 4. HISTÓRICO (SYNC INICIAL)
-    // -----------------------------------------------------------
+    // 4. HISTÓRICO (SYNC)
     sock.ev.on('messaging-history.set', (data) => {
         historyChunkCounter++;
+        // Passa para o handler robusto
         handleHistorySync(data, sock, sessionId, companyId, historyChunkCounter);
     });
 };
