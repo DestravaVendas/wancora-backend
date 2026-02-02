@@ -51,7 +51,7 @@ export const createCampaign = async (req, res) => {
 
         if (campError) throw campError;
 
-        // 3. Cria Vínculos (Campaign Leads) - Bulk Insert
+        // 3. Cria Vínculos (Campaign Leads) - Bulk Insert DB
         // Prepara o array de inserção
         const campaignLeads = leads.map(l => ({
             campaign_id: campaign.id,
@@ -59,15 +59,16 @@ export const createCampaign = async (req, res) => {
             status: 'pending'
         }));
 
-        // Insere em chunks para evitar limite de payload do Postgrest se houver muitos leads (ex: > 1000)
-        const chunkSize = 100;
-        for (let i = 0; i < campaignLeads.length; i += chunkSize) {
-            const chunk = campaignLeads.slice(i, i + chunkSize);
+        // Insere em chunks para evitar limite de payload do Postgrest
+        const DB_CHUNK_SIZE = 100;
+        for (let i = 0; i < campaignLeads.length; i += DB_CHUNK_SIZE) {
+            const chunk = campaignLeads.slice(i, i + DB_CHUNK_SIZE);
             const { error: clError } = await supabase.from('campaign_leads').insert(chunk);
             if (clError) throw clError;
         }
 
-        // 4. Enfileira Jobs no Redis (BullMQ) para o Worker processar
+        // 4. Enfileira Jobs no Redis (BullMQ) - Bulk Add Redis
+        // CRÍTICO: Também fazemos chunking aqui para não estourar o Redis em campanhas massivas
         const jobs = leads.map(lead => ({
             name: `camp-${campaign.id}-${lead.id}`,
             data: {
@@ -85,8 +86,11 @@ export const createCampaign = async (req, res) => {
             }
         }));
 
-        // Adiciona em lote ao Redis
-        await campaignQueue.addBulk(jobs);
+        const REDIS_CHUNK_SIZE = 500;
+        for (let i = 0; i < jobs.length; i += REDIS_CHUNK_SIZE) {
+            const chunk = jobs.slice(i, i + REDIS_CHUNK_SIZE);
+            await campaignQueue.addBulk(chunk);
+        }
 
         console.log(`✅ [CAMPAIGN] Campanha criada e ${jobs.length} jobs enfileirados.`);
 
