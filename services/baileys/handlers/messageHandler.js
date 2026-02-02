@@ -12,11 +12,13 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
+// --- 1. HANDLE NEW MESSAGE (UPSERT) ---
 export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime = true, forcedName = null, options = {}) => {
     try {
         const { downloadMedia = true, fetchProfilePic = false, createLead = false } = options;
 
         if (!msg.message) return;
+        // Ignora status e newsletters
         if (msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid.includes('@newsletter')) return;
 
         const unwrapped = unwrapMessage(msg);
@@ -126,5 +128,108 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
     } catch (e) {
         console.error(`❌ [HANDLER] Erro msg ${msg.key?.id}:`, e.message);
+    }
+};
+
+// --- 2. HANDLE MESSAGE UPDATE (POLLS) ---
+export const handleMessageUpdate = async (updates, companyId) => {
+    for (const update of updates) {
+        // Lógica de Enquetes (Votos)
+        if (update.pollUpdates) {
+            for (const pollUpdate of update.pollUpdates) {
+                const pollMsgId = pollUpdate.pollCreationMessageKey.id;
+                const vote = pollUpdate.vote;
+                const voterJid = normalizeJid(pollUpdate.pollUpdateMessageKey.participant || pollUpdate.pollUpdateMessageKey.remoteJid);
+                
+                const { data: originalMsg } = await supabase.from('messages')
+                    .select('poll_votes, content')
+                    .eq('whatsapp_id', pollMsgId)
+                    .eq('company_id', companyId)
+                    .maybeSingle();
+
+                if (originalMsg) {
+                    try {
+                        let currentVotes = Array.isArray(originalMsg.poll_votes) ? originalMsg.poll_votes : [];
+                        // Remove voto anterior do mesmo votante para evitar duplicidade
+                        currentVotes = currentVotes.filter(v => v.voterJid !== voterJid);
+                        
+                        // Buffer -> Hex se necessário
+                        const selectedOptions = vote.selectedOptions.map(opt => Buffer.isBuffer(opt) ? opt.toString('hex') : opt);
+                        
+                        currentVotes.push({ voterJid, selectedOptions, ts: Date.now() });
+                        
+                        await supabase.from('messages')
+                            .update({ poll_votes: currentVotes })
+                            .eq('whatsapp_id', pollMsgId)
+                            .eq('company_id', companyId);
+                    } catch (e) {
+                        console.error("Erro ao atualizar enquete:", e);
+                    }
+                }
+            }
+        }
+    }
+};
+
+// --- 3. HANDLE RECEIPT UPDATE (TICKS) ---
+export const handleReceiptUpdate = async (events, companyId) => {
+    for (const event of events) {
+        const { key, receipt } = event;
+        // Ignora receipts de grupos que não são updates de status global da mensagem
+        if (receipt.userJid) continue; 
+        
+        let statusStr = 'sent';
+        const type = event.type; 
+        
+        if (type === 'read' || type === 'read-self') statusStr = 'read';
+        else if (type === 'delivery') statusStr = 'delivered';
+        else continue;
+
+        const updateData = { status: statusStr };
+        if (statusStr === 'read') updateData.read_at = new Date();
+        else if (statusStr === 'delivered') updateData.delivered_at = new Date();
+
+        await supabase.from('messages')
+            .update(updateData)
+            .eq('whatsapp_id', key.id)
+            .eq('company_id', companyId);
+    }
+};
+
+// --- 4. HANDLE REACTION ---
+export const handleReaction = async (reactions, sock, companyId) => {
+    for (const reaction of reactions) {
+        const { key, reaction: r } = reaction;
+        const msgId = key.id;
+        const participant = key.participant || key.remoteJid;
+        const actor = normalizeJid(participant);
+        const emoji = r.text;
+
+        if (!msgId || !companyId) continue;
+
+        try {
+            const { data: msg } = await supabase.from('messages')
+                .select('id, reactions')
+                .eq('whatsapp_id', msgId)
+                .eq('company_id', companyId)
+                .maybeSingle();
+
+            if (msg) {
+                let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
+                // Remove reação anterior do mesmo ator
+                currentReactions = currentReactions.filter(rx => rx.actor !== actor);
+                
+                // Se emoji existe (não é remoção), adiciona
+                if (emoji) {
+                    currentReactions.push({ text: emoji, actor: actor, ts: Date.now() });
+                }
+                
+                await supabase.from('messages')
+                    .update({ reactions: currentReactions })
+                    .eq('id', msg.id);
+            }
+        } catch (e) {
+            console.error("Erro reaction:", e);
+        }
     }
 };
