@@ -6,15 +6,15 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const HISTORY_MSG_LIMIT = 15; // Limite seguro para não estourar memória
-const HISTORY_MONTHS_LIMIT = 6; 
+const HISTORY_MSG_LIMIT = 20; // Aumentado para garantir contexto
+const HISTORY_MONTHS_LIMIT = 12; // 1 ano de histórico
 
-// Helper: Pausa para não bloquear o Event Loop do Node.js
-const tick = () => new Promise(r => setImmediate(r));
+// Helper: Pausa para não bloquear o Event Loop e evitar Rate Limit do WhatsApp
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
     
-    // Atualiza progresso visual
+    // Calcula progresso visual
     const currentProgress = isLatest ? 100 : (progress || 10);
     console.log(`📚 [SYNC] Processando Histórico... (${currentProgress}%)`);
     await updateSyncStatus(sessionId, 'importing_messages', currentProgress);
@@ -23,41 +23,42 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         const contactsMap = new Map();
 
         // -----------------------------------------------------------
-        // ETAPA 1: SALVAR CONTATOS (Prioridade Máxima)
-        // Precisamos salvar os contatos ANTES de salvar mensagens para ter nomes.
+        // ETAPA 1: CONTATOS & FOTOS (O Segredo da Identidade)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
+            console.log(`👤 [SYNC] Enriquecendo ${contacts.length} contatos...`);
             
-            // Mapeia para processamento rápido
-            contacts.forEach(c => {
+            // Processa em série para não tomar ban por flood de requests de foto
+            for (const c of contacts) {
                 const jid = normalizeJid(c.id);
-                if(jid) {
-                    const bestName = c.name || c.verifiedName || c.notify;
-                    contactsMap.set(jid, { name: bestName, imgUrl: c.imgUrl });
-                }
-            });
-
-            // Processamento em Série (Chunks de 50) para garantir integridade do banco
-            const BATCH_SIZE = 50;
-            for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
-                const batch = contacts.slice(i, i + BATCH_SIZE);
+                if (!jid) continue;
                 
-                await Promise.all(batch.map(async (c) => {
-                    const jid = normalizeJid(c.id);
-                    if (!jid) return;
-                    
-                    const bestName = c.name || c.verifiedName || c.notify;
-                    
-                    // Upsert com nome da agenda/notify
-                    await upsertContact(jid, companyId, bestName, c.imgUrl || null, !!c.name, c.lid);
-                }));
+                const bestName = c.name || c.verifiedName || c.notify;
+                
+                // Tenta pegar foto se não vier no payload (Comum no History Sync)
+                let profilePic = c.imgUrl || null;
+                
+                // Se não tem foto, tenta buscar ativamente (Smart Fetch)
+                if (!profilePic && !jid.includes('@g.us')) {
+                    try {
+                        // Delay minúsculo para não floodar
+                        await sleep(200); 
+                        profilePic = await sock.profilePictureUrl(jid, 'image');
+                    } catch (e) {
+                        // 401/404 é normal (sem foto ou privado)
+                    }
+                }
 
-                await tick(); // Respira
+                // Armazena em memória para uso rápido nas mensagens
+                contactsMap.set(jid, { name: bestName, imgUrl: profilePic });
+
+                // Salva no Banco IMEDIATAMENTE
+                await upsertContact(jid, companyId, bestName, profilePic, !!c.name, c.lid);
             }
         }
 
         // -----------------------------------------------------------
-        // ETAPA 2: PROCESSAR MENSAGENS
+        // ETAPA 2: MENSAGENS (Com Garantia de Contato)
         // -----------------------------------------------------------
         if (messages && messages.length > 0) {
             
@@ -65,7 +66,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             cutoffDate.setMonth(cutoffDate.getMonth() - HISTORY_MONTHS_LIMIT);
             const cutoffTimestamp = Math.floor(cutoffDate.getTime() / 1000);
 
-            // Agrupa mensagens por Chat para processar conversa por conversa
+            // Agrupa por Chat
             const chats = {}; 
             
             for (const msg of messages) {
@@ -80,11 +81,12 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Name Hunter: Se o contato não veio na lista 'contacts' mas veio na mensagem
-                if (!contactsMap.has(jid) && clean.pushName) {
-                    clean._forcedName = clean.pushName;
-                } else if (contactsMap.has(jid)) {
+                // Name Hunter V2: Se temos o nome no mapa (Etapa 1), injetamos na mensagem
+                // Isso ajuda o messageHandler a criar o Lead com nome certo
+                if (contactsMap.has(jid)) {
                     clean._forcedName = contactsMap.get(jid).name;
+                } else if (clean.pushName) {
+                    clean._forcedName = clean.pushName;
                 }
 
                 chats[jid].push(clean);
@@ -92,39 +94,35 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
             const chatJids = Object.keys(chats);
 
-            // Processa cada chat individualmente
+            // Processa cada chat
             for (const jid of chatJids) {
-                // Ordena (Antigas -> Recentes)
+                // Ordena cronologicamente
                 chats[jid].sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
                 
-                // Pega apenas as últimas X mensagens
+                // Pega as últimas X mensagens
                 const messagesToSave = chats[jid].slice(-HISTORY_MSG_LIMIT);
                 
-                // Atualiza data do contato para ordenação correta no frontend
+                // Atualiza data do contato para ordenação (Last Message At)
                 const lastMsg = messagesToSave[messagesToSave.length - 1];
                 if (lastMsg) {
                     const ts = new Date(Number(lastMsg.messageTimestamp) * 1000);
-                    // Atualiza data sem bloquear
-                    supabase.from('contacts')
+                    await supabase.from('contacts')
                         .update({ last_message_at: ts })
                         .eq('company_id', companyId)
-                        .eq('jid', jid)
-                        .then(() => {});
+                        .eq('jid', jid);
                 }
 
                 // Salva mensagens
                 for (const msg of messagesToSave) {
-                    // Configurações de Sync:
-                    // - downloadMedia: false (Economiza banda no histórico)
-                    // - createLead: true (Garante que chats ativos apareçam no Kanban/Lista)
+                    // Configuração: createLead: true garante que quem mandou mensagem vire lead
                     await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, { 
-                        downloadMedia: false, 
-                        fetchProfilePic: true, // Tenta buscar foto se não tiver
+                        downloadMedia: false, // Histórico não baixa mídia auto (economia)
+                        fetchProfilePic: false, // Já fizemos na Etapa 1
                         createLead: true 
                     });
                 }
                 
-                await tick();
+                await sleep(50); // Respiro para o banco
             }
         }
 
