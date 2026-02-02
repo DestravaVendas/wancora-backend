@@ -6,51 +6,74 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const HISTORY_MSG_LIMIT = 20; 
-const HISTORY_MONTHS_LIMIT = 12;
+const HISTORY_MSG_LIMIT = 15; // Equilíbrio entre carga e contexto
+const HISTORY_MONTHS_LIMIT = 8;
+const processedHistoryChunks = new Set();
 
-// Helper: Pausa para não bloquear o Event Loop
+// Helper: Pausa para não sufocar o banco/CPU
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
     
-    // Calcula progresso visual
-    const currentProgress = isLatest ? 100 : (progress || 10);
-    console.log(`📚 [SYNC] Processando Histórico (Chunk ${chunkCounter})... (${currentProgress}%)`);
-    await updateSyncStatus(sessionId, 'importing_messages', currentProgress);
+    // Evita processar o mesmo chunk duas vezes (Anti-Duplication)
+    const chunkKey = `${sessionId}-chunk-${chunkCounter}`;
+    if (processedHistoryChunks.has(chunkKey)) return;
+    processedHistoryChunks.add(chunkKey);
+
+    // UX: Progresso linear
+    const estimatedProgress = progress || Math.min((chunkCounter * 2), 99);
+    console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
+    await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
 
     try {
         const contactsMap = new Map();
 
         // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS (Agenda & Notify)
+        // ETAPA 1: CONTATOS (Lotes de 50)
+        // Restauração do "Smart Fetch" original que busca fotos
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
-            console.log(`👤 [SYNC] Salvando ${contacts.length} contatos da agenda...`);
-            
-            // Processa sequencialmente para garantir DB
-            for (const c of contacts) {
-                const jid = normalizeJid(c.id);
-                if (!jid) continue;
+            const BATCH_SIZE = 50;
+            for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
+                const batch = contacts.slice(i, i + BATCH_SIZE);
                 
-                // EXTRAÇÃO AGRESSIVA DE NOME
-                // c.name = Nome na Agenda do Celular
-                // c.notify = Nome do Perfil (PushName) - MUITO IMPORTANTE SE NÃO TIVER AGENDA
-                // c.verifiedName = Nome Business
-                const bestName = c.name || c.notify || c.verifiedName;
-                const isFromBook = !!c.name; // Só é da agenda se tiver c.name
+                await Promise.all(batch.map(async (c) => {
+                    const jid = normalizeJid(c.id);
+                    if (!jid) return;
+                    
+                    const bestName = c.name || c.verifiedName || c.notify;
+                    
+                    // --- SMART FETCH DE FOTO (Lógica Original Restaurada) ---
+                    let finalImgUrl = c.imgUrl || null;
 
-                // Mapeia para uso rápido
-                contactsMap.set(jid, { name: bestName });
+                    // Se não veio foto no pacote, tenta buscar ativamente
+                    if (!finalImgUrl && !jid.includes('@newsletter')) {
+                        try {
+                            // Pequeno delay aleatório para não tomar ban por flood de requests
+                            await sleep(Math.floor(Math.random() * 200)); 
+                            finalImgUrl = await sock.profilePictureUrl(jid, 'image');
+                        } catch (e) {
+                            finalImgUrl = null;
+                        }
+                    }
 
-                // Se não tiver foto, tentamos pegar depois, mas salvamos o contato AGORA
-                // para que as mensagens tenham onde se ligar
-                await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook, c.lid);
+                    contactsMap.set(jid, { 
+                        name: bestName, 
+                        imgUrl: finalImgUrl, 
+                        isFromBook: !!c.name,
+                        lid: c.lid || null 
+                    });
+
+                    // Upsert seguro
+                    await upsertContact(jid, companyId, bestName, finalImgUrl, !!c.name, c.lid);
+                }));
+                
+                await sleep(50); // Respira
             }
         }
 
         // -----------------------------------------------------------
-        // ETAPA 2: MENSAGENS & NAME HUNTING
+        // ETAPA 2: MENSAGENS (Por Conversa)
         // -----------------------------------------------------------
         if (messages && messages.length > 0) {
             
@@ -58,67 +81,60 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             cutoffDate.setMonth(cutoffDate.getMonth() - HISTORY_MONTHS_LIMIT);
             const cutoffTimestamp = Math.floor(cutoffDate.getTime() / 1000);
 
-            // Agrupa por Chat
+            // Agrupa por chat
             const chats = {}; 
-            
-            for (const msg of messages) {
+            messages.forEach(msg => {
                 const clean = unwrapMessage(msg);
-                if (!clean.key?.remoteJid) continue;
+                if (!clean.key?.remoteJid) return;
                 
                 const msgTs = Number(clean.messageTimestamp);
-                if (msgTs < cutoffTimestamp) continue;
+                if (msgTs < cutoffTimestamp) return;
 
                 const jid = normalizeJid(clean.key.remoteJid);
-                if (jid === 'status@broadcast') continue;
+                if (jid === 'status@broadcast') return;
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // NAME HUNTER: Se o contato ainda não tem nome no mapa, tenta pegar da mensagem
-                if (!contactsMap.has(jid) && clean.pushName) {
-                    contactsMap.set(jid, { name: clean.pushName });
-                    // Atualiza contato no banco "on the fly" para garantir que apareça na lista
-                    await upsertContact(jid, companyId, clean.pushName, null, false, null);
-                }
-
-                // Injeta o nome descoberto na mensagem para o messageHandler usar
-                if (contactsMap.has(jid)) {
-                    clean._forcedName = contactsMap.get(jid).name;
-                } else if (clean.pushName) {
-                    clean._forcedName = clean.pushName;
-                }
-
+                // Name Injection: Se temos o nome da etapa 1, injetamos na mensagem
+                const knownContact = contactsMap.get(jid);
+                clean._forcedName = knownContact ? knownContact.name : clean.pushName;
+                
                 chats[jid].push(clean);
-            }
+            });
 
             const chatJids = Object.keys(chats);
 
-            // Processa cada chat
+            // Processa conversas sequencialmente para não matar o banco
             for (const jid of chatJids) {
-                // Ordena (Antigas -> Recentes)
-                chats[jid].sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+                // Ordena cronologicamente
+                chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0)); // Desc
                 
-                const messagesToSave = chats[jid].slice(-HISTORY_MSG_LIMIT);
-                
-                // Atualiza data do contato
-                const lastMsg = messagesToSave[messagesToSave.length - 1];
-                if (lastMsg) {
-                    const ts = new Date(Number(lastMsg.messageTimestamp) * 1000);
-                    await supabase.from('contacts')
-                        .update({ last_message_at: ts })
-                        .eq('company_id', companyId)
-                        .eq('jid', jid);
+                // Atualiza data da conversa
+                const latestMsg = chats[jid][0];
+                if (latestMsg && latestMsg.messageTimestamp) {
+                    const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
+                    // Fire and forget update
+                    supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
                 }
 
-                // Salva mensagens
-                for (const msg of messagesToSave) {
-                    await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, { 
-                        downloadMedia: false, // Performance
-                        fetchProfilePic: true, // Tenta buscar foto se não tiver (Corrige falta de avatar)
-                        createLead: true // Garante que apareça no Kanban
-                    });
+                // Pega apenas as N últimas para salvar no banco
+                const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT).reverse(); // Asc para salvar
+                
+                for (const msg of topMessages) {
+                    try {
+                        const options = { 
+                            downloadMedia: false, // Não baixa mídia no histórico (economia)
+                            fetchProfilePic: false, // Já fizemos na Etapa 1
+                            createLead: true // Cria lead se tiver interação
+                        };
+                        
+                        await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
+                    } catch (msgError) {
+                        // Ignora erro individual
+                    }
                 }
                 
-                await sleep(20); // Respiro
+                await sleep(10); 
             }
         }
 
@@ -126,8 +142,9 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         console.error("❌ [SYNC ERROR]", e);
     } finally {
         if (isLatest) {
-            console.log(`✅ [HISTÓRICO] Sincronização Finalizada.`);
+            console.log(`✅ [HISTÓRICO] Sincronização 100% Concluída.`);
             await updateSyncStatus(sessionId, 'completed', 100);
+            processedHistoryChunks.clear();
         }
     }
 };
