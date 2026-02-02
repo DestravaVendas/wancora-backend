@@ -14,6 +14,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         const { connection } = update;
         if (connection === 'open') {
             console.log(`⚡ [LISTENER] Conexão aberta! Iniciando monitoramento.`);
+            // Inicia o estado no banco
             await updateSyncStatus(sessionId, 'importing_contacts', 1);
         }
     });
@@ -48,10 +49,10 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     sock.ev.on('messages.reaction', (reactions) => handleReaction(reactions, sock, companyId));
 
     // -----------------------------------------------------------
-    // 4. HISTÓRICO (SYNC LINEAR)
+    // 4. HISTÓRICO (SYNC UNIFICADO)
     // -----------------------------------------------------------
     sock.ev.on('messaging-history.set', (data) => {
-        // Passa o pacote inteiro para o handler que vai filtrar e processar de uma vez
+        // Envia o pacote para o handler. O handler vai acumular no buffer.
         handleHistorySync(data, sock, sessionId, companyId);
     });
 };
