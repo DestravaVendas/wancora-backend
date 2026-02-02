@@ -10,10 +10,10 @@ const HISTORY_MSG_LIMIT = 10;
 const HISTORY_MONTHS_LIMIT = 8;
 const processedHistoryChunks = new Set();
 
-// Helper: Pausa para não sufocar o banco/CPU
+// Helper: Pausa mínima apenas para não travar o Event Loop (0ms = setImmediate)
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
+export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter, totalAccumulated) => {
     
     const chunkKey = `${sessionId}-chunk-${chunkCounter}`;
     if (processedHistoryChunks.has(chunkKey)) {
@@ -30,26 +30,29 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         
     if (currentInstance?.sync_status === 'completed') return;
 
-    // UX FIX: Progresso mais conservador (2% por chunk em vez de 5%)
-    // Isso garante que a barra suba devagar e constantemente.
-    // Limitado a 98% para não dar falso positivo de conclusão antes do status 'completed'.
-    const estimatedProgress = progress || Math.min((chunkCounter * 2), 98);
-    console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
+    // LÓGICA DE PORCENTAGEM VISUAL:
+    // Se o Baileys mandar progresso, usamos. Se não, usamos uma estimativa baseada nos chunks.
+    // Mas NUNCA deixamos chegar a 100% antes do 'isLatest'.
+    let visualProgress = progress || Math.min((chunkCounter * 5), 95);
+    if (!isLatest && visualProgress >= 100) visualProgress = 99;
+
+    console.log(`📚 [SYNC] Lote ${chunkCounter} | Msgs no Lote: ${messages?.length || 0} | Total Acumulado: ${totalAccumulated} | Baileys Progress: ${progress}%`);
     
     // Atualiza status no banco para a barra se mover
-    await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
+    await updateSyncStatus(sessionId, 'importing_messages', visualProgress);
 
     try {
         const contactsMap = new Map();
 
         // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS (Lotes de 50)
+        // ETAPA 1: CONTATOS (Otimizado)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
-            const BATCH_SIZE = 50;
+            const BATCH_SIZE = 100; // Aumentado para 100 para acelerar
             for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
                 const batch = contacts.slice(i, i + BATCH_SIZE);
                 
+                // Processamento Paralelo de Contatos
                 await Promise.all(batch.map(async (c) => {
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
@@ -74,16 +77,16 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         lid: c.lid || null 
                     });
 
-                    // Upsert seguro com a URL correta
                     await upsertContact(jid, companyId, bestName, finalImgUrl, !!c.name, c.lid);
                 }));
                 
-                await sleep(50); // Respira
+                // Pequena pausa para o banco respirar
+                await sleep(5); 
             }
         }
 
         // -----------------------------------------------------------
-        // ETAPA 2: MENSAGENS (Por Conversa)
+        // ETAPA 2: MENSAGENS (Otimizado com Logs 2%)
         // -----------------------------------------------------------
         if (messages && messages.length > 0) {
             
@@ -110,16 +113,20 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             });
 
             const chatJids = Object.keys(chats);
+            let processedInThisBatch = 0;
+            const totalInThisBatch = messages.length; // Aproximado (pós filtro)
 
-            // Processa conversas sequencialmente para não matar o banco
+            // Log inicial do lote
+            console.log(`📥 [SYNC] Processando ${totalInThisBatch} mensagens neste lote...`);
+
+            // Processa conversas sequencialmente
             for (const jid of chatJids) {
                 chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0));
                 
-                // Pega a mensagem mais recente para atualizar o last_message_at do contato
+                // Atualiza last_message_at
                 const latestMsg = chats[jid][chats[jid].length - 1];
                 if (latestMsg && latestMsg.messageTimestamp) {
                     const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
-                    // Atualiza o contato com a data REAL da mensagem, não Date.now()
                     await supabase.from('contacts')
                         .update({ last_message_at: ts })
                         .eq('company_id', companyId)
@@ -134,28 +141,41 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         const options = { 
                             downloadMedia: true, 
                             fetchProfilePic: false,
-                            // FORCE LEAD CREATION: Isso garante que o que aparece no chat vira lead
-                            // O ensureLeadExists vai filtrar grupos/canais e permitir NULLs no nome
                             createLead: true 
                         };
                         
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
+                        processedInThisBatch++;
+
+                        // --- LOG DE PROGRESSO REAL (2% em 2%) ---
+                        const percent = Math.floor((processedInThisBatch / totalInThisBatch) * 100);
+                        if (processedInThisBatch % Math.ceil(totalInThisBatch / 50) === 0) { // A cada ~2%
+                            console.log(`⏳ [SYNC LOTE ${chunkCounter}] ${processedInThisBatch}/${totalInThisBatch} mensagens (${percent}%)`);
+                        }
+
                     } catch (msgError) {
                         // Ignora erro individual
                     }
                 }
                 
-                await sleep(20); 
+                // Reduzido de 20ms para 1ms para acelerar o download
+                await sleep(1); 
             }
+            
+            console.log(`✅ [SYNC LOTE ${chunkCounter}] ${processedInThisBatch}/${totalInThisBatch} mensagens (100%) - Lote Finalizado`);
         }
 
     } catch (e) {
         console.error("❌ [SYNC ERROR]", e);
     } finally {
-        // SE FOR O FIM, MARCA COMO COMPLETO
+        // SE FOR O FIM (Flag isLatest do Baileys), MARCA COMO COMPLETO
         if (isLatest) {
-            console.log(`✅ [HISTÓRICO] Sincronização 100% Concluída.`);
+            console.log(`🎉 [HISTÓRICO FINAL] Todos os lotes processados. Marcando como 100% Completo.`);
+            
+            // Força um pequeno delay para garantir que a UI pegue o 99% antes do 100%
+            await sleep(500); 
             await updateSyncStatus(sessionId, 'completed', 100);
+            
             processedHistoryChunks.clear();
         }
     }
