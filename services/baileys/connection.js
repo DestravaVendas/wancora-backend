@@ -11,6 +11,7 @@ import { useSupabaseAuthState } from '../../auth/supabaseAuth.js';
 import { setupListeners } from './listener.js';
 import { deleteSessionData, updateInstanceStatus, normalizeJid } from '../crm/sync.js';
 import { createClient } from "@supabase/supabase-js";
+import getRedisClient from '../redisClient.js'; // Redis para cache de retry
 import pino from 'pino';
 
 // Cliente para getMessage (Recuperação de falha de criptografia)
@@ -54,11 +55,27 @@ const subscribeToRecentChats = async (sock, companyId) => {
     }
 };
 
+// Verifica se a própria instância é Business
+const checkIsBusiness = async (sock) => {
+    try {
+        // Tenta obter o perfil de business do próprio JID
+        const myJid = normalizeJid(sock.user?.id);
+        if(!myJid) return false;
+        
+        // Se retornar dados, é business. Se der 404, é pessoal.
+        const bizProfile = await sock.getBusinessProfile(myJid);
+        return !!bizProfile;
+    } catch (e) {
+        return false;
+    }
+};
+
 export const startSession = async (sessionId, companyId) => {
     try {
         // 1. Recupera estado de autenticação do Banco
         const { state, saveCreds } = await useSupabaseAuthState(sessionId);
         const { version } = await fetchLatestBaileysVersion();
+        const redis = getRedisClient();
 
         console.log(`🔌 [CONNECTION] Iniciando sessão ${sessionId} (v${version.join('.')}) - Empresa: ${companyId}`);
 
@@ -73,6 +90,19 @@ export const startSession = async (sessionId, companyId) => {
                 // Isso reduz IO e evita que o bot bata no banco a cada mensagem recebida.
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
+            // PERSISTÊNCIA DE RETRY (Critical para restarts)
+            msgRetryCounterCache: redis ? {
+                get: async (key) => {
+                    const result = await redis.get(`retry:${sessionId}:${key}`);
+                    return result ? parseInt(result) : 0;
+                },
+                set: async (key, value) => {
+                    await redis.set(`retry:${sessionId}:${key}`, value, 'EX', 60 * 60 * 24); // TTL 24h
+                },
+                del: async (key) => {
+                    await redis.del(`retry:${sessionId}:${key}`);
+                }
+            } : undefined,
             browser: Browsers.ubuntu("Chrome"), 
             syncFullHistory: true, 
             markOnlineOnConnect: true,
@@ -161,12 +191,16 @@ export const startSession = async (sessionId, companyId) => {
                 console.log(`✅ [CONECTADO] Sessão ${sessionId} online!`);
                 retries.delete(sessionId); 
                 
+                // Verifica se é Business (Audit)
+                const isBiz = await checkIsBusiness(sock);
+                
                 await updateInstanceStatus(sessionId, companyId, { 
                     status: 'connected', 
                     qrcode_url: null, 
                     sync_status: 'importing_contacts', 
                     sync_percent: 5,
-                    profile_pic_url: sock.user?.imgUrl || null
+                    profile_pic_url: sock.user?.imgUrl || null,
+                    is_business_account: isBiz // Salva no banco
                 });
 
                 // ATIVAÇÃO DE PRESENÇA (FIX Visto Por Último)
