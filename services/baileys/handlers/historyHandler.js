@@ -36,9 +36,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
     const estimatedProgress = progress || Math.min((chunkCounter * 2), 98);
     console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
     
-    // --- LOG DE PORCENTAGEM (ADICIONADO) ---
-    console.log(`📊 [SYNC DB] Atualizando progresso no banco: ${estimatedProgress}%`);
-
     // Atualiza status no banco para a barra se mover
     await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
 
@@ -158,10 +155,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         // SE FOR O FIM, MARCA COMO COMPLETO
         if (isLatest) {
             console.log(`✅ [HISTÓRICO] Sincronização 100% Concluída.`);
-            
-            // --- LOG DE PORCENTAGEM FINAL (ADICIONADO) ---
-            console.log(`💯 [SYNC DB] Finalizando: Enviando 100% (Completed)`);
-
             await updateSyncStatus(sessionId, 'completed', 100);
             processedHistoryChunks.clear();
         }
