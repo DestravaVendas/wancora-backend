@@ -103,17 +103,26 @@ export const syncNow = async (req, res) => {
     }
 };
 
-// [NOVO] Upload via Base64 (Simples e compatível com estrutura atual)
+// [ATUALIZADO] Upload via Multipart/Form-Data (Streaming/Buffer)
 export const uploadFileToDrive = async (req, res) => {
-    const { companyId, name, mimeType, base64, folderId } = req.body;
+    // Agora os campos vêm no req.body e o arquivo em req.file (graças ao Multer)
+    const { companyId, name, folderId } = req.body;
+    const file = req.file;
 
-    if (!companyId || !name || !base64) {
-        return res.status(400).json({ error: "Dados incompletos para upload." });
+    if (!companyId || !file) {
+        return res.status(400).json({ error: "Arquivo ou CompanyId ausentes." });
     }
 
     try {
-        const buffer = Buffer.from(base64, 'base64');
-        const fileData = await uploadFile(companyId, buffer, name, mimeType || 'application/octet-stream', folderId);
+        // O Multer já processou o arquivo para um buffer
+        const fileData = await uploadFile(
+            companyId, 
+            file.buffer, 
+            name || file.originalname, 
+            file.mimetype, 
+            folderId === 'null' ? null : folderId // FormData converte null para string 'null'
+        );
+        
         res.json({ success: true, file: fileData });
     } catch (e) {
         console.error("Erro Upload Drive:", e);
