@@ -18,13 +18,13 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         }
     });
 
-    // 2. CONTATOS & PRESENÇA
+    // 2. PRESENÇA & CONTATOS
     sock.ev.on('presence.update', (update) => handlePresenceUpdate(update, companyId));
     
-    // Upsert: Quando o WA notifica mudança de contato (ex: foto nova)
     sock.ev.on('contacts.upsert', (contacts) => handleContactsUpsert(contacts, companyId));
     
     sock.ev.on('contacts.update', async (updates) => {
+        // Updates parciais (ex: foto nova ou nome alterado)
         for (const update of updates) {
             if (update.imgUrl || update.notify) {
                 handleContactsUpsert([update], companyId);
@@ -33,6 +33,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // 3. MENSAGENS (FILA)
+    // Usa a fila para garantir ordem e performance
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         const isRealtime = type === 'notify';
         for (const msg of messages) {
@@ -47,7 +48,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // 4. HISTÓRICO (SYNC)
     sock.ev.on('messaging-history.set', (data) => {
         historyChunkCounter++;
-        // Passa para o handler robusto
         handleHistorySync(data, sock, sessionId, companyId, historyChunkCounter);
     });
 };
