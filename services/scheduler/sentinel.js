@@ -203,47 +203,57 @@ const processAIResponse = async (payload) => {
         // Loop de processamento de Tools (Multi-Turn)
         let toolResponse = response;
         let functionCalls = toolResponse.functionCalls;
+        let loopLimit = 0; // Proteção contra loop infinito
 
-        while (functionCalls && functionCalls.length > 0) {
+        while (functionCalls && functionCalls.length > 0 && loopLimit < 3) {
+            loopLimit++;
             const parts = [];
 
             for (const call of functionCalls) {
                 console.log(`🔧 [AI TOOL] Chamando: ${call.name} args:`, call.args);
                 let result = {};
 
-                // --- EXECUÇÃO DAS TOOLS ---
-                if (call.name === 'search_files') {
-                    const query = call.args.query;
-                    // Chama RPC do Supabase
-                    const { data: files } = await supabase.rpc('search_drive_files', { 
-                        p_company_id: company_id, 
-                        p_query: query,
-                        p_limit: 5 
-                    });
-                    
-                    if (files && files.length > 0) {
-                        result = { found: true, files: files.map(f => ({ google_id: f.google_id, name: f.name, type: f.mime_type })) };
-                    } else {
-                        result = { found: false, message: "Nenhum arquivo encontrado com esse nome." };
-                    }
-                } 
-                else if (call.name === 'send_file') {
-                    const googleId = call.args.google_id;
-                    const sessionId = await getSessionId(company_id);
-                    if (sessionId) {
-                        // Dispara envio Assíncrono via Sender (Não bloqueia a IA)
-                        // O Sender agora sabe lidar com driveFileId
-                        sendMessage({
-                            sessionId,
-                            to: remote_jid,
-                            driveFileId: googleId, // ID Real do Google
-                            companyId
-                        }).catch(err => console.error("Erro ao enviar arquivo via IA:", err));
+                // --- EXECUÇÃO SEGURA DAS TOOLS ---
+                try {
+                    if (call.name === 'search_files') {
+                        const query = call.args.query;
+                        // Chama RPC do Supabase
+                        const { data: files } = await supabase.rpc('search_drive_files', { 
+                            p_company_id: company_id, 
+                            p_query: query,
+                            p_limit: 5 
+                        });
                         
-                        result = { success: true, message: "Arquivo enviado para o chat." };
+                        if (files && files.length > 0) {
+                            result = { found: true, files: files.map(f => ({ google_id: f.google_id, name: f.name, type: f.mime_type })) };
+                        } else {
+                            result = { found: false, message: "Nenhum arquivo encontrado com esse nome." };
+                        }
+                    } 
+                    else if (call.name === 'send_file') {
+                        const googleId = call.args.google_id;
+                        if (!googleId) throw new Error("ID do arquivo não fornecido.");
+
+                        const sessionId = await getSessionId(company_id);
+                        if (sessionId) {
+                            // Dispara envio Assíncrono via Sender (Não bloqueia a IA)
+                            sendMessage({
+                                sessionId,
+                                to: remote_jid,
+                                driveFileId: googleId, // ID Real do Google
+                                companyId
+                            }).catch(err => console.error("Erro ao enviar arquivo via IA:", err));
+                            
+                            result = { success: true, message: "Arquivo enviado para o chat." };
+                        } else {
+                            result = { success: false, message: "WhatsApp desconectado." };
+                        }
                     } else {
-                        result = { success: false, message: "WhatsApp desconectado." };
+                        result = { error: "Ferramenta desconhecida." };
                     }
+                } catch (toolError) {
+                    console.error(`⚠️ [AI TOOL ERROR] ${call.name}:`, toolError.message);
+                    result = { error: `Erro ao executar ferramenta: ${toolError.message}. Tente novamente ou peça outra coisa.` };
                 }
 
                 // Adiciona resposta da função ao histórico da conversa para a próxima volta
