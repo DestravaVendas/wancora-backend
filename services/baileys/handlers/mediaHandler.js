@@ -1,6 +1,7 @@
 
 import { downloadMediaMessage } from '@whiskeysockets/baileys';
 import { createClient } from '@supabase/supabase-js';
+import { unwrapMessage } from '../../../utils/wppParsers.js';
 import mime from 'mime-types';
 import pino from 'pino';
 import sharp from 'sharp'; 
@@ -8,9 +9,12 @@ import sharp from 'sharp';
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'silent' });
 
-export const handleMediaUpload = async (msg, companyId) => {
+export const handleMediaUpload = async (rawMsg, companyId) => {
     try {
-        // PATCH: User-Agent Genérico
+        // 1. Sanitização: Desenrola a mensagem para acessar o conteúdo real (ViewOnce, Ephemeral, etc)
+        const msg = unwrapMessage(rawMsg);
+
+        // PATCH: User-Agent Genérico para evitar bloqueio no download
         const downloadOptions = {
             options: {
                 headers: {
@@ -18,10 +22,11 @@ export const handleMediaUpload = async (msg, companyId) => {
                     'Referer': 'https://web.whatsapp.com/',
                     'Origin': 'https://web.whatsapp.com/'
                 },
-                timeout: 15000 
+                timeout: 30000 // Aumentado para 30s para vídeos maiores
             }
         };
 
+        // Download do Buffer
         let buffer = await downloadMediaMessage(
             msg,
             'buffer',
@@ -31,7 +36,7 @@ export const handleMediaUpload = async (msg, companyId) => {
 
         if (!buffer) return null;
 
-        // --- Tipo ---
+        // --- Detecção de Tipo ---
         let mimeType = 'application/octet-stream';
         const messageType = Object.keys(msg.message)[0];
 
@@ -41,7 +46,7 @@ export const handleMediaUpload = async (msg, companyId) => {
         else if (messageType === 'documentMessage') mimeType = msg.message.documentMessage?.mimetype || 'application/pdf';
         else if (messageType === 'stickerMessage') mimeType = 'image/webp';
 
-        // --- OTIMIZAÇÃO COM SHARP (IMAGENS) ---
+        // --- OTIMIZAÇÃO COM SHARP (Apenas Imagens) ---
         // Se for imagem (exceto sticker que já vem otimizado ou gif animado), redimensiona
         if (mimeType.startsWith('image/') && messageType !== 'stickerMessage' && !mimeType.includes('gif')) {
             try {
@@ -59,6 +64,7 @@ export const handleMediaUpload = async (msg, companyId) => {
         }
 
         let ext = mime.extension(mimeType) || 'bin';
+        // Normalização de extensões
         if (mimeType === 'audio/mp4' || mimeType.includes('audio')) ext = 'm4a';
         if (mimeType.includes('opus')) ext = 'ogg';
         if (mimeType === 'image/jpeg') ext = 'jpg';
@@ -66,7 +72,7 @@ export const handleMediaUpload = async (msg, companyId) => {
         const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
         const filePath = companyId ? `${companyId}/${fileName}` : fileName;
 
-        // Upload
+        // Upload para Supabase Storage
         const { error } = await supabase.storage
             .from('chat-media')
             .upload(filePath, buffer, { contentType: mimeType, upsert: false });
@@ -83,6 +89,7 @@ export const handleMediaUpload = async (msg, companyId) => {
 
     } catch (e) {
         const m = e.message || '';
+        // Ignora erros comuns de mídia expirada ou não autorizada
         if (m.includes('403') || m.includes('401') || m.includes('404') || m.includes('410') || m.includes('timeout')) {
              return null; 
         }
