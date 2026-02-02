@@ -22,7 +22,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const unwrapped = unwrapMessage(msg);
         let jid = normalizeJid(unwrapped.key.remoteJid);
         const fromMe = unwrapped.key.fromMe;
-        // Usa o nome forçado (do histórico) ou o pushName da mensagem
+        // Pega o pushName da mensagem ou o nome forçado (do histórico)
         const pushName = forcedName || unwrapped.pushName;
         
         const type = getContentType(unwrapped.message);
@@ -44,12 +44,13 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         let leadId = null;
         if (!fromMe) {
             const myJid = normalizeJid(sock.user?.id);
+            // Se for realtime ou se foi forçado a criar lead (histórico recente)
             if (isRealtime || createLead) {
-                // Cria Lead se não existir
+                // Passa o pushName para tentar nomear o lead corretamente
                 leadId = await ensureLeadExists(jid, companyId, pushName, myJid);
                 
-                // ATUALIZAÇÃO DE INFORMAÇÕES (NOME/FOTO)
-                // Se for realtime ou se pedimos fetchProfilePic (no histórico)
+                // ATUALIZAÇÃO DE INFORMAÇÕES
+                // Se for realtime ou se pedimos fetchProfilePic no histórico
                 if (isRealtime || fetchProfilePic) {
                     refreshContactInfo(sock, jid, companyId, pushName).catch(err => console.error("Refresh Error", err));
                 }
