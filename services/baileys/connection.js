@@ -194,17 +194,31 @@ export const startSession = async (sessionId, companyId) => {
                 // Verifica se é Business (Audit)
                 const isBiz = await checkIsBusiness(sock);
                 
-                await updateInstanceStatus(sessionId, companyId, { 
-                    status: 'connected', 
-                    qrcode_url: null, 
-                    sync_status: 'importing_contacts', 
-                    sync_percent: 5,
+                // FIX RECONEXÃO: Verifica status anterior antes de forçar 'importing'
+                const { data: prev } = await supabase
+                    .from('instances')
+                    .select('sync_status')
+                    .eq('session_id', sessionId)
+                    .single();
+
+                const updatePayload = {
+                    status: 'connected',
+                    qrcode_url: null,
                     profile_pic_url: sock.user?.imgUrl || null,
-                    is_business_account: isBiz // Salva no banco
-                });
+                    is_business_account: isBiz
+                };
+
+                // Se NÃO estava completo, reinicia o sync visual.
+                // Se JÁ estava completo (reconexão), mantém como está e não reseta a %
+                // Isso evita que o modal de loading apareça em reconexões simples.
+                if (prev?.sync_status !== 'completed') {
+                    updatePayload.sync_status = 'importing_contacts';
+                    updatePayload.sync_percent = 5;
+                }
+
+                await updateInstanceStatus(sessionId, companyId, updatePayload);
 
                 // ATIVAÇÃO DE PRESENÇA (FIX Visto Por Último)
-                // Espera 5s para garantir que a conexão está estável antes de floodar com subscribes
                 setTimeout(() => subscribeToRecentChats(sock, companyId), 5000);
             }
 
