@@ -7,6 +7,9 @@ import { enqueueMessage } from './messageQueue.js';
 
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
+    // Contador local de lotes para este listener
+    let historyChunkCounter = 0;
+
     // -----------------------------------------------------------
     // 1. CONEXÃO & GATILHOS
     // -----------------------------------------------------------
@@ -14,7 +17,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         const { connection } = update;
         if (connection === 'open') {
             console.log(`⚡ [LISTENER] Conexão aberta! Iniciando monitoramento.`);
-            // Inicia o estado no banco
             await updateSyncStatus(sessionId, 'importing_contacts', 1);
         }
     });
@@ -49,10 +51,11 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     sock.ev.on('messages.reaction', (reactions) => handleReaction(reactions, sock, companyId));
 
     // -----------------------------------------------------------
-    // 4. HISTÓRICO (SYNC UNIFICADO)
+    // 4. HISTÓRICO (SYNC POR CHUNKS)
     // -----------------------------------------------------------
     sock.ev.on('messaging-history.set', (data) => {
-        // Envia o pacote para o handler. O handler vai acumular no buffer.
-        handleHistorySync(data, sock, sessionId, companyId);
+        historyChunkCounter++;
+        // Passa o contador para log e controle
+        handleHistorySync(data, sock, sessionId, companyId, historyChunkCounter);
     });
 };
