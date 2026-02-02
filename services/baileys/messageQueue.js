@@ -10,8 +10,8 @@ let activeWorkers = 0;
  * Processador da Fila (Worker)
  * Pega itens da fila e executa o handleMessage respeitando o limite de concorrência.
  */
-const processQueue = async () => {
-    // Se atingiu o limite ou fila vazia, para.
+const processNext = async () => {
+    // Se atingiu o limite ou fila vazia, para. Não agende recursão se não há trabalho.
     if (activeWorkers >= CONCURRENCY_LIMIT || queue.length === 0) return;
 
     activeWorkers++;
@@ -30,8 +30,8 @@ const processQueue = async () => {
         console.error(`❌ [QUEUE] Erro ao processar mensagem ${task.msg.key?.id}:`, error.message);
     } finally {
         activeWorkers--;
-        // Garante que a fila continue andando
-        setImmediate(processQueue);
+        // Gatilho: Ao terminar um, tenta pegar o próximo imediatamente
+        processNext();
     }
 };
 
@@ -47,7 +47,7 @@ export const enqueueMessage = (msg, sock, companyId, sessionId, isRealtime) => {
     queue.push({ msg, sock, companyId, sessionId, isRealtime });
     
     // Tenta iniciar o processamento se houver slots livres
-    processQueue();
+    processNext();
 };
 
 /**
