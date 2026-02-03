@@ -1,6 +1,6 @@
 
 import { getContentType, normalizeJid, unwrapMessage, getBody } from '../../../utils/wppParsers.js';
-import { upsertMessage, ensureLeadExists } from '../../crm/sync.js';
+import { upsertMessage, ensureLeadExists, upsertContact } from '../../crm/sync.js';
 import { handleMediaUpload } from './mediaHandler.js';
 import { refreshContactInfo } from './contactHandler.js'; 
 import { dispatchWebhook } from '../../integrations/webhook.js';
@@ -23,6 +23,12 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         const unwrapped = unwrapMessage(msg);
         let jid = normalizeJid(unwrapped.key.remoteJid);
+        
+        // Verifica se é grupo para tratamento diferenciado
+        const isGroup = jid.includes('@g.us');
+        // Se for grupo, o participant é quem mandou. Se for DM, participant é undefined (ou null)
+        const participantJid = isGroup ? normalizeJid(unwrapped.key.participant) : null;
+        
         const fromMe = unwrapped.key.fromMe;
         // Pega o pushName da mensagem ou o nome forçado (do histórico)
         const pushName = forcedName || unwrapped.pushName;
@@ -36,23 +42,31 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             if (mapping?.phone_jid) jid = mapping.phone_jid; 
         }
 
-        // Anti-Ghost
-        if (!fromMe) {
+        // --- GHOST CHAT PREVENTION (CRÍTICO) ---
+        // Se for Grupo, precisamos salvar o remetente (Participant) como Contato para ter nome/foto,
+        // mas NÃO podemos criar um Lead ou atualizar last_message_at dele, senão ele "salta" pra lista de conversas.
+        
+        if (isGroup && participantJid && !fromMe) {
+            // Atualiza dados do participante silenciosamente (sem virar chat ativo)
+            if (pushName) {
+               // Apenas salva nome/pushname se não existir ou for melhor. Não cria Lead.
+               upsertContact(participantJid, companyId, null, null, false, null, false, null, { push_name: pushName }).catch(() => {});
+            }
+            // Se for realtime, tenta pegar foto do participante (sem bloquear)
+            if (isRealtime && fetchProfilePic) {
+                refreshContactInfo(sock, participantJid, companyId, pushName).catch(() => {});
+            }
+        }
+        
+        // --- LEAD GUARD (Apenas para DM ou Menções Diretas se configurado) ---
+        // Só processa lead/anti-ghost no JID Principal (Se for grupo, é o grupo. Se for DM, é a pessoa).
+        if (!fromMe && !isGroup) {
             const { data: contact } = await supabase.from('contacts').select('is_ignored').eq('jid', jid).eq('company_id', companyId).maybeSingle();
             if (contact?.is_ignored) return;
-        }
 
-        // Lead Guard & Info Refresh
-        let leadId = null;
-        if (!fromMe) {
             const myJid = normalizeJid(sock.user?.id);
-            // Se for realtime ou se foi forçado a criar lead (histórico recente)
             if (isRealtime || createLead) {
-                // Passa o pushName para tentar nomear o lead corretamente
-                leadId = await ensureLeadExists(jid, companyId, pushName, myJid);
-                
-                // ATUALIZAÇÃO DE INFORMAÇÕES
-                // Se for realtime ou se pedimos fetchProfilePic no histórico
+                await ensureLeadExists(jid, companyId, pushName, myJid);
                 if (isRealtime || fetchProfilePic) {
                     refreshContactInfo(sock, jid, companyId, pushName).catch(err => console.error("Refresh Error", err));
                 }
@@ -80,11 +94,11 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
              } catch (err) {}
         }
 
-        // Payload
+        // Payload da Mensagem
         const messageData = {
             company_id: companyId,
             session_id: sessionId,
-            remote_jid: jid, 
+            remote_jid: jid,  // O JID do Chat (Grupo ou Pessoa)
             whatsapp_id: unwrapped.key.id,
             from_me: fromMe,
             content: body,
@@ -92,8 +106,16 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             media_url: mediaUrl,
             status: fromMe ? 'sent' : 'delivered',
             created_at: new Date( (unwrapped.messageTimestamp || Date.now() / 1000) * 1000 ),
-            lead_id: leadId
+            // Se for grupo, não vincula lead_id na mensagem diretamente para não poluir contagem
+            lead_id: isGroup ? null : undefined 
         };
+        
+        // Se for DM, tenta vincular lead_id corretamente
+        if (!isGroup && !fromMe) {
+             const purePhone = jid.split('@')[0].replace(/\D/g, '');
+             const { data: lead } = await supabase.from('leads').select('id').eq('phone', purePhone).eq('company_id', companyId).maybeSingle();
+             if (lead) messageData.lead_id = lead.id;
+        }
 
         // Parsers Especiais
         if (type === 'pollCreationMessage' || type === 'pollCreationMessageV3') {
@@ -116,13 +138,17 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             messageData.content = JSON.stringify({ displayName: contact.displayName, vcard: contact.vcard });
         }
 
+        // Salva a mensagem. O Trigger de banco `handle_new_message_stats` cuidará de atualizar 
+        // o `last_message_at` APENAS para o `remote_jid` (Grupo ou DM), evitando o bug de duplicidade.
         await upsertMessage(messageData);
 
         // Webhook
         if (isRealtime) {
             const { data: instance } = await supabase.from('instances').select('webhook_url, webhook_enabled, id').eq('session_id', sessionId).single();
             if (instance?.webhook_enabled && instance.webhook_url) {
-                dispatchWebhook(instance.webhook_url, 'message.upsert', { ...messageData, pushName }, instance.id);
+                // Injeta participant no webhook para quem consome saber quem mandou no grupo
+                const webhookPayload = { ...messageData, pushName, participant: participantJid };
+                dispatchWebhook(instance.webhook_url, 'message.upsert', webhookPayload, instance.id);
             }
         }
 
