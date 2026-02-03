@@ -1,5 +1,5 @@
 
-import { upsertContact, updateSyncStatus, normalizeJid } from '../../crm/sync.js'; 
+import { upsertContactsBulk, updateSyncStatus, normalizeJid } from '../../crm/sync.js'; 
 import { handleMessage } from './messageHandler.js';
 import { unwrapMessage } from '../../../utils/wppParsers.js';
 import { createClient } from '@supabase/supabase-js';
@@ -19,64 +19,85 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
     processedHistoryChunks.add(chunkKey);
 
     const estimatedProgress = progress || Math.min((chunkCounter * 2), 99);
-    console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
+    console.log(`📚 [SYNC] Lote ${chunkCounter} | Contatos: ${contacts?.length || 0} | Msgs: ${messages?.length || 0}`);
     await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
 
     try {
         const contactsMap = new Map();
 
         // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS (AGENDA - PRIORIDADE MÁXIMA)
+        // ETAPA 1: CONTATOS (BULK INSERT - VELOCIDADE MÁXIMA)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
-            const BATCH_SIZE = 50;
-            for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
-                const batch = contacts.slice(i, i + BATCH_SIZE);
-                
-                await Promise.all(batch.map(async (c) => {
-                    const jid = normalizeJid(c.id);
-                    if (!jid) return;
-                    
+            const BATCH_SIZE = 250; // Lote maior para banco
+            const bulkPayload = [];
+
+            for (const c of contacts) {
+                const jid = normalizeJid(c.id);
+                if (!jid || jid.includes('@lid')) {
+                    // Se for LID, apenas vincula
                     if (c.lid) {
-                        supabase.rpc('link_identities', {
+                         supabase.rpc('link_identities', {
                             p_lid: normalizeJid(c.lid),
                             p_phone: jid,
                             p_company_id: companyId
                         }).then(() => {});
                     }
+                    continue; 
+                }
 
-                    if (jid.includes('@lid')) return;
+                // LÓGICA DE OURO DO NOME (Agenda > Business > PushName)
+                const isFromBook = !!(c.name && c.name.trim().length > 0);
+                const bestName = c.name || c.verifiedName || c.notify; 
 
-                    const isFromBook = !!(c.name && c.name.trim().length > 0);
-                    const bestName = c.name || c.verifiedName || c.notify; 
+                // Armazena no mapa para uso nas mensagens subsequentes
+                contactsMap.set(jid, { 
+                    name: bestName, 
+                    imgUrl: c.imgUrl || null, 
+                    isFromBook: isFromBook, 
+                    lid: c.lid || null 
+                });
 
-                    let finalImgUrl = c.imgUrl || null;
-                    if (!finalImgUrl && !jid.includes('@newsletter') && !jid.includes('status@broadcast')) {
-                        try {
-                            await sleep(Math.floor(Math.random() * 150)); 
-                            finalImgUrl = await sock.profilePictureUrl(jid, 'image');
-                        } catch (e) {
-                            finalImgUrl = null;
-                        }
-                    }
-
-                    contactsMap.set(jid, { 
-                        name: bestName, 
-                        imgUrl: finalImgUrl, 
-                        isFromBook: isFromBook, 
-                        lid: c.lid || null 
-                    });
-
-                    // Upsert IMEDIATO 
-                    await upsertContact(jid, companyId, bestName, finalImgUrl, isFromBook, c.lid);
-                }));
+                // PREPARA OBJETO PARA BULK
+                const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
                 
-                await sleep(50); 
+                const contactData = {
+                    jid: jid,
+                    phone: purePhone,
+                    company_id: companyId,
+                    updated_at: new Date()
+                };
+
+                if (isFromBook) {
+                    contactData.name = bestName;
+                } else if (bestName) {
+                    contactData.push_name = bestName;
+                }
+
+                if (c.imgUrl) {
+                    contactData.profile_pic_url = c.imgUrl;
+                    contactData.profile_pic_updated_at = new Date();
+                }
+
+                if (c.verifiedName) {
+                    contactData.verified_name = c.verifiedName;
+                    contactData.is_business = true;
+                }
+
+                bulkPayload.push(contactData);
+            }
+
+            // EXECUTAR BULK UPSERT
+            for (let i = 0; i < bulkPayload.length; i += BATCH_SIZE) {
+                const batch = bulkPayload.slice(i, i + BATCH_SIZE);
+                await upsertContactsBulk(batch);
+                await sleep(20); // Pequeno respiro para o banco
             }
             
-            if (chunkCounter === 1) {
-                console.log("⏳ [SYNC] Aguardando indexação da agenda...");
-                await sleep(1500); 
+            // Só aguarda se foi o primeiro lote significativo
+            if (chunkCounter === 1 || contacts.length > 500) {
+                console.log("⏳ [SYNC] Aguardando persistência da agenda...");
+                await sleep(1000); 
             }
         }
 
@@ -102,7 +123,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Name Injection & Trust Flag
+                // Name Injection & Trust Flag (Memory Lookup)
                 const knownContact = contactsMap.get(jid);
                 let isFromBookMsg = false;
 
@@ -113,7 +134,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     clean._forcedName = clean.pushName;
                 }
                 
-                // Anexa a flag diretamente no objeto (embora passemos via options, é bom ter)
                 clean._isFromBook = isFromBookMsg;
 
                 chats[jid].push(clean);
@@ -144,7 +164,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {}
                 }
-                await sleep(10); 
+                // Pequeno delay entre chats para não travar o loop
+                if (chatJids.length > 50) await sleep(5); 
             }
         }
 
