@@ -46,14 +46,15 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         }).then(() => {});
                     }
 
-                    // Se o JID for LID, não salva como contato visual
+                    // Se o JID for LID, não salva como contato visual, apenas faz o link acima
                     if (jid.includes('@lid')) return;
 
-                    // Definição de Nome da Agenda
+                    // LÓGICA DE OURO DO NOME (Agenda > Business > PushName)
+                    // Se c.name existe, é da agenda. Ponto final.
+                    const isFromBook = !!(c.name && c.name.trim().length > 0);
                     const bestName = c.name || c.verifiedName || c.notify; 
-                    const isFromBook = !!c.name; // Se tem c.name, é da agenda
 
-                    // Smart Fetch Foto
+                    // Smart Fetch Foto (Apenas se não tiver)
                     let finalImgUrl = c.imgUrl || null;
                     if (!finalImgUrl && !jid.includes('@newsletter') && !jid.includes('status@broadcast')) {
                         try {
@@ -64,7 +65,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         }
                     }
 
-                    // Armazena no mapa para uso nas mensagens
+                    // Armazena no mapa para uso nas mensagens subsequentes
                     contactsMap.set(jid, { 
                         name: bestName, 
                         imgUrl: finalImgUrl, 
@@ -72,7 +73,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         lid: c.lid || null 
                     });
 
-                    // Upsert IMEDIATO garantindo flag da agenda
+                    // Upsert IMEDIATO 
+                    // isFromBook garante que sync.js não aplique filtros de nome genérico
                     await upsertContact(jid, companyId, bestName, finalImgUrl, isFromBook, c.lid);
                 }));
                 
@@ -81,7 +83,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             
             if (chunkCounter === 1) {
                 console.log("⏳ [SYNC] Aguardando indexação da agenda...");
-                await sleep(2000); 
+                await sleep(1500); 
             }
         }
 
@@ -107,7 +109,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Name Injection: Se veio da agenda, injeta o nome na mensagem para o handler saber
+                // Name Injection: Se veio da agenda (está no mapa), injeta o nome na mensagem
                 const knownContact = contactsMap.get(jid);
                 if (knownContact && knownContact.isFromBook) {
                     clean._forcedName = knownContact.name;
@@ -139,7 +141,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                             createLead: true 
                         };
                         
-                        // Passa o nome forçado se houver (agenda)
+                        // Passa o nome forçado (agenda) para garantir criação correta do lead
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {}
                 }
