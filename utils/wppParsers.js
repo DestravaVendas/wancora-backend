@@ -3,9 +3,36 @@
 
 export const normalizeJid = (jid) => {
     if (!jid) return null;
-    if (jid.includes('@g.us')) return jid;
-    // Removido suporte a newsletter
-    return jid.includes('@') ? jid : `${jid}@s.whatsapp.net`;
+    
+    // Se for broadcast de status
+    if (jid === 'status@broadcast') return jid;
+    
+    // Separa o JID de sufixos de dispositivo (Ex: :12)
+    const [user, domain] = jid.split('@');
+    
+    // Se não tiver @, retorna como está (invalido, mas evita crash)
+    if (!domain) return jid;
+    
+    // Limpa a parte do usuário (remove :12 no final se houver antes do @, embora raro no formato novo)
+    // E limpa a parte do domínio se houver :
+    
+    // Formato padrão Baileys: 55119999@s.whatsapp.net:12
+    // Deve virar: 55119999@s.whatsapp.net
+    
+    // Se já contém o domínio correto
+    if (jid.includes('@g.us')) {
+        return jid.split('@')[0] + '@g.us';
+    }
+    
+    if (jid.includes('@s.whatsapp.net')) {
+        return jid.split('@')[0].split(':')[0] + '@s.whatsapp.net';
+    }
+    
+    if (jid.includes('@lid')) {
+         return jid.split('@')[0].split(':')[0] + '@lid';
+    }
+
+    return jid; // Fallback
 };
 
 // Desenrola mensagens complexas (ViewOnce, Ephemeral, Edited, DocumentWithCaption)
