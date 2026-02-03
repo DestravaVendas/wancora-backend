@@ -12,40 +12,30 @@ const processedHistoryChunks = new Set();
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Função Auxiliar Otimizada para download de fotos (Turbo Mode)
+// Função Auxiliar para buscar fotos em background (Detached)
 const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
-    console.log(`🖼️ [BACKGROUND] Iniciando busca TURBO de fotos para ${contacts.length} contatos...`);
+    console.log(`🖼️ [BACKGROUND] Iniciando busca de fotos para ${contacts.length} contatos...`);
     
-    // Configurações de Concorrência
-    const CONCURRENCY = 15; // 15 requisições simultâneas
-    const DELAY_BETWEEN_CHUNKS = 200; // 200ms entre blocos
-
-    // Divide em chunks
-    for (let i = 0; i < contacts.length; i += CONCURRENCY) {
-        const chunk = contacts.slice(i, i + CONCURRENCY);
+    // Processa um por um com delay para não tomar Ban por rate limit
+    for (const c of contacts) {
+        if (!c.jid || c.jid.includes('@lid')) continue;
         
-        // Processa o chunk em paralelo
-        await Promise.all(chunk.map(async (c) => {
-            if (!c.jid || c.jid.includes('@lid')) return;
-            
-            try {
-                // Tenta pegar a URL
+        try {
+            // Só busca se não tiver URL já salva (o Baileys as vezes manda no objeto inicial)
+            if (!c.profile_pic_url) {
                 const newUrl = await sock.profilePictureUrl(c.jid, 'image').catch(() => null);
                 
-                // Só atualiza se tiver URL válida e for diferente (opcional check, mas upsert já lida bem)
                 if (newUrl) {
                     await upsertContact(c.jid, companyId, null, newUrl, false);
                 }
-            } catch (e) {
-                // Erros de privacidade (401/403) são comuns, ignoramos silenciosamente
+                // Delay de segurança entre requests de foto
+                await sleep(500); 
             }
-        }));
-
-        // Respiro para não tomar rate limit
-        await sleep(DELAY_BETWEEN_CHUNKS);
+        } catch (e) {
+            // Ignora erros de privacidade/404
+        }
     }
-
-    console.log(`🖼️ [BACKGROUND] Busca TURBO de fotos concluída.`);
+    console.log(`🖼️ [BACKGROUND] Busca de fotos concluída.`);
 };
 
 export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
@@ -112,7 +102,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     contactData.profile_pic_url = c.imgUrl;
                     contactData.profile_pic_updated_at = new Date();
                 } else {
-                    // Adiciona na lista de busca em background se não veio foto
+                    // Se não tem foto, adiciona na lista para buscar em background
                     contactsToFetchPic.push({ jid, profile_pic_url: null });
                 }
 
@@ -133,7 +123,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 await sleep(50);
             }
             
-            // DISPARA BUSCA DE FOTOS OTIMIZADA
+            // DISPARA BUSCA DE FOTOS (Segundo Plano - Não espera terminar)
             if (contactsToFetchPic.length > 0) {
                 fetchProfilePicsInBackground(sock, contactsToFetchPic, companyId);
             }
@@ -190,7 +180,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     try {
                         const options = { 
                             downloadMedia: false, 
-                            // Tenta buscar foto se for mensagem recente
+                            // IMPORTANTE: Tenta buscar foto se for mensagem recente e não tivermos ainda.
+                            // Isso garante que os chats ativos fiquem bonitos mais rápido que o background job.
                             fetchProfilePic: true, 
                             createLead: true 
                         };
