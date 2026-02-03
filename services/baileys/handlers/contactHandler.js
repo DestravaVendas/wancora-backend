@@ -46,10 +46,10 @@ export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
  * Processa lista de contatos (Sync inicial da Agenda - Bulk Version)
  */
 export const handleContactsUpsert = async (contacts, companyId) => {
-    // Se for pequeno, processa individualmente para simplicidade
+    // Se for um ou dois, faz individual. Se for lote, faz bulk.
     if (!contacts || contacts.length === 0) return;
-    
-    if (contacts.length < 5) {
+
+    if (contacts.length <= 5) {
         for (const c of contacts) {
             const jid = normalizeJid(c.id);
             if (!jid) continue;
@@ -67,14 +67,11 @@ export const handleContactsUpsert = async (contacts, companyId) => {
             const bestName = c.name || c.notify || c.verifiedName;
             const isFromBook = !!c.name;
 
-            // Só salva se tiver algo relevante
-            if (bestName || c.imgUrl) {
-                await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook, c.lid);
-            }
+            // Salva sempre, mesmo sem nome, para garantir integridade do ID
+            await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook, c.lid);
         }
     } else {
-        // BULK PROCESSING PARA LISTAS GRANDES
-        // Isso é crucial para o evento 'contacts.upsert' que o Baileys dispara as vezes separado do history
+        // BULK PROCESSING PARA A LISTA COMPLETA
         const bulkPayload = [];
         
         for (const c of contacts) {
@@ -152,6 +149,7 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
              } catch (e) {}
         }
 
+        // Tenta buscar foto se não tiver ou se for velha
         if (!contact?.profile_pic_url || diffHours >= 24) {
             try {
                 newPicUrl = await sock.profilePictureUrl(cleanJid, 'image');
