@@ -1,5 +1,5 @@
 
-import { upsertContactsBulk, updateSyncStatus, normalizeJid } from '../../crm/sync.js'; 
+import { upsertContactsBulk, updateSyncStatus, normalizeJid, upsertContact } from '../../crm/sync.js'; 
 import { handleMessage } from './messageHandler.js';
 import { unwrapMessage } from '../../../utils/wppParsers.js';
 import { createClient } from '@supabase/supabase-js';
@@ -11,6 +11,32 @@ const HISTORY_MONTHS_LIMIT = 8;
 const processedHistoryChunks = new Set();
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Função Auxiliar para buscar fotos em background (Detached)
+const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
+    console.log(`🖼️ [BACKGROUND] Iniciando busca de fotos para ${contacts.length} contatos...`);
+    
+    // Processa um por um com delay para não tomar Ban por rate limit
+    for (const c of contacts) {
+        if (!c.jid || c.jid.includes('@lid')) continue;
+        
+        try {
+            // Só busca se não tiver URL já salva (o Baileys as vezes manda no objeto inicial)
+            if (!c.profile_pic_url) {
+                const newUrl = await sock.profilePictureUrl(c.jid, 'image').catch(() => null);
+                
+                if (newUrl) {
+                    await upsertContact(c.jid, companyId, null, newUrl, false);
+                }
+                // Delay de segurança entre requests de foto
+                await sleep(500); 
+            }
+        } catch (e) {
+            // Ignora erros de privacidade/404
+        }
+    }
+    console.log(`🖼️ [BACKGROUND] Busca de fotos concluída.`);
+};
 
 export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
     
@@ -24,21 +50,19 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
     try {
         const contactsMap = new Map();
+        const contactsToFetchPic = [];
 
         // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS (BULK INSERT - VELOCIDADE MÁXIMA)
+        // ETAPA 1: CONTATOS (BULK INSERT)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
-            console.log(`🔍 [HISTORY] Processando ${contacts.length} contatos recebidos do Baileys...`);
-            
-            const BATCH_SIZE = 500; // Supabase aguenta lotes grandes
+            const BATCH_SIZE = 500;
             const bulkPayload = [];
 
             for (const c of contacts) {
                 const jid = normalizeJid(c.id);
                 if (!jid) continue;
 
-                // Mapa de Identidade (LID -> Phone)
                 if (c.lid) {
                      supabase.rpc('link_identities', {
                         p_lid: normalizeJid(c.lid),
@@ -47,19 +71,15 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     }).then(() => {});
                 }
                 
-                // Se o JID for LID, não salva como contato visual na tabela contacts
-                // Mas usamos a RPC acima para garantir o vinculo
                 if (jid.includes('@lid')) continue;
 
+                // Cache para uso nas mensagens
                 const bestName = c.name || c.verifiedName || c.notify;
                 const isFromBook = !!(c.name && c.name.trim().length > 0);
 
-                // Armazena no mapa para uso nas mensagens subsequentes (In-Memory Cache)
                 contactsMap.set(jid, { 
                     name: bestName, 
-                    imgUrl: c.imgUrl || null, 
-                    isFromBook: isFromBook, 
-                    lid: c.lid || null 
+                    isFromBook: isFromBook 
                 });
 
                 // PREPARA OBJETO PARA BULK
@@ -71,7 +91,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     updated_at: new Date()
                 };
 
-                // Aplica lógica de nomes da Agenda
+                // Lógica de nomes permissiva
                 if (isFromBook) {
                     contactData.name = bestName;
                 } else if (bestName) {
@@ -81,6 +101,9 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 if (c.imgUrl) {
                     contactData.profile_pic_url = c.imgUrl;
                     contactData.profile_pic_updated_at = new Date();
+                } else {
+                    // Se não tem foto, adiciona na lista para buscar em background
+                    contactsToFetchPic.push({ jid, profile_pic_url: null });
                 }
 
                 if (c.verifiedName) {
@@ -91,14 +114,18 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 bulkPayload.push(contactData);
             }
 
-            console.log(`📦 [HISTORY] Payload montado: ${bulkPayload.length} contatos válidos para salvar.`);
+            console.log(`📦 [HISTORY] Contatos preparados: ${bulkPayload.length}`);
 
-            // EXECUTAR BULK UPSERT
+            // SALVA NO BANCO PRIMEIRO (Prioridade Imediata)
             for (let i = 0; i < bulkPayload.length; i += BATCH_SIZE) {
                 const batch = bulkPayload.slice(i, i + BATCH_SIZE);
-                console.log(`💾 [HISTORY] Enviando batch ${i/BATCH_SIZE + 1} (${batch.length} itens)...`);
                 await upsertContactsBulk(batch);
                 await sleep(50);
+            }
+            
+            // DISPARA BUSCA DE FOTOS (Segundo Plano - Não espera terminar)
+            if (contactsToFetchPic.length > 0) {
+                fetchProfilePicsInBackground(sock, contactsToFetchPic, companyId);
             }
         }
 
@@ -124,7 +151,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Name Injection: Se veio da agenda, injeta o nome na mensagem
+                // Name Injection
                 const knownContact = contactsMap.get(jid);
                 if (knownContact && knownContact.isFromBook) {
                     clean._forcedName = knownContact.name;
@@ -146,20 +173,23 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
                 }
 
+                // Processa apenas as N últimas mensagens
                 const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT).reverse(); 
                 
                 for (const msg of topMessages) {
                     try {
                         const options = { 
                             downloadMedia: false, 
-                            fetchProfilePic: false, // Desligado para acelerar, o Bulk já tentou pegar o que tinha
+                            // IMPORTANTE: Tenta buscar foto se for mensagem recente e não tivermos ainda.
+                            // Isso garante que os chats ativos fiquem bonitos mais rápido que o background job.
+                            fetchProfilePic: true, 
                             createLead: true 
                         };
                         
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {}
                 }
-                await sleep(5); // Delay mínimo
+                await sleep(5); 
             }
         }
 
