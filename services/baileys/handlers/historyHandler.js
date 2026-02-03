@@ -29,6 +29,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         // ETAPA 1: CONTATOS (BULK INSERT - VELOCIDADE MÁXIMA)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
+            console.log(`🔍 [HISTORY] Processando ${contacts.length} contatos recebidos do Baileys...`);
+            
             const BATCH_SIZE = 500; // Supabase aguenta lotes grandes
             const bulkPayload = [];
 
@@ -89,13 +91,13 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 bulkPayload.push(contactData);
             }
 
+            console.log(`📦 [HISTORY] Payload montado: ${bulkPayload.length} contatos válidos para salvar.`);
+
             // EXECUTAR BULK UPSERT
-            // Divide em chunks menores se necessário, mas 500 costuma ir bem
             for (let i = 0; i < bulkPayload.length; i += BATCH_SIZE) {
                 const batch = bulkPayload.slice(i, i + BATCH_SIZE);
-                console.log(`💾 [SYNC] Salvando lote de ${batch.length} contatos no banco...`);
+                console.log(`💾 [HISTORY] Enviando batch ${i/BATCH_SIZE + 1} (${batch.length} itens)...`);
                 await upsertContactsBulk(batch);
-                // Pequeno respiro para não travar o socket
                 await sleep(50);
             }
         }
