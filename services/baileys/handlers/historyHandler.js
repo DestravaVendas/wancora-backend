@@ -6,7 +6,7 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const HISTORY_MSG_LIMIT = 15; // Equilíbrio entre carga e contexto
+const HISTORY_MSG_LIMIT = 15;
 const HISTORY_MONTHS_LIMIT = 8;
 const processedHistoryChunks = new Set();
 
@@ -20,7 +20,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
     if (processedHistoryChunks.has(chunkKey)) return;
     processedHistoryChunks.add(chunkKey);
 
-    // UX: Progresso linear
     const estimatedProgress = progress || Math.min((chunkCounter * 2), 99);
     console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
     await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
@@ -29,8 +28,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         const contactsMap = new Map();
 
         // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS (Lotes de 50)
-        // Restauração do "Smart Fetch" original que busca fotos
+        // ETAPA 1: CONTATOS (AGENDA - PRIORIDADE MÁXIMA)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
             const BATCH_SIZE = 50;
@@ -41,16 +39,16 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
                     
-                    const bestName = c.name || c.verifiedName || c.notify;
-                    
-                    // --- SMART FETCH DE FOTO (Lógica Original Restaurada) ---
-                    let finalImgUrl = c.imgUrl || null;
+                    // LÓGICA DE OURO: Prioriza 'name' (Agenda do celular)
+                    // Se tiver 'name', marcamos isFromBook = true para blindar contra pushName
+                    const bestName = c.name || c.verifiedName || c.notify; 
+                    const isFromBook = !!c.name; 
 
-                    // Se não veio foto no pacote, tenta buscar ativamente
+                    // Smart Fetch Foto (Recuperado)
+                    let finalImgUrl = c.imgUrl || null;
                     if (!finalImgUrl && !jid.includes('@newsletter')) {
                         try {
-                            // Pequeno delay aleatório para não tomar ban por flood de requests
-                            await sleep(Math.floor(Math.random() * 200)); 
+                            await sleep(Math.floor(Math.random() * 100)); // Jitter
                             finalImgUrl = await sock.profilePictureUrl(jid, 'image');
                         } catch (e) {
                             finalImgUrl = null;
@@ -60,20 +58,27 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     contactsMap.set(jid, { 
                         name: bestName, 
                         imgUrl: finalImgUrl, 
-                        isFromBook: !!c.name,
+                        isFromBook: isFromBook, // Importante
                         lid: c.lid || null 
                     });
 
-                    // Upsert seguro
-                    await upsertContact(jid, companyId, bestName, finalImgUrl, !!c.name, c.lid);
+                    // Upsert IMEDIATO e BLINDADO
+                    await upsertContact(jid, companyId, bestName, finalImgUrl, isFromBook, c.lid);
                 }));
                 
-                await sleep(50); // Respira
+                await sleep(50); 
+            }
+            
+            // DELAY ESTRATÉGICO: Dá tempo pro banco indexar os nomes da agenda
+            // Isso garante que quando as mensagens forem processadas abaixo, o contato já exista com o nome certo.
+            if (chunkCounter === 1) {
+                console.log("⏳ [SYNC] Aguardando indexação da agenda...");
+                await sleep(1500); 
             }
         }
 
         // -----------------------------------------------------------
-        // ETAPA 2: MENSAGENS (Por Conversa)
+        // ETAPA 2: MENSAGENS
         // -----------------------------------------------------------
         if (messages && messages.length > 0) {
             
@@ -95,42 +100,44 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Name Injection: Se temos o nome da etapa 1, injetamos na mensagem
+                // Name Injection: Se temos o nome da Etapa 1, forçamos na mensagem
+                // Isso evita que o messageHandler tente usar o pushName se já temos nome de agenda
                 const knownContact = contactsMap.get(jid);
-                clean._forcedName = knownContact ? knownContact.name : clean.pushName;
+                if (knownContact && knownContact.isFromBook) {
+                    clean._forcedName = knownContact.name;
+                } else {
+                    clean._forcedName = clean.pushName;
+                }
                 
                 chats[jid].push(clean);
             });
 
             const chatJids = Object.keys(chats);
 
-            // Processa conversas sequencialmente para não matar o banco
             for (const jid of chatJids) {
-                // Ordena cronologicamente
                 chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0)); // Desc
                 
                 // Atualiza data da conversa
                 const latestMsg = chats[jid][0];
                 if (latestMsg && latestMsg.messageTimestamp) {
                     const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
-                    // Fire and forget update
                     supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
                 }
 
-                // Pega apenas as N últimas para salvar no banco
-                const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT).reverse(); // Asc para salvar
+                // Processa mensagens
+                const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT).reverse(); // Asc
                 
                 for (const msg of topMessages) {
                     try {
                         const options = { 
-                            downloadMedia: false, // Não baixa mídia no histórico (economia)
-                            fetchProfilePic: false, // Já fizemos na Etapa 1
-                            createLead: true // Cria lead se tiver interação
+                            downloadMedia: false, 
+                            fetchProfilePic: false, // Já buscamos na Etapa 1
+                            createLead: true 
                         };
                         
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {
-                        // Ignora erro individual
+                        // Ignore
                     }
                 }
                 
