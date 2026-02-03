@@ -1,5 +1,5 @@
 
-import { upsertContact, normalizeJid } from '../../crm/sync.js';
+import { upsertContact, upsertContactsBulk, normalizeJid } from '../../crm/sync.js';
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -43,28 +43,71 @@ export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
 };
 
 /**
- * Processa lista de contatos (Sync inicial da Agenda)
+ * Processa lista de contatos (Sync inicial da Agenda - Bulk Version)
  */
 export const handleContactsUpsert = async (contacts, companyId) => {
-    for (const c of contacts) {
-        const jid = normalizeJid(c.id);
-        if (!jid) continue;
+    // Se for um ou dois, faz individual. Se for lote, faz bulk.
+    if (!contacts || contacts.length === 0) return;
 
-        if (c.lid) {
-            supabase.rpc('link_identities', {
-                p_lid: normalizeJid(c.lid),
-                p_phone: jid,
-                p_company_id: companyId
-            }).then(() => {});
+    if (contacts.length <= 5) {
+        for (const c of contacts) {
+            const jid = normalizeJid(c.id);
+            if (!jid) continue;
+
+            if (c.lid) {
+                supabase.rpc('link_identities', {
+                    p_lid: normalizeJid(c.lid),
+                    p_phone: jid,
+                    p_company_id: companyId
+                }).then(() => {});
+            }
+
+            if (jid.includes('@lid')) continue;
+
+            const bestName = c.name || c.notify || c.verifiedName;
+            const isFromBook = !!c.name;
+
+            if (bestName || c.imgUrl) {
+                await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook, c.lid);
+            }
+        }
+    } else {
+        // BULK PROCESSING PARA A LISTA COMPLETA
+        const bulkPayload = [];
+        console.log(`📋 [CONTACTS] Recebido lote de agenda: ${contacts.length} itens.`);
+        
+        for (const c of contacts) {
+            const jid = normalizeJid(c.id);
+            if (!jid || jid.includes('@lid')) continue;
+
+            const isFromBook = !!c.name;
+            const bestName = c.name || c.notify || c.verifiedName;
+            
+            const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
+            
+            const contactData = {
+                jid: jid,
+                phone: purePhone,
+                company_id: companyId,
+                updated_at: new Date()
+            };
+
+            if (isFromBook) contactData.name = bestName;
+            else if (bestName) contactData.push_name = bestName;
+
+            if (c.imgUrl) contactData.profile_pic_url = c.imgUrl;
+            if (c.verifiedName) {
+                contactData.verified_name = c.verifiedName;
+                contactData.is_business = true;
+            }
+
+            bulkPayload.push(contactData);
         }
 
-        if (jid.includes('@lid')) continue;
-
-        const bestName = c.name || c.notify || c.verifiedName;
-        const isFromBook = !!c.name;
-
-        if (bestName || c.imgUrl) {
-            await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook, c.lid);
+        // Envia em chunks de 500
+        const CHUNK_SIZE = 500;
+        for (let i = 0; i < bulkPayload.length; i += CHUNK_SIZE) {
+            await upsertContactsBulk(bulkPayload.slice(i, i + CHUNK_SIZE));
         }
     }
 };
