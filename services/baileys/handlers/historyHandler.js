@@ -26,7 +26,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         const contactsMap = new Map();
 
         // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS (AGENDA)
+        // ETAPA 1: CONTATOS (AGENDA - PRIORIDADE MÁXIMA)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
             const BATCH_SIZE = 50;
@@ -37,8 +37,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
                     
-                    // --- MAPA DE IDENTIDADE (CRÍTICO) ---
-                    // Se o contato histórico tem LID, salva o vínculo agora.
+                    // Mapa de Identidade (LID -> Phone)
                     if (c.lid) {
                         supabase.rpc('link_identities', {
                             p_lid: normalizeJid(c.lid),
@@ -47,11 +46,12 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         }).then(() => {});
                     }
 
-                    // Se o JID for LID, não salva na lista visual
+                    // Se o JID for LID, não salva como contato visual
                     if (jid.includes('@lid')) return;
 
+                    // Definição de Nome da Agenda
                     const bestName = c.name || c.verifiedName || c.notify; 
-                    const isFromBook = !!c.name; 
+                    const isFromBook = !!c.name; // Se tem c.name, é da agenda
 
                     // Smart Fetch Foto
                     let finalImgUrl = c.imgUrl || null;
@@ -64,6 +64,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         }
                     }
 
+                    // Armazena no mapa para uso nas mensagens
                     contactsMap.set(jid, { 
                         name: bestName, 
                         imgUrl: finalImgUrl, 
@@ -71,6 +72,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         lid: c.lid || null 
                     });
 
+                    // Upsert IMEDIATO garantindo flag da agenda
                     await upsertContact(jid, companyId, bestName, finalImgUrl, isFromBook, c.lid);
                 }));
                 
@@ -105,6 +107,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
+                // Name Injection: Se veio da agenda, injeta o nome na mensagem para o handler saber
                 const knownContact = contactsMap.get(jid);
                 if (knownContact && knownContact.isFromBook) {
                     clean._forcedName = knownContact.name;
@@ -136,6 +139,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                             createLead: true 
                         };
                         
+                        // Passa o nome forçado se houver (agenda)
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {}
                 }
