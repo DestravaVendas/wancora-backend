@@ -24,7 +24,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     sock.ev.on('contacts.upsert', (contacts) => handleContactsUpsert(contacts, companyId));
     
     sock.ev.on('contacts.update', async (updates) => {
-        // Updates parciais (ex: foto nova ou nome alterado)
         for (const update of updates) {
             if (update.imgUrl || update.notify) {
                 handleContactsUpsert([update], companyId);
@@ -33,7 +32,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // 3. MENSAGENS (FILA)
-    // Usa a fila para garantir ordem e performance
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         const isRealtime = type === 'notify';
         for (const msg of messages) {
