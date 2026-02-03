@@ -147,7 +147,8 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 };
 
 // --- GUARDIÃO DE LEADS ---
-export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
+// trustName: Se true, ignora isGenericName para o pushName (útil quando vem da agenda)
+export const ensureLeadExists = async (jid, companyId, pushName, myJid, trustName = false) => {
     if (!jid) return null;
     
     if (jid.includes('@lid')) return null;
@@ -192,9 +193,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
         // Prioridade de Nome para o Lead:
         // 1. Agenda (contacts.name) - Confiança TOTAL se existir no banco.
-        //    Se está no banco, assumimos que upsertContact já validou ou é da agenda.
-        // 2. Business (verified_name)
-        // 3. PushName
         
         if (contact) {
             if (contact.name && contact.name.trim().length > 0) {
@@ -209,9 +207,12 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             }
         }
         
-        // Se ainda não temos nome, tentamos o pushName passado na hora
-        if (!finalName && pushName && !isGenericName(pushName, purePhone)) {
-            finalName = pushName;
+        // TRUST TUNNEL: Se ainda não pegamos do banco (race condition), usamos o pushName passado
+        // Se trustName=true (Agenda), aceitamos mesmo que pareça genérico (ex: "102")
+        if (!finalName && pushName) {
+            if (trustName || !isGenericName(pushName, purePhone)) {
+                finalName = pushName;
+            }
         }
 
         const { data: existing } = await safeSupabaseCall(() => 
@@ -221,7 +222,8 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         if (existing) {
             // Auto-Healing: Melhora o nome se o atual for ruim
             const currentNameIsBad = !existing.name || isGenericName(existing.name, purePhone);
-            const newNameIsGood = finalName && (contact?.name === finalName || !isGenericName(finalName, purePhone));
+            // Só atualiza se o novo nome for bom OU se for trusted (Agenda)
+            const newNameIsGood = finalName && (trustName || !isGenericName(finalName, purePhone));
 
             if (currentNameIsBad && newNameIsGood) {
                 console.log(`✨ [CRM] Melhorando nome do Lead ${purePhone}: "${existing.name || 'NULL'}" -> "${finalName}"`);
@@ -230,9 +232,10 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             return existing.id;
         }
 
-        // Para novos leads, se o nome final ainda for considerado genérico (e não veio do banco contacts.name), anulamos
-        // Nota: Se veio de contacts.name, já atribuímos acima e confiamos.
-        if (finalName && isGenericName(finalName, purePhone) && contact?.name !== finalName) {
+        // Validação final de segurança para criação:
+        // Se NÃO é trusted (Agenda) e é genérico, anula para criar como NULL (frontend formata)
+        // Se É trusted, deixa passar o nome "102" ou "Mãe"
+        if (finalName && !trustName && isGenericName(finalName, purePhone) && contact?.name !== finalName) {
             finalName = null;
         }
 
