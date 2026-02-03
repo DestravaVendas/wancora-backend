@@ -12,8 +12,6 @@ export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
     const presences = presenceUpdate.presences;
 
     // --- LID RESOLVER PARA PRESENÇA ---
-    // Se o ID for um LID, buscamos o telefone real na tabela identity_map
-    // para marcar online o chat correto (Telefone), não o dispositivo (LID).
     if (id.includes('@lid')) {
         const { data } = await supabase
             .from('identity_map')
@@ -23,10 +21,8 @@ export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
             .maybeSingle();
             
         if (data?.phone_jid) {
-            id = data.phone_jid; // Redireciona para o JID do telefone
+            id = data.phone_jid; 
         } else {
-            // Se não achou mapeamento, ABORTA. 
-            // Não queremos atualizar status de um LID desconhecido na tabela contacts.
             return; 
         }
     }
@@ -35,13 +31,12 @@ export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
         const lastKnown = presences[presenceUpdate.id].lastKnownPresence;
         const isOnline = lastKnown === 'composing' || lastKnown === 'recording' || lastKnown === 'available';
         
-        // Update Rápido no ID resolvido (Telefone)
         supabase.from('contacts')
             .update({ 
                 is_online: isOnline, 
                 last_seen_at: new Date().toISOString() 
             })
-            .eq('jid', normalizeJid(id)) // Usa o ID resolvido (Telefone)
+            .eq('jid', normalizeJid(id)) 
             .eq('company_id', companyId)
             .then(() => {});
     }
@@ -55,8 +50,6 @@ export const handleContactsUpsert = async (contacts, companyId) => {
         const jid = normalizeJid(c.id);
         if (!jid) continue;
 
-        // Mapeamento de Identidade (LID -> Phone)
-        // O Baileys geralmente envia o objeto com { id: 'phone_jid', lid: 'lid_jid' }
         if (c.lid) {
             supabase.rpc('link_identities', {
                 p_lid: normalizeJid(c.lid),
@@ -65,9 +58,6 @@ export const handleContactsUpsert = async (contacts, companyId) => {
             }).then(() => {});
         }
 
-        // --- FILTRO DE HIGIENE ---
-        // Se o PRÓPRIO contato for um LID (ex: upsert de dispositivo), ignoramos na lista visual.
-        // Só queremos salvar contatos de telefone (@s.whatsapp.net) ou grupos (@g.us).
         if (jid.includes('@lid')) continue;
 
         const bestName = c.name || c.notify || c.verifiedName;
@@ -83,7 +73,6 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
     if (!jid || jid.includes('status@broadcast')) return;
     const cleanJid = normalizeJid(jid);
     
-    // Ignora LIDs, Grupos e Canais para refresh de perfil comercial
     if (cleanJid.includes('@lid') || cleanJid.includes('@g.us') || cleanJid.includes('@newsletter')) return;
 
     try {
