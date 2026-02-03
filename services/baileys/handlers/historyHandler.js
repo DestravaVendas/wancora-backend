@@ -37,7 +37,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     const jid = normalizeJid(c.id);
                     if (!jid) return;
                     
-                    // Mapa de Identidade (LID -> Phone)
                     if (c.lid) {
                         supabase.rpc('link_identities', {
                             p_lid: normalizeJid(c.lid),
@@ -46,15 +45,11 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         }).then(() => {});
                     }
 
-                    // Se o JID for LID, não salva como contato visual, apenas faz o link acima
                     if (jid.includes('@lid')) return;
 
-                    // LÓGICA DE OURO DO NOME (Agenda > Business > PushName)
-                    // Se c.name existe, é da agenda. Ponto final.
                     const isFromBook = !!(c.name && c.name.trim().length > 0);
                     const bestName = c.name || c.verifiedName || c.notify; 
 
-                    // Smart Fetch Foto (Apenas se não tiver)
                     let finalImgUrl = c.imgUrl || null;
                     if (!finalImgUrl && !jid.includes('@newsletter') && !jid.includes('status@broadcast')) {
                         try {
@@ -65,7 +60,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         }
                     }
 
-                    // Armazena no mapa para uso nas mensagens subsequentes
                     contactsMap.set(jid, { 
                         name: bestName, 
                         imgUrl: finalImgUrl, 
@@ -74,7 +68,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     });
 
                     // Upsert IMEDIATO 
-                    // isFromBook garante que sync.js não aplique filtros de nome genérico
                     await upsertContact(jid, companyId, bestName, finalImgUrl, isFromBook, c.lid);
                 }));
                 
@@ -109,14 +102,20 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Name Injection: Se veio da agenda (está no mapa), injeta o nome na mensagem
+                // Name Injection & Trust Flag
                 const knownContact = contactsMap.get(jid);
+                let isFromBookMsg = false;
+
                 if (knownContact && knownContact.isFromBook) {
                     clean._forcedName = knownContact.name;
+                    isFromBookMsg = true; // Flag vital para o messageHandler
                 } else {
                     clean._forcedName = clean.pushName;
                 }
                 
+                // Anexa a flag diretamente no objeto (embora passemos via options, é bom ter)
+                clean._isFromBook = isFromBookMsg;
+
                 chats[jid].push(clean);
             });
 
@@ -138,10 +137,10 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         const options = { 
                             downloadMedia: false, 
                             fetchProfilePic: false,
-                            createLead: true 
+                            createLead: true,
+                            isFromBook: msg._isFromBook // Passa a confiança aqui
                         };
                         
-                        // Passa o nome forçado (agenda) para garantir criação correta do lead
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {}
                 }
