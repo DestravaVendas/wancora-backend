@@ -15,16 +15,16 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 // --- 1. HANDLE NEW MESSAGE (UPSERT) ---
 export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime = true, forcedName = null, options = {}) => {
     try {
-        // options.isFromBook: Flag crucial do HistoryHandler para indicar que o nome veio da agenda
-        const { downloadMedia = true, fetchProfilePic = false, createLead = false, isFromBook = false } = options;
+        const { downloadMedia = true, fetchProfilePic = false, createLead = false } = options;
 
         if (!msg.message) return;
+        // Ignora status e newsletters
         if (msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid.includes('@newsletter')) return;
 
         const unwrapped = unwrapMessage(msg);
         let jid = normalizeJid(unwrapped.key.remoteJid);
         const fromMe = unwrapped.key.fromMe;
-        
+        // Pega o pushName da mensagem ou o nome forçado (do histórico)
         const pushName = forcedName || unwrapped.pushName;
         
         const type = getContentType(unwrapped.message);
@@ -46,11 +46,13 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         let leadId = null;
         if (!fromMe) {
             const myJid = normalizeJid(sock.user?.id);
+            // Se for realtime ou se foi forçado a criar lead (histórico recente)
             if (isRealtime || createLead) {
-                // TRUST TUNNEL: Passa isFromBook como 5º argumento (trustName)
-                // Isso força o ensureLeadExists a aceitar nomes numéricos como "102" se vierem da agenda
-                leadId = await ensureLeadExists(jid, companyId, pushName, myJid, isFromBook);
+                // Passa o pushName para tentar nomear o lead corretamente
+                leadId = await ensureLeadExists(jid, companyId, pushName, myJid);
                 
+                // ATUALIZAÇÃO DE INFORMAÇÕES
+                // Se for realtime ou se pedimos fetchProfilePic no histórico
                 if (isRealtime || fetchProfilePic) {
                     refreshContactInfo(sock, jid, companyId, pushName).catch(err => console.error("Refresh Error", err));
                 }
@@ -148,8 +150,10 @@ export const handleMessageUpdate = async (updates, companyId) => {
                 if (originalMsg) {
                     try {
                         let currentVotes = Array.isArray(originalMsg.poll_votes) ? originalMsg.poll_votes : [];
+                        // Remove voto anterior do mesmo votante para evitar duplicidade
                         currentVotes = currentVotes.filter(v => v.voterJid !== voterJid);
                         
+                        // Buffer -> Hex se necessário
                         const selectedOptions = vote.selectedOptions.map(opt => Buffer.isBuffer(opt) ? opt.toString('hex') : opt);
                         
                         currentVotes.push({ voterJid, selectedOptions, ts: Date.now() });
@@ -171,6 +175,7 @@ export const handleMessageUpdate = async (updates, companyId) => {
 export const handleReceiptUpdate = async (events, companyId) => {
     for (const event of events) {
         const { key, receipt } = event;
+        // Ignora receipts de grupos que não são updates de status global da mensagem
         if (receipt.userJid) continue; 
         
         let statusStr = 'sent';
@@ -211,8 +216,10 @@ export const handleReaction = async (reactions, sock, companyId) => {
 
             if (msg) {
                 let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
+                // Remove reação anterior do mesmo ator
                 currentReactions = currentReactions.filter(rx => rx.actor !== actor);
                 
+                // Se emoji existe (não é remoção), adiciona
                 if (emoji) {
                     currentReactions.push({ text: emoji, actor: actor, ts: Date.now() });
                 }
