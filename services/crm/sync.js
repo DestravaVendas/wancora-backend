@@ -84,8 +84,7 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     }
 };
 
-// --- UPSERT BULK (ALTA PERFORMANCE) ---
-// Resolve o problema de "perda de contatos" no sync inicial salvando em lotes
+// --- UPSERT BULK (COM LOGS DE DEBUG) ---
 export const upsertContactsBulk = async (contactsArray) => {
     if (!contactsArray || contactsArray.length === 0) return;
     
@@ -93,21 +92,41 @@ export const upsertContactsBulk = async (contactsArray) => {
     const validContacts = contactsArray.filter(c => c.jid && c.company_id);
     if (validContacts.length === 0) return;
 
+    // console.log(`💾 [DB] Tentando salvar lote de ${validContacts.length} contatos...`);
+
     try {
         await safeSupabaseCall(async () => {
-            const { error } = await supabase
+            const { error, count } = await supabase
                 .from('contacts')
-                .upsert(validContacts, { onConflict: 'company_id, jid', ignoreDuplicates: false });
+                .upsert(validContacts, { onConflict: 'company_id, jid', ignoreDuplicates: false, count: 'exact' });
             
-            if (error) throw error;
+            if (error) {
+                console.error(`🚨 [DB FAIL] Erro Supabase Bulk Upsert: ${error.message} | Code: ${error.code}`);
+                if (error.details) console.error(`   Detalhes: ${error.details}`);
+                if (error.hint) console.error(`   Dica: ${error.hint}`);
+                throw error;
+            } else {
+                console.log(`✅ [DB SUCCESS] ${validContacts.length} contatos salvos/atualizados.`);
+            }
         });
     } catch (e) {
-        console.error(`❌ [SYNC] Erro Bulk Insert (${validContacts.length} items):`, e.message);
-        // Fallback: Se o bulk falhar (ex: payload muito grande), tenta um por um
-        console.log("⚠️ [SYNC] Tentando fallback item-a-item...");
+        console.error(`❌ [SYNC] Falha crítica no Bulk Insert. Iniciando modo de recuperação ITEM-A-ITEM...`);
+        
+        // Fallback: Tenta salvar um por um para descobrir qual registro está quebrando
+        let successCount = 0;
+        let failCount = 0;
+
         for (const c of validContacts) {
-             await upsertContact(c.jid, c.company_id, c.name, c.profile_pic_url, !!c.name, null, c.is_business, c.verified_name);
+             try {
+                const { error } = await supabase.from('contacts').upsert(c, { onConflict: 'company_id, jid' });
+                if (error) throw error;
+                successCount++;
+             } catch (singleErr) {
+                 failCount++;
+                 console.error(`   💀 Falha no contato ${c.jid} (${c.name || 'Sem nome'}):`, singleErr.message);
+             }
         }
+        console.log(`🏁 [RECOVERY] Recuperação finalizada. Sucessos: ${successCount} | Falhas: ${failCount}`);
     }
 };
 
@@ -157,7 +176,10 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
         await safeSupabaseCall(async () => {
             const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
-            if (error) throw error;
+            if (error) {
+                console.error(`❌ [CONTACT SINGLE] Erro ao salvar ${cleanJid}:`, error.message);
+                throw error;
+            }
         });
 
         if (lid) {
@@ -169,7 +191,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         }
 
     } catch (e) {
-        // Erro silencioso
+        // Erro silencioso (já logado acima se for db error)
     }
 };
 
