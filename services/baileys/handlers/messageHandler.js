@@ -18,19 +18,16 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const { downloadMedia = true, fetchProfilePic = false, createLead = false } = options;
 
         if (!msg.message) return;
-        // Ignora status e newsletters
         if (msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid.includes('@newsletter')) return;
 
         const unwrapped = unwrapMessage(msg);
         let jid = normalizeJid(unwrapped.key.remoteJid);
         
-        // Verifica se é grupo para tratamento diferenciado
         const isGroup = jid.includes('@g.us');
-        // Se for grupo, o participant é quem mandou. Se for DM, participant é undefined (ou null)
-        const participantJid = isGroup ? normalizeJid(unwrapped.key.participant) : null;
+        // Identifica quem mandou no grupo. Se DM, é o próprio JID ou undefined
+        const participantJid = isGroup && unwrapped.key.participant ? normalizeJid(unwrapped.key.participant) : null;
         
         const fromMe = unwrapped.key.fromMe;
-        // Pega o pushName da mensagem ou o nome forçado (do histórico)
         const pushName = forcedName || unwrapped.pushName;
         
         const type = getContentType(unwrapped.message);
@@ -42,24 +39,19 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             if (mapping?.phone_jid) jid = mapping.phone_jid; 
         }
 
-        // --- GHOST CHAT PREVENTION (CRÍTICO) ---
-        // Se for Grupo, precisamos salvar o remetente (Participant) como Contato para ter nome/foto,
-        // mas NÃO podemos criar um Lead ou atualizar last_message_at dele, senão ele "salta" pra lista de conversas.
-        
+        // --- GHOST CHAT PREVENTION & GROUP MEMBER SYNC ---
+        // Se for grupo, salvamos o remetente como contato (para ter nome/foto), mas NÃO como Lead.
         if (isGroup && participantJid && !fromMe) {
-            // Atualiza dados do participante silenciosamente (sem virar chat ativo)
             if (pushName) {
-               // Apenas salva nome/pushname se não existir ou for melhor. Não cria Lead.
-               upsertContact(participantJid, companyId, null, null, false, null, false, null, { push_name: pushName }).catch(() => {});
+               await upsertContact(participantJid, companyId, null, null, false, null, false, null, { push_name: pushName });
             }
-            // Se for realtime, tenta pegar foto do participante (sem bloquear)
             if (isRealtime && fetchProfilePic) {
+                // Background refresh da foto do participante
                 refreshContactInfo(sock, participantJid, companyId, pushName).catch(() => {});
             }
         }
         
-        // --- LEAD GUARD (Apenas para DM ou Menções Diretas se configurado) ---
-        // Só processa lead/anti-ghost no JID Principal (Se for grupo, é o grupo. Se for DM, é a pessoa).
+        // --- LEAD GUARD (Apenas DM) ---
         if (!fromMe && !isGroup) {
             const { data: contact } = await supabase.from('contacts').select('is_ignored').eq('jid', jid).eq('company_id', companyId).maybeSingle();
             if (contact?.is_ignored) return;
@@ -98,7 +90,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const messageData = {
             company_id: companyId,
             session_id: sessionId,
-            remote_jid: jid,  // O JID do Chat (Grupo ou Pessoa)
+            remote_jid: jid,
             whatsapp_id: unwrapped.key.id,
             from_me: fromMe,
             content: body,
@@ -106,11 +98,11 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             media_url: mediaUrl,
             status: fromMe ? 'sent' : 'delivered',
             created_at: new Date( (unwrapped.messageTimestamp || Date.now() / 1000) * 1000 ),
-            // Se for grupo, não vincula lead_id na mensagem diretamente para não poluir contagem
+            participant: participantJid, // [NOVO] Salva quem mandou no grupo
             lead_id: isGroup ? null : undefined 
         };
         
-        // Se for DM, tenta vincular lead_id corretamente
+        // Se for DM, vincula lead_id
         if (!isGroup && !fromMe) {
              const purePhone = jid.split('@')[0].replace(/\D/g, '');
              const { data: lead } = await supabase.from('leads').select('id').eq('phone', purePhone).eq('company_id', companyId).maybeSingle();
@@ -138,15 +130,12 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             messageData.content = JSON.stringify({ displayName: contact.displayName, vcard: contact.vcard });
         }
 
-        // Salva a mensagem. O Trigger de banco `handle_new_message_stats` cuidará de atualizar 
-        // o `last_message_at` APENAS para o `remote_jid` (Grupo ou DM), evitando o bug de duplicidade.
         await upsertMessage(messageData);
 
         // Webhook
         if (isRealtime) {
             const { data: instance } = await supabase.from('instances').select('webhook_url, webhook_enabled, id').eq('session_id', sessionId).single();
             if (instance?.webhook_enabled && instance.webhook_url) {
-                // Injeta participant no webhook para quem consome saber quem mandou no grupo
                 const webhookPayload = { ...messageData, pushName, participant: participantJid };
                 dispatchWebhook(instance.webhook_url, 'message.upsert', webhookPayload, instance.id);
             }
@@ -157,10 +146,9 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
     }
 };
 
-// --- 2. HANDLE MESSAGE UPDATE (POLLS) ---
+// ... (Resto das funções handleMessageUpdate, handleReceiptUpdate, handleReaction permanecem iguais)
 export const handleMessageUpdate = async (updates, companyId) => {
     for (const update of updates) {
-        // Lógica de Enquetes (Votos)
         if (update.pollUpdates) {
             for (const pollUpdate of update.pollUpdates) {
                 const pollMsgId = pollUpdate.pollCreationMessageKey.id;
@@ -176,10 +164,8 @@ export const handleMessageUpdate = async (updates, companyId) => {
                 if (originalMsg) {
                     try {
                         let currentVotes = Array.isArray(originalMsg.poll_votes) ? originalMsg.poll_votes : [];
-                        // Remove voto anterior do mesmo votante para evitar duplicidade
                         currentVotes = currentVotes.filter(v => v.voterJid !== voterJid);
                         
-                        // Buffer -> Hex se necessário
                         const selectedOptions = vote.selectedOptions.map(opt => Buffer.isBuffer(opt) ? opt.toString('hex') : opt);
                         
                         currentVotes.push({ voterJid, selectedOptions, ts: Date.now() });
@@ -197,11 +183,9 @@ export const handleMessageUpdate = async (updates, companyId) => {
     }
 };
 
-// --- 3. HANDLE RECEIPT UPDATE (TICKS) ---
 export const handleReceiptUpdate = async (events, companyId) => {
     for (const event of events) {
         const { key, receipt } = event;
-        // Ignora receipts de grupos que não são updates de status global da mensagem
         if (receipt.userJid) continue; 
         
         let statusStr = 'sent';
@@ -222,7 +206,6 @@ export const handleReceiptUpdate = async (events, companyId) => {
     }
 };
 
-// --- 4. HANDLE REACTION ---
 export const handleReaction = async (reactions, sock, companyId) => {
     for (const reaction of reactions) {
         const { key, reaction: r } = reaction;
@@ -242,10 +225,8 @@ export const handleReaction = async (reactions, sock, companyId) => {
 
             if (msg) {
                 let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
-                // Remove reação anterior do mesmo ator
                 currentReactions = currentReactions.filter(rx => rx.actor !== actor);
                 
-                // Se emoji existe (não é remoção), adiciona
                 if (emoji) {
                     currentReactions.push({ text: emoji, actor: actor, ts: Date.now() });
                 }
