@@ -1,151 +1,155 @@
 
-import { upsertContact, normalizeJid } from '../../crm/sync.js';
+import { upsertContact, updateSyncStatus, normalizeJid } from '../../crm/sync.js'; 
+import { handleMessage } from './messageHandler.js';
+import { unwrapMessage } from '../../../utils/wppParsers.js';
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-/**
- * Processa atualizações de presença (Online/Visto por ultimo)
- */
-export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
-    let id = presenceUpdate.id;
-    const presences = presenceUpdate.presences;
+const HISTORY_MSG_LIMIT = 15;
+const HISTORY_MONTHS_LIMIT = 8;
+const processedHistoryChunks = new Set();
 
-    // --- LID RESOLVER PARA PRESENÇA ---
-    // Se o ID for um LID, buscamos o telefone real na tabela identity_map
-    // para marcar online o chat correto (Telefone), não o dispositivo (LID).
-    if (id.includes('@lid')) {
-        const { data } = await supabase
-            .from('identity_map')
-            .select('phone_jid')
-            .eq('lid_jid', normalizeJid(id))
-            .eq('company_id', companyId)
-            .maybeSingle();
-            
-        if (data?.phone_jid) {
-            id = data.phone_jid; // Redireciona para o JID do telefone
-        } else {
-            // Se não achou mapeamento, ABORTA. 
-            // Não queremos atualizar status de um LID desconhecido na tabela contacts.
-            return; 
-        }
-    }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-    if (presences[presenceUpdate.id]) {
-        const lastKnown = presences[presenceUpdate.id].lastKnownPresence;
-        const isOnline = lastKnown === 'composing' || lastKnown === 'recording' || lastKnown === 'available';
-        
-        // Update Rápido no ID resolvido (Telefone)
-        supabase.from('contacts')
-            .update({ 
-                is_online: isOnline, 
-                last_seen_at: new Date().toISOString() 
-            })
-            .eq('jid', normalizeJid(id)) // Usa o ID resolvido (Telefone)
-            .eq('company_id', companyId)
-            .then(() => {});
-    }
-};
-
-/**
- * Processa lista de contatos (Sync inicial da Agenda)
- */
-export const handleContactsUpsert = async (contacts, companyId) => {
-    for (const c of contacts) {
-        const jid = normalizeJid(c.id);
-        if (!jid) continue;
-
-        // Mapeamento de Identidade (LID -> Phone)
-        // O Baileys geralmente envia o objeto com { id: 'phone_jid', lid: 'lid_jid' }
-        if (c.lid) {
-            supabase.rpc('link_identities', {
-                p_lid: normalizeJid(c.lid),
-                p_phone: jid,
-                p_company_id: companyId
-            }).then(() => {});
-        }
-
-        // --- FILTRO DE HIGIENE ---
-        // Se o PRÓPRIO contato for um LID (ex: upsert de dispositivo), ignoramos na lista visual.
-        // Só queremos salvar contatos de telefone (@s.whatsapp.net) ou grupos (@g.us).
-        if (jid.includes('@lid')) continue;
-
-        const bestName = c.name || c.notify || c.verifiedName;
-        const isFromBook = !!c.name;
-
-        if (bestName || c.imgUrl) {
-            await upsertContact(jid, companyId, bestName, c.imgUrl || null, isFromBook, c.lid);
-        }
-    }
-};
-
-export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
-    if (!jid || jid.includes('status@broadcast')) return;
-    const cleanJid = normalizeJid(jid);
+export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
     
-    // Ignora LIDs, Grupos e Canais para refresh de perfil comercial
-    if (cleanJid.includes('@lid') || cleanJid.includes('@g.us') || cleanJid.includes('@newsletter')) return;
+    const chunkKey = `${sessionId}-chunk-${chunkCounter}`;
+    if (processedHistoryChunks.has(chunkKey)) return;
+    processedHistoryChunks.add(chunkKey);
+
+    const estimatedProgress = progress || Math.min((chunkCounter * 2), 99);
+    console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
+    await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
 
     try {
-        const { data: contact } = await supabase
-            .from('contacts')
-            .select('profile_pic_url, profile_pic_updated_at, is_business, verified_name, name, push_name')
-            .eq('jid', cleanJid)
-            .eq('company_id', companyId)
-            .maybeSingle();
+        const contactsMap = new Map();
 
-        const now = new Date();
-        const lastUpdate = contact?.profile_pic_updated_at ? new Date(contact.profile_pic_updated_at) : new Date(0);
-        const diffHours = (now - lastUpdate) / 1000 / 60 / 60;
+        // -----------------------------------------------------------
+        // ETAPA 1: CONTATOS (AGENDA)
+        // -----------------------------------------------------------
+        if (contacts && contacts.length > 0) {
+            const BATCH_SIZE = 50;
+            for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
+                const batch = contacts.slice(i, i + BATCH_SIZE);
+                
+                await Promise.all(batch.map(async (c) => {
+                    const jid = normalizeJid(c.id);
+                    if (!jid) return;
+                    
+                    // --- MAPA DE IDENTIDADE (CRÍTICO) ---
+                    // Se o contato histórico tem LID, salva o vínculo agora.
+                    if (c.lid) {
+                        supabase.rpc('link_identities', {
+                            p_lid: normalizeJid(c.lid),
+                            p_phone: jid,
+                            p_company_id: companyId
+                        }).then(() => {});
+                    }
 
-        let newPicUrl = null;
-        let isBusiness = contact?.is_business || false;
-        let verifiedName = contact?.verified_name || null;
-        let shouldUpdate = false;
+                    // Se o JID for LID, não salva na lista visual
+                    if (jid.includes('@lid')) return;
 
-        if (pushName && pushName.trim() !== '') {
-            if (!contact?.push_name || contact.push_name !== pushName) {
-                shouldUpdate = true;
+                    const bestName = c.name || c.verifiedName || c.notify; 
+                    const isFromBook = !!c.name; 
+
+                    // Smart Fetch Foto
+                    let finalImgUrl = c.imgUrl || null;
+                    if (!finalImgUrl && !jid.includes('@newsletter') && !jid.includes('status@broadcast')) {
+                        try {
+                            await sleep(Math.floor(Math.random() * 150)); 
+                            finalImgUrl = await sock.profilePictureUrl(jid, 'image');
+                        } catch (e) {
+                            finalImgUrl = null;
+                        }
+                    }
+
+                    contactsMap.set(jid, { 
+                        name: bestName, 
+                        imgUrl: finalImgUrl, 
+                        isFromBook: isFromBook, 
+                        lid: c.lid || null 
+                    });
+
+                    await upsertContact(jid, companyId, bestName, finalImgUrl, isFromBook, c.lid);
+                }));
+                
+                await sleep(50); 
+            }
+            
+            if (chunkCounter === 1) {
+                console.log("⏳ [SYNC] Aguardando indexação da agenda...");
+                await sleep(2000); 
             }
         }
 
-        if (!contact || diffHours > 48) { 
-             try {
-                 const businessProfile = await sock.getBusinessProfile(cleanJid);
-                 if (businessProfile) {
-                     isBusiness = true;
-                     verifiedName = businessProfile.description ? (pushName || null) : null; 
-                     shouldUpdate = true;
-                 }
-             } catch (e) {}
-        }
+        // -----------------------------------------------------------
+        // ETAPA 2: MENSAGENS
+        // -----------------------------------------------------------
+        if (messages && messages.length > 0) {
+            
+            const cutoffDate = new Date();
+            cutoffDate.setMonth(cutoffDate.getMonth() - HISTORY_MONTHS_LIMIT);
+            const cutoffTimestamp = Math.floor(cutoffDate.getTime() / 1000);
 
-        if (!contact?.profile_pic_url || diffHours >= 24) {
-            try {
-                newPicUrl = await sock.profilePictureUrl(cleanJid, 'image');
-                if (newPicUrl !== contact?.profile_pic_url) {
-                    shouldUpdate = true;
+            const chats = {}; 
+            messages.forEach(msg => {
+                const clean = unwrapMessage(msg);
+                if (!clean.key?.remoteJid) return;
+                
+                const msgTs = Number(clean.messageTimestamp);
+                if (msgTs < cutoffTimestamp) return;
+
+                const jid = normalizeJid(clean.key.remoteJid);
+                if (jid === 'status@broadcast') return;
+
+                if (!chats[jid]) chats[jid] = [];
+                
+                const knownContact = contactsMap.get(jid);
+                if (knownContact && knownContact.isFromBook) {
+                    clean._forcedName = knownContact.name;
+                } else {
+                    clean._forcedName = clean.pushName;
                 }
-            } catch (e) {}
-        }
+                
+                chats[jid].push(clean);
+            });
 
-        if (shouldUpdate) {
-            const finalPic = newPicUrl || contact?.profile_pic_url || null;
-            const nameToSave = pushName || contact?.push_name;
+            const chatJids = Object.keys(chats);
 
-            await upsertContact(
-                cleanJid, 
-                companyId, 
-                nameToSave, 
-                finalPic, 
-                false, 
-                null, 
-                isBusiness,
-                verifiedName
-            );
+            for (const jid of chatJids) {
+                chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0)); 
+                
+                const latestMsg = chats[jid][0];
+                if (latestMsg && latestMsg.messageTimestamp) {
+                    const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
+                    supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
+                }
+
+                const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT).reverse(); 
+                
+                for (const msg of topMessages) {
+                    try {
+                        const options = { 
+                            downloadMedia: false, 
+                            fetchProfilePic: false,
+                            createLead: true 
+                        };
+                        
+                        await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
+                    } catch (msgError) {}
+                }
+                await sleep(10); 
+            }
         }
 
     } catch (e) {
-        console.error(`⚠️ [CONTACT] Erro no refresh info para ${jid}:`, e.message);
+        console.error("❌ [SYNC ERROR]", e);
+    } finally {
+        if (isLatest) {
+            console.log(`✅ [HISTÓRICO] Sincronização 100% Concluída.`);
+            await updateSyncStatus(sessionId, 'completed', 100);
+            processedHistoryChunks.clear();
+        }
     }
 };
