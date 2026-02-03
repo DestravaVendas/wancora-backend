@@ -1,5 +1,5 @@
 
-import { upsertContactsBulk, updateSyncStatus, normalizeJid } from '../../crm/sync.js'; 
+import { upsertContact, updateSyncStatus, normalizeJid } from '../../crm/sync.js'; 
 import { handleMessage } from './messageHandler.js';
 import { unwrapMessage } from '../../../utils/wppParsers.js';
 import { createClient } from '@supabase/supabase-js';
@@ -19,85 +19,69 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
     processedHistoryChunks.add(chunkKey);
 
     const estimatedProgress = progress || Math.min((chunkCounter * 2), 99);
-    console.log(`📚 [SYNC] Lote ${chunkCounter} | Contatos: ${contacts?.length || 0} | Msgs: ${messages?.length || 0}`);
+    console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
     await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
 
     try {
         const contactsMap = new Map();
 
         // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS (BULK INSERT - VELOCIDADE MÁXIMA)
+        // ETAPA 1: CONTATOS (AGENDA - PRIORIDADE MÁXIMA)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
-            const BATCH_SIZE = 250; // Lote maior para banco
-            const bulkPayload = [];
-
-            for (const c of contacts) {
-                const jid = normalizeJid(c.id);
-                if (!jid || jid.includes('@lid')) {
-                    // Se for LID, apenas vincula
+            const BATCH_SIZE = 50;
+            for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
+                const batch = contacts.slice(i, i + BATCH_SIZE);
+                
+                await Promise.all(batch.map(async (c) => {
+                    const jid = normalizeJid(c.id);
+                    if (!jid) return;
+                    
+                    // Mapa de Identidade (LID -> Phone)
                     if (c.lid) {
-                         supabase.rpc('link_identities', {
+                        supabase.rpc('link_identities', {
                             p_lid: normalizeJid(c.lid),
                             p_phone: jid,
                             p_company_id: companyId
                         }).then(() => {});
                     }
-                    continue; 
-                }
 
-                // LÓGICA DE OURO DO NOME (Agenda > Business > PushName)
-                const isFromBook = !!(c.name && c.name.trim().length > 0);
-                const bestName = c.name || c.verifiedName || c.notify; 
+                    // Se o JID for LID, não salva como contato visual
+                    if (jid.includes('@lid')) return;
 
-                // Armazena no mapa para uso nas mensagens subsequentes
-                contactsMap.set(jid, { 
-                    name: bestName, 
-                    imgUrl: c.imgUrl || null, 
-                    isFromBook: isFromBook, 
-                    lid: c.lid || null 
-                });
+                    // Definição de Nome da Agenda
+                    const bestName = c.name || c.verifiedName || c.notify; 
+                    const isFromBook = !!c.name; // Se tem c.name, é da agenda
 
-                // PREPARA OBJETO PARA BULK
-                const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
+                    // Smart Fetch Foto
+                    let finalImgUrl = c.imgUrl || null;
+                    if (!finalImgUrl && !jid.includes('@newsletter') && !jid.includes('status@broadcast')) {
+                        try {
+                            await sleep(Math.floor(Math.random() * 150)); 
+                            finalImgUrl = await sock.profilePictureUrl(jid, 'image');
+                        } catch (e) {
+                            finalImgUrl = null;
+                        }
+                    }
+
+                    // Armazena no mapa para uso nas mensagens
+                    contactsMap.set(jid, { 
+                        name: bestName, 
+                        imgUrl: finalImgUrl, 
+                        isFromBook: isFromBook, 
+                        lid: c.lid || null 
+                    });
+
+                    // Upsert IMEDIATO garantindo flag da agenda
+                    await upsertContact(jid, companyId, bestName, finalImgUrl, isFromBook, c.lid);
+                }));
                 
-                const contactData = {
-                    jid: jid,
-                    phone: purePhone,
-                    company_id: companyId,
-                    updated_at: new Date()
-                };
-
-                if (isFromBook) {
-                    contactData.name = bestName;
-                } else if (bestName) {
-                    contactData.push_name = bestName;
-                }
-
-                if (c.imgUrl) {
-                    contactData.profile_pic_url = c.imgUrl;
-                    contactData.profile_pic_updated_at = new Date();
-                }
-
-                if (c.verifiedName) {
-                    contactData.verified_name = c.verifiedName;
-                    contactData.is_business = true;
-                }
-
-                bulkPayload.push(contactData);
-            }
-
-            // EXECUTAR BULK UPSERT
-            for (let i = 0; i < bulkPayload.length; i += BATCH_SIZE) {
-                const batch = bulkPayload.slice(i, i + BATCH_SIZE);
-                await upsertContactsBulk(batch);
-                await sleep(20); // Pequeno respiro para o banco
+                await sleep(50); 
             }
             
-            // Só aguarda se foi o primeiro lote significativo
-            if (chunkCounter === 1 || contacts.length > 500) {
-                console.log("⏳ [SYNC] Aguardando persistência da agenda...");
-                await sleep(1000); 
+            if (chunkCounter === 1) {
+                console.log("⏳ [SYNC] Aguardando indexação da agenda...");
+                await sleep(2000); 
             }
         }
 
@@ -123,19 +107,14 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Name Injection & Trust Flag (Memory Lookup)
+                // Name Injection: Se veio da agenda, injeta o nome na mensagem para o handler saber
                 const knownContact = contactsMap.get(jid);
-                let isFromBookMsg = false;
-
                 if (knownContact && knownContact.isFromBook) {
                     clean._forcedName = knownContact.name;
-                    isFromBookMsg = true; // Flag vital para o messageHandler
                 } else {
                     clean._forcedName = clean.pushName;
                 }
                 
-                clean._isFromBook = isFromBookMsg;
-
                 chats[jid].push(clean);
             });
 
@@ -157,15 +136,14 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         const options = { 
                             downloadMedia: false, 
                             fetchProfilePic: false,
-                            createLead: true,
-                            isFromBook: msg._isFromBook // Passa a confiança aqui
+                            createLead: true 
                         };
                         
+                        // Passa o nome forçado se houver (agenda)
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {}
                 }
-                // Pequeno delay entre chats para não travar o loop
-                if (chatJids.length > 50) await sleep(5); 
+                await sleep(10); 
             }
         }
 
