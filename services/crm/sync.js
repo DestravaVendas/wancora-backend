@@ -35,10 +35,19 @@ const safeSupabaseCall = async (operation, retries = 3) => {
 
 export const normalizeJid = (jid) => {
     if (!jid) return null;
-    if (jid.includes('@g.us')) return jid;
-    // Removido suporte a newsletter
-    const clean = jid.split(':')[0];
-    return clean.includes('@') ? clean : `${clean}@s.whatsapp.net`;
+    // Se já vier formatado corretamente
+    if (jid.includes('@s.whatsapp.net') || jid.includes('@g.us')) return jid;
+    
+    // Tratamento de JID puro (apenas numeros)
+    const clean = jid.split(':')[0].split('@')[0];
+    
+    // Se for curto demais ou tiver caracteres estranhos, ignora (exceto IDs de grupo)
+    if (clean.length < 5 && !jid.includes('-')) return null;
+
+    // Detecção básica: Se tem hífen, provavel ser grupo antigo ou broadcast
+    if (jid.includes('-')) return `${clean}@g.us`;
+    
+    return `${clean}@s.whatsapp.net`;
 };
 
 // Validador Estrito de Nomes (Anti-Spam)
@@ -92,8 +101,6 @@ export const upsertContactsBulk = async (contactsArray) => {
     const validContacts = contactsArray.filter(c => c.jid && c.company_id);
     if (validContacts.length === 0) return;
 
-    // console.log(`💾 [DB] Tentando salvar lote de ${validContacts.length} contatos...`);
-
     try {
         await safeSupabaseCall(async () => {
             const { error, count } = await supabase
@@ -102,31 +109,27 @@ export const upsertContactsBulk = async (contactsArray) => {
             
             if (error) {
                 console.error(`🚨 [DB FAIL] Erro Supabase Bulk Upsert: ${error.message} | Code: ${error.code}`);
-                if (error.details) console.error(`   Detalhes: ${error.details}`);
-                if (error.hint) console.error(`   Dica: ${error.hint}`);
+                // Se der erro de dados, tenta fallback
                 throw error;
             } else {
-                console.log(`✅ [DB SUCCESS] ${validContacts.length} contatos salvos/atualizados.`);
+                console.log(`✅ [DB SUCCESS] ${validContacts.length} contatos processados.`);
             }
         });
     } catch (e) {
         console.error(`❌ [SYNC] Falha crítica no Bulk Insert. Iniciando modo de recuperação ITEM-A-ITEM...`);
         
-        // Fallback: Tenta salvar um por um para descobrir qual registro está quebrando
         let successCount = 0;
-        let failCount = 0;
-
         for (const c of validContacts) {
              try {
-                const { error } = await supabase.from('contacts').upsert(c, { onConflict: 'company_id, jid' });
-                if (error) throw error;
+                // Tenta salvar individualmente
+                await upsertContact(c.jid, c.company_id, c.name, c.profile_pic_url, !!c.name, null, c.is_business, c.verified_name, {
+                    push_name: c.push_name,
+                    is_ignored: c.is_ignored
+                });
                 successCount++;
-             } catch (singleErr) {
-                 failCount++;
-                 console.error(`   💀 Falha no contato ${c.jid} (${c.name || 'Sem nome'}):`, singleErr.message);
-             }
+             } catch (singleErr) {}
         }
-        console.log(`🏁 [RECOVERY] Recuperação finalizada. Sucessos: ${successCount} | Falhas: ${failCount}`);
+        console.log(`🏁 [RECOVERY] Recuperados: ${successCount}/${validContacts.length}`);
     }
 };
 
@@ -154,15 +157,8 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
         const nameClean = incomingName ? incomingName.toString().trim() : '';
         const hasValidName = nameClean.length > 0;
-        
-        // Verifica se é genérico (números, simbolos)
         const isGeneric = isGenericName(incomingName, purePhone);
 
-        // LÓGICA "TRUST THE BOOK":
-        // 1. Se veio da Agenda (isFromBook) E tem texto -> Salva em 'name' (Ignora filtro de genérico).
-        //    Motivo: Se o usuário salvou "123" ou "❤️", ele quer ver isso.
-        // 2. Se veio de PushName (Automático) -> Salva em 'push_name' APENAS se não for genérico.
-        
         if (isFromBook && hasValidName) {
             updateData.name = incomingName;
         } else if (hasValidName && !isGeneric) {
@@ -238,11 +234,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         }
 
         let finalName = null;
-
-        // Prioridade de Nome para o Lead:
-        // 1. Agenda (contacts.name) - Confiança total se não for genérico (aqui mantemos filtro pra lead)
-        // 2. Business (verified_name)
-        // 3. PushName
         
         if (contact) {
             if (contact.name && !isGenericName(contact.name, purePhone)) finalName = contact.name; 
@@ -250,7 +241,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             else if (contact.push_name && !isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
         }
         
-        // Se ainda não temos nome, tentamos o pushName passado na hora
         if (!finalName && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
         }
@@ -260,7 +250,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         );
 
         if (existing) {
-            // Auto-Healing: Melhora o nome se o atual for ruim
             const currentNameIsBad = !existing.name || isGenericName(existing.name, purePhone);
             const newNameIsGood = finalName && !isGenericName(finalName, purePhone);
 
