@@ -3,7 +3,6 @@ import { upsertContact, upsertContactsBulk, normalizeJid } from '../../crm/sync.
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const presenceDebounce = new Map();
 
 /**
  * Processa atualizações de presença (Online/Visto por ultimo)
@@ -28,50 +27,18 @@ export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
         }
     }
 
-    const jid = normalizeJid(id);
-
     if (presences[presenceUpdate.id]) {
         const lastKnown = presences[presenceUpdate.id].lastKnownPresence;
         const isOnline = lastKnown === 'composing' || lastKnown === 'recording' || lastKnown === 'available';
         
-        // --- DEBOUNCE PARA EVITAR PISCAR ---
-        // O WhatsApp as vezes manda 'unavailable' logo depois de 'available'.
-        // Vamos segurar o 'unavailable' por 5 segundos. Se virar 'available' de novo, cancelamos.
-        
-        if (isOnline) {
-            // Se ficou online, limpa qualquer timeout de offline pendente
-            if (presenceDebounce.has(jid)) {
-                clearTimeout(presenceDebounce.get(jid));
-                presenceDebounce.delete(jid);
-            }
-            
-            // Atualiza imediatamente
-            supabase.from('contacts')
-                .update({ 
-                    is_online: true, 
-                    last_seen_at: new Date().toISOString() 
-                })
-                .eq('jid', jid) 
-                .eq('company_id', companyId)
-                .then(() => {});
-
-        } else {
-            // Se ficou offline (unavailable), agenda a atualização
-            if (!presenceDebounce.has(jid)) {
-                const timeout = setTimeout(() => {
-                    supabase.from('contacts')
-                        .update({ 
-                            is_online: false, 
-                            last_seen_at: new Date().toISOString() 
-                        })
-                        .eq('jid', jid) 
-                        .eq('company_id', companyId)
-                        .then(() => presenceDebounce.delete(jid));
-                }, 5000); // 5 segundos de tolerância
-
-                presenceDebounce.set(jid, timeout);
-            }
-        }
+        supabase.from('contacts')
+            .update({ 
+                is_online: isOnline, 
+                last_seen_at: new Date().toISOString() 
+            })
+            .eq('jid', normalizeJid(id)) 
+            .eq('company_id', companyId)
+            .then(() => {});
     }
 };
 
