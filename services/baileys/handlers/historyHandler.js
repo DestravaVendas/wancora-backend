@@ -1,5 +1,5 @@
 
-import { upsertContact, updateSyncStatus, normalizeJid } from '../../crm/sync.js'; 
+import { upsertContactsBulk, updateSyncStatus, normalizeJid } from '../../crm/sync.js'; 
 import { handleMessage } from './messageHandler.js';
 import { unwrapMessage } from '../../../utils/wppParsers.js';
 import { createClient } from '@supabase/supabase-js';
@@ -19,69 +19,84 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
     processedHistoryChunks.add(chunkKey);
 
     const estimatedProgress = progress || Math.min((chunkCounter * 2), 99);
-    console.log(`📚 [SYNC] Lote ${chunkCounter} | Progresso: ${estimatedProgress}% | Latest: ${isLatest}`);
+    console.log(`📚 [SYNC] Lote ${chunkCounter} | Contatos: ${contacts?.length || 0} | Msgs: ${messages?.length || 0}`);
     await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
 
     try {
         const contactsMap = new Map();
 
         // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS (AGENDA - PRIORIDADE MÁXIMA)
+        // ETAPA 1: CONTATOS (BULK INSERT - VELOCIDADE MÁXIMA)
         // -----------------------------------------------------------
         if (contacts && contacts.length > 0) {
-            const BATCH_SIZE = 50;
-            for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
-                const batch = contacts.slice(i, i + BATCH_SIZE);
+            const BATCH_SIZE = 500; // Supabase aguenta lotes grandes
+            const bulkPayload = [];
+
+            for (const c of contacts) {
+                const jid = normalizeJid(c.id);
+                if (!jid) continue;
+
+                // Mapa de Identidade (LID -> Phone)
+                if (c.lid) {
+                     supabase.rpc('link_identities', {
+                        p_lid: normalizeJid(c.lid),
+                        p_phone: jid,
+                        p_company_id: companyId
+                    }).then(() => {});
+                }
                 
-                await Promise.all(batch.map(async (c) => {
-                    const jid = normalizeJid(c.id);
-                    if (!jid) return;
-                    
-                    // Mapa de Identidade (LID -> Phone)
-                    if (c.lid) {
-                        supabase.rpc('link_identities', {
-                            p_lid: normalizeJid(c.lid),
-                            p_phone: jid,
-                            p_company_id: companyId
-                        }).then(() => {});
-                    }
+                // Se o JID for LID, não salva como contato visual na tabela contacts
+                // Mas usamos a RPC acima para garantir o vinculo
+                if (jid.includes('@lid')) continue;
 
-                    // Se o JID for LID, não salva como contato visual
-                    if (jid.includes('@lid')) return;
+                const bestName = c.name || c.verifiedName || c.notify;
+                const isFromBook = !!(c.name && c.name.trim().length > 0);
 
-                    // Definição de Nome da Agenda
-                    const bestName = c.name || c.verifiedName || c.notify; 
-                    const isFromBook = !!c.name; // Se tem c.name, é da agenda
+                // Armazena no mapa para uso nas mensagens subsequentes (In-Memory Cache)
+                contactsMap.set(jid, { 
+                    name: bestName, 
+                    imgUrl: c.imgUrl || null, 
+                    isFromBook: isFromBook, 
+                    lid: c.lid || null 
+                });
 
-                    // Smart Fetch Foto
-                    let finalImgUrl = c.imgUrl || null;
-                    if (!finalImgUrl && !jid.includes('@newsletter') && !jid.includes('status@broadcast')) {
-                        try {
-                            await sleep(Math.floor(Math.random() * 150)); 
-                            finalImgUrl = await sock.profilePictureUrl(jid, 'image');
-                        } catch (e) {
-                            finalImgUrl = null;
-                        }
-                    }
+                // PREPARA OBJETO PARA BULK
+                const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
+                const contactData = {
+                    jid: jid,
+                    phone: purePhone,
+                    company_id: companyId,
+                    updated_at: new Date()
+                };
 
-                    // Armazena no mapa para uso nas mensagens
-                    contactsMap.set(jid, { 
-                        name: bestName, 
-                        imgUrl: finalImgUrl, 
-                        isFromBook: isFromBook, 
-                        lid: c.lid || null 
-                    });
+                // Aplica lógica de nomes da Agenda
+                if (isFromBook) {
+                    contactData.name = bestName;
+                } else if (bestName) {
+                    contactData.push_name = bestName;
+                }
 
-                    // Upsert IMEDIATO garantindo flag da agenda
-                    await upsertContact(jid, companyId, bestName, finalImgUrl, isFromBook, c.lid);
-                }));
-                
-                await sleep(50); 
+                if (c.imgUrl) {
+                    contactData.profile_pic_url = c.imgUrl;
+                    contactData.profile_pic_updated_at = new Date();
+                }
+
+                if (c.verifiedName) {
+                    contactData.verified_name = c.verifiedName;
+                    contactData.is_business = true;
+                }
+
+                bulkPayload.push(contactData);
             }
-            
-            if (chunkCounter === 1) {
-                console.log("⏳ [SYNC] Aguardando indexação da agenda...");
-                await sleep(2000); 
+
+            // EXECUTAR BULK UPSERT
+            // Divide em chunks menores se necessário, mas 500 costuma ir bem
+            for (let i = 0; i < bulkPayload.length; i += BATCH_SIZE) {
+                const batch = bulkPayload.slice(i, i + BATCH_SIZE);
+                console.log(`💾 [SYNC] Salvando lote de ${batch.length} contatos no banco...`);
+                await upsertContactsBulk(batch);
+                // Pequeno respiro para não travar o socket
+                await sleep(50);
             }
         }
 
@@ -107,7 +122,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Name Injection: Se veio da agenda, injeta o nome na mensagem para o handler saber
+                // Name Injection: Se veio da agenda, injeta o nome na mensagem
                 const knownContact = contactsMap.get(jid);
                 if (knownContact && knownContact.isFromBook) {
                     clean._forcedName = knownContact.name;
@@ -135,15 +150,14 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     try {
                         const options = { 
                             downloadMedia: false, 
-                            fetchProfilePic: false,
+                            fetchProfilePic: false, // Desligado para acelerar, o Bulk já tentou pegar o que tinha
                             createLead: true 
                         };
                         
-                        // Passa o nome forçado se houver (agenda)
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {}
                 }
-                await sleep(10); 
+                await sleep(5); // Delay mínimo
             }
         }
 
