@@ -68,6 +68,24 @@ export const updateGroup = async (req, res) => {
     } catch (error) { res.status(500).json({ error: error.message }); }
 };
 
+// [NOVO] Endpoint para buscar metadados do grupo (Participantes)
+export const getGroupMetadata = async (req, res) => {
+    const { sessionId, groupId } = req.body;
+    
+    try {
+        const session = sessions.get(sessionId);
+        if (!session || !session.sock) throw new Error("Sessão desconectada.");
+
+        const jid = normalizeJid(groupId);
+        const metadata = await session.sock.groupMetadata(jid);
+
+        res.json({ success: true, metadata });
+    } catch (error) {
+        console.error("Erro getGroupMetadata:", error);
+        res.status(500).json({ error: error.message });
+    }
+};
+
 export const createCommunity = async (req, res) => {
     const { sessionId, companyId, subject, description } = req.body;
     try {
@@ -77,7 +95,6 @@ export const createCommunity = async (req, res) => {
 };
 
 // --- CATÁLOGO ---
-
 export const syncCatalog = async (req, res) => {
     const { sessionId, companyId } = req.body;
     try {
@@ -86,82 +103,50 @@ export const syncCatalog = async (req, res) => {
     } catch (error) { res.status(500).json({ error: error.message }); }
 };
 
-// --- INTERATIVIDADE ---
+// --- INTERATIVIDADE (VOTE/REACT/DELETE) ---
 export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, optionId) => {
     try {
         const session = sessions.get(sessionId);
         if (!session || !session.sock) throw new Error("Sessão desconectada.");
 
-        // 1. Busca dados da enquete original
-        const { data: pollMsg } = await supabase
-            .from('messages')
-            .select('whatsapp_id, from_me, content')
-            .eq('id', pollId) 
-            .single();
-
+        const { data: pollMsg } = await supabase.from('messages').select('whatsapp_id, from_me, content').eq('id', pollId).single();
         if (!pollMsg) throw new Error("Enquete não encontrada no banco.");
 
         let pollContent;
         try {
             pollContent = typeof pollMsg.content === 'string' ? JSON.parse(pollMsg.content) : pollMsg.content;
-        } catch (e) {
-            console.error("Erro parse poll:", e);
-            throw new Error("Conteúdo da enquete corrompido.");
-        }
+        } catch (e) { throw new Error("Conteúdo da enquete corrompido."); }
 
-        // 2. Resolve a opção com Robustez
         let optionsList = [];
         if (Array.isArray(pollContent.options)) {
             optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
         } else if (pollContent.values) {
             optionsList = pollContent.values;
-        } else {
-            throw new Error("Estrutura da enquete inválida.");
         }
 
         const selectedOptionText = optionsList[optionId];
-        
-        if (selectedOptionText === undefined) {
-            throw new Error(`Opção inválida: Index ${optionId} não existe.`);
-        }
+        if (selectedOptionText === undefined) throw new Error(`Opção inválida: Index ${optionId} não existe.`);
 
         const chatJid = normalizeJid(remoteJid);
         
-        // 3. Payload de Voto
         await session.sock.sendMessage(chatJid, {
             poll: {
                 vote: {
-                    key: {
-                        remoteJid: chatJid,
-                        id: pollMsg.whatsapp_id,
-                        fromMe: pollMsg.from_me,
-                    },
+                    key: { remoteJid: chatJid, id: pollMsg.whatsapp_id, fromMe: pollMsg.from_me },
                     selectedOptions: [selectedOptionText] 
                 }
             }
         });
 
-        // 4. Salva no banco (Atualização Otimista)
         const myJid = normalizeJid(session.sock.user?.id);
-        
         const { data: currentMsg } = await supabase.from('messages').select('poll_votes').eq('whatsapp_id', pollMsg.whatsapp_id).single();
         let votes = currentMsg?.poll_votes || [];
-        
         votes = votes.filter(v => v.voterJid !== myJid);
+        votes.push({ voterJid: myJid, ts: Date.now(), selectedOptions: [selectedOptionText] });
 
-        votes.push({
-            voterJid: myJid,
-            ts: Date.now(),
-            selectedOptions: [selectedOptionText]
-        });
-
-        await supabase.from('messages')
-            .update({ poll_votes: votes })
-            .eq('whatsapp_id', pollMsg.whatsapp_id)
-            .eq('company_id', companyId);
+        await supabase.from('messages').update({ poll_votes: votes }).eq('whatsapp_id', pollMsg.whatsapp_id).eq('company_id', companyId);
 
         return { success: true };
-
     } catch (error) {
         console.error(`[Controller] Erro ao votar:`, error.message);
         throw error;
@@ -173,20 +158,10 @@ export const sendReaction = async (sessionId, companyId, remoteJid, msgId, react
         const session = sessions.get(sessionId);
         if (!session?.sock) throw new Error("Sessão desconectada.");
 
-        const { data: targetMsg } = await supabase
-            .from('messages')
-            .select('whatsapp_id, from_me')
-            .eq('id', msgId) 
-            .single();
-
+        const { data: targetMsg } = await supabase.from('messages').select('whatsapp_id, from_me').eq('id', msgId).single();
         if (!targetMsg) throw new Error("Mensagem alvo não encontrada.");
 
-        const key = {
-            remoteJid: normalizeJid(remoteJid),
-            id: targetMsg.whatsapp_id,
-            fromMe: targetMsg.from_me
-        };
-
+        const key = { remoteJid: normalizeJid(remoteJid), id: targetMsg.whatsapp_id, fromMe: targetMsg.from_me };
         await session.sock.sendMessage(normalizeJid(remoteJid), { react: { text: reaction, key: key } });
         return { success: true };
     } catch (error) {
@@ -197,11 +172,7 @@ export const sendReaction = async (sessionId, companyId, remoteJid, msgId, react
 
 export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, everyone = false) => {
     try {
-        await supabase.from('messages')
-            .update({ is_deleted: true, content: '⊘ Mensagem apagada' }) 
-            .eq('id', msgId)
-            .eq('company_id', companyId);
-
+        await supabase.from('messages').update({ is_deleted: true, content: '⊘ Mensagem apagada' }).eq('id', msgId).eq('company_id', companyId);
         if (everyone) {
             const session = sessions.get(sessionId);
             if (session?.sock) {
@@ -223,46 +194,17 @@ export const markChatAsRead = async (sessionId, companyId, remoteJid) => {
     try {
         const session = sessions.get(sessionId);
         if (!session?.sock) return; 
-        
         const jid = normalizeJid(remoteJid);
         await session.sock.presenceSubscribe(jid);
-
-        const { data: unreadMsgs } = await supabase
-            .from('messages')
-            .select('whatsapp_id, from_me')
-            .eq('company_id', companyId)
-            .eq('remote_jid', jid)
-            .eq('from_me', false)
-            .neq('status', 'read')
-            .limit(20); 
-
+        const { data: unreadMsgs } = await supabase.from('messages').select('whatsapp_id, from_me').eq('company_id', companyId).eq('remote_jid', jid).eq('from_me', false).neq('status', 'read').limit(20); 
         if (unreadMsgs && unreadMsgs.length > 0) {
-            const keys = unreadMsgs.map(m => ({
-                remoteJid: jid,
-                id: m.whatsapp_id,
-                fromMe: false 
-            }));
-
+            const keys = unreadMsgs.map(m => ({ remoteJid: jid, id: m.whatsapp_id, fromMe: false }));
             await session.sock.readMessages(keys);
-
-            await supabase
-                .from('messages')
-                .update({ status: 'read', read_at: new Date() })
-                .eq('company_id', companyId)
-                .eq('remote_jid', jid)
-                .in('whatsapp_id', unreadMsgs.map(m => m.whatsapp_id));
-            
-            await supabase
-                .from('contacts')
-                .update({ unread_count: 0 })
-                .eq('company_id', companyId)
-                .eq('jid', jid);
+            await supabase.from('messages').update({ status: 'read', read_at: new Date() }).eq('company_id', companyId).eq('remote_jid', jid).in('whatsapp_id', unreadMsgs.map(m => m.whatsapp_id));
+            await supabase.from('contacts').update({ unread_count: 0 }).eq('company_id', companyId).eq('jid', jid);
         }
-
         return { success: true };
-    } catch (error) {
-        return { success: false, error: error.message };
-    }
+    } catch (error) { return { success: false, error: error.message }; }
 };
 
 export const getSessionId = async (companyId) => {
