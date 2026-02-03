@@ -1,7 +1,7 @@
 
 import express from "express";
 import { 
-    createGroup, updateGroup, 
+    createGroup, updateGroup, getGroupMetadata,
     createCommunity, 
     syncCatalog
 } from "../controllers/whatsappController.js";
@@ -14,6 +14,7 @@ router.use(requireAuth);
 // Grupos
 router.post("/group/create", createGroup);
 router.post("/group/update", updateGroup); 
+router.post("/group/metadata", getGroupMetadata); // NOVO
 
 // Comunidades
 router.post("/community/create", createCommunity);
