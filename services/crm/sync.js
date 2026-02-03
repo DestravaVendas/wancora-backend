@@ -41,16 +41,19 @@ export const normalizeJid = (jid) => {
     return clean.includes('@') ? clean : `${clean}@s.whatsapp.net`;
 };
 
-// Validador Estrito de Nomes
+// Validador Estrito de Nomes (Anti-Spam)
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
     if (cleanName.length < 1) return true;
     
+    // Se for só números ou símbolos: generic
     if (/^[\d\s\+\-\(\)]*$/.test(cleanName)) return true;
 
+    // Se for igual ao telefone: generic
     if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true;
     
+    // Se não tiver pelo menos uma letra: generic
     return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName);
 };
 
@@ -62,7 +65,7 @@ export const updateInstanceStatus = async (sessionId, companyId, data) => {
             .eq('company_id', companyId)
         );
     } catch (e) {
-        // Fail silent para não parar fluxo
+        // Fail silent
     }
 };
 
@@ -84,8 +87,8 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
 export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false, lid = null, isBusiness = false, verifiedName = null, extraData = {}) => {
     try {
         if (!jid || !companyId) return;
-        if (jid.includes('status@broadcast')) return; // Ignora Status
-        if (jid.includes('@newsletter')) return; // Ignora Canais
+        if (jid.includes('status@broadcast')) return; 
+        if (jid.includes('@newsletter')) return;
 
         const cleanJid = normalizeJid(jid);
         if (!cleanJid) return;
@@ -97,17 +100,26 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             phone: purePhone, 
             company_id: companyId,
             updated_at: new Date(),
-            ...extraData // Injeta is_community, parent_jid (metadata removido)
+            ...extraData
         };
 
         if (isBusiness) updateData.is_business = true;
         if (verifiedName) updateData.verified_name = verifiedName;
 
-        const incomingNameValid = !isGenericName(incomingName, purePhone);
+        const nameClean = incomingName ? incomingName.toString().trim() : '';
+        const hasValidName = nameClean.length > 0;
+        
+        // Verifica se é genérico (números, simbolos)
+        const isGeneric = isGenericName(incomingName, purePhone);
 
-        if (isFromBook && incomingNameValid) {
+        // LÓGICA "TRUST THE BOOK":
+        // 1. Se veio da Agenda (isFromBook) E tem texto -> Salva em 'name' (Ignora filtro de genérico).
+        //    Motivo: Se o usuário salvou "123" ou "❤️", ele quer ver isso.
+        // 2. Se veio de PushName (Automático) -> Salva em 'push_name' APENAS se não for genérico.
+        
+        if (isFromBook && hasValidName) {
             updateData.name = incomingName;
-        } else if (incomingNameValid) {
+        } else if (hasValidName && !isGeneric) {
             updateData.push_name = incomingName;
         }
 
@@ -134,20 +146,17 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
     }
 };
 
-// --- GUARDIÃO DE LEADS (The Gatekeeper) ---
+// --- GUARDIÃO DE LEADS ---
 export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     if (!jid) return null;
     
-    // Tratamento de LID
     if (jid.includes('@lid')) return null;
-
     if (jid.includes('@g.us')) return null; 
-    if (jid.includes('@newsletter')) return null; // Hard Block
-    if (jid.includes('status@broadcast')) return null; // Hard Block
+    if (jid.includes('@newsletter')) return null; 
+    if (jid.includes('status@broadcast')) return null; 
     
     const cleanJid = normalizeJid(jid);
     
-    // Auto-exclusão
     if (myJid) {
         const cleanMyJid = normalizeJid(myJid);
         const myNum = cleanMyJid?.split('@')[0];
@@ -181,12 +190,18 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
         let finalName = null;
 
+        // Prioridade de Nome para o Lead:
+        // 1. Agenda (contacts.name) - Confiança total se não for genérico (aqui mantemos filtro pra lead)
+        // 2. Business (verified_name)
+        // 3. PushName
+        
         if (contact) {
             if (!isGenericName(contact.name, purePhone)) finalName = contact.name; 
             else if (!isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name;
             else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
         }
         
+        // Se ainda não temos nome, tentamos o pushName passado na hora
         if (!finalName && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
         }
@@ -196,6 +211,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         );
 
         if (existing) {
+            // Auto-Healing: Melhora o nome se o atual for ruim
             const currentNameIsBad = !existing.name || isGenericName(existing.name, purePhone);
             const newNameIsGood = finalName && !isGenericName(finalName, purePhone);
 
@@ -236,7 +252,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
 export const upsertMessage = async (msgData) => {
     try {
-        if (msgData.remote_jid.includes('status@broadcast')) return; // Bloqueio Extra de Segurança
+        if (msgData.remote_jid.includes('status@broadcast')) return;
         
         const cleanRemoteJid = normalizeJid(msgData.remote_jid);
         const finalData = { ...msgData, remote_jid: cleanRemoteJid };
