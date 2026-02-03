@@ -84,6 +84,33 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     }
 };
 
+// --- UPSERT BULK (ALTA PERFORMANCE) ---
+// Resolve o problema de "perda de contatos" no sync inicial salvando em lotes
+export const upsertContactsBulk = async (contactsArray) => {
+    if (!contactsArray || contactsArray.length === 0) return;
+    
+    // Filtra inválidos
+    const validContacts = contactsArray.filter(c => c.jid && c.company_id);
+    if (validContacts.length === 0) return;
+
+    try {
+        await safeSupabaseCall(async () => {
+            const { error } = await supabase
+                .from('contacts')
+                .upsert(validContacts, { onConflict: 'company_id, jid', ignoreDuplicates: false });
+            
+            if (error) throw error;
+        });
+    } catch (e) {
+        console.error(`❌ [SYNC] Erro Bulk Insert (${validContacts.length} items):`, e.message);
+        // Fallback: Se o bulk falhar (ex: payload muito grande), tenta um por um
+        console.log("⚠️ [SYNC] Tentando fallback item-a-item...");
+        for (const c of validContacts) {
+             await upsertContact(c.jid, c.company_id, c.name, c.profile_pic_url, !!c.name, null, c.is_business, c.verified_name);
+        }
+    }
+};
+
 export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false, lid = null, isBusiness = false, verifiedName = null, extraData = {}) => {
     try {
         if (!jid || !companyId) return;
@@ -196,9 +223,9 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         // 3. PushName
         
         if (contact) {
-            if (!isGenericName(contact.name, purePhone)) finalName = contact.name; 
-            else if (!isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name;
-            else if (!isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
+            if (contact.name && !isGenericName(contact.name, purePhone)) finalName = contact.name; 
+            else if (contact.verified_name && !isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name;
+            else if (contact.push_name && !isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
         }
         
         // Se ainda não temos nome, tentamos o pushName passado na hora
