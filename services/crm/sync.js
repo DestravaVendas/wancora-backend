@@ -159,10 +159,15 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         const hasValidName = nameClean.length > 0;
         const isGeneric = isGenericName(incomingName, purePhone);
 
+        // Lógica de Prioridade de Nome
         if (isFromBook && hasValidName) {
             updateData.name = incomingName;
         } else if (hasValidName && !isGeneric) {
             updateData.push_name = incomingName;
+        }
+        // Fallback: Se não tem nome da agenda mas tem push_name válido no extraData
+        else if (extraData.push_name && !isGenericName(extraData.push_name, purePhone)) {
+             updateData.push_name = extraData.push_name;
         }
 
         if (profilePicUrl) {
@@ -308,7 +313,7 @@ export const upsertMessage = async (msgData) => {
 export const updateCampaignStats = async (campaignId, status) => {
     try {
         await supabase.rpc('increment_campaign_count', { p_campaign_id: campaignId, p_field: status });
-    } catch (e) {}
+    } catch (e) { }
 };
 
 export const deleteSessionData = async (sessionId, companyId) => {
