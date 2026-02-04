@@ -6,46 +6,31 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const HISTORY_MSG_LIMIT = 15;
-const HISTORY_MONTHS_LIMIT = 8;
+const HISTORY_MSG_LIMIT = 20; // Aumentado levemente para melhor contexto
+const HISTORY_MONTHS_LIMIT = 6;
 const processedHistoryChunks = new Set();
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Função Auxiliar Otimizada para download de fotos (Turbo Mode)
 const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
-    console.log(`🖼️ [BACKGROUND] Iniciando busca TURBO de fotos para ${contacts.length} contatos...`);
+    // Roda em background, sem await crítico
+    const CONCURRENCY = 10;
+    const DELAY = 300;
     
-    // Configurações de Concorrência
-    const CONCURRENCY = 15; // 15 requisições simultâneas
-    const DELAY_BETWEEN_CHUNKS = 200; // 200ms entre blocos
-
-    // Divide em chunks
-    for (let i = 0; i < contacts.length; i += CONCURRENCY) {
-        const chunk = contacts.slice(i, i + CONCURRENCY);
-        
-        // Processa o chunk em paralelo
-        await Promise.all(chunk.map(async (c) => {
-            if (!c.jid || c.jid.includes('@lid')) return;
-            
-            try {
-                // Tenta pegar a URL
-                const newUrl = await sock.profilePictureUrl(c.jid, 'image').catch(() => null);
-                
-                // Só atualiza se tiver URL válida e for diferente (opcional check, mas upsert já lida bem)
-                if (newUrl) {
-                    await upsertContact(c.jid, companyId, null, newUrl, false);
-                }
-            } catch (e) {
-                // Erros de privacidade (401/403) são comuns, ignoramos silenciosamente
-            }
-        }));
-
-        // Respiro para não tomar rate limit
-        await sleep(DELAY_BETWEEN_CHUNKS);
-    }
-
-    console.log(`🖼️ [BACKGROUND] Busca TURBO de fotos concluída.`);
+    (async () => {
+        for (let i = 0; i < contacts.length; i += CONCURRENCY) {
+            const chunk = contacts.slice(i, i + CONCURRENCY);
+            await Promise.all(chunk.map(async (c) => {
+                try {
+                    const newUrl = await sock.profilePictureUrl(c.jid, 'image').catch(() => null);
+                    if (newUrl) {
+                        await upsertContact(c.jid, companyId, null, newUrl, false);
+                    }
+                } catch (e) {}
+            }));
+            await sleep(DELAY);
+        }
+    })();
 };
 
 export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
@@ -54,7 +39,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
     if (processedHistoryChunks.has(chunkKey)) return;
     processedHistoryChunks.add(chunkKey);
 
-    const estimatedProgress = progress || Math.min((chunkCounter * 2), 99);
+    const estimatedProgress = progress || Math.min((chunkCounter * 3), 99);
     console.log(`📚 [SYNC] Lote ${chunkCounter} | Contatos: ${contacts?.length || 0} | Msgs: ${messages?.length || 0}`);
     await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
 
@@ -62,9 +47,9 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         const contactsMap = new Map();
         const contactsToFetchPic = [];
 
-        // -----------------------------------------------------------
-        // ETAPA 1: CONTATOS (BULK INSERT)
-        // -----------------------------------------------------------
+        // =========================================================================
+        // BARREIRA DE SINCRONIZAÇÃO: FASE 1 - CONTATOS (PRIORIDADE ABSOLUTA)
+        // =========================================================================
         if (contacts && contacts.length > 0) {
             const BATCH_SIZE = 500;
             const bulkPayload = [];
@@ -83,17 +68,11 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 
                 if (jid.includes('@lid')) continue;
 
-                // Cache para uso nas mensagens
-                // O Baileys as vezes manda 'notify' no lugar de 'name' ou vice-versa
                 const bestName = c.name || c.notify || c.verifiedName;
                 const isFromBook = !!(c.name && c.name.trim().length > 0);
 
-                contactsMap.set(jid, { 
-                    name: bestName, 
-                    isFromBook: isFromBook 
-                });
+                contactsMap.set(jid, { name: bestName, isFromBook: isFromBook });
 
-                // PREPARA OBJETO PARA BULK
                 const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
                 const contactData = {
                     jid: jid,
@@ -102,12 +81,10 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     updated_at: new Date()
                 };
 
-                // Lógica de nomes permissiva
+                // Lógica de Hierarquia para Bulk
                 if (isFromBook) {
                     contactData.name = bestName;
                 } else if (bestName) {
-                    // Se não veio da agenda, salvamos como push_name, 
-                    // mas se name for null, o Trigger do banco pode tentar consertar
                     contactData.push_name = bestName;
                 }
 
@@ -115,7 +92,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     contactData.profile_pic_url = c.imgUrl;
                     contactData.profile_pic_updated_at = new Date();
                 } else {
-                    // Adiciona na lista de busca em background se não veio foto
                     contactsToFetchPic.push({ jid, profile_pic_url: null });
                 }
 
@@ -129,22 +105,21 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
             console.log(`📦 [HISTORY] Contatos preparados: ${bulkPayload.length}`);
 
-            // SALVA NO BANCO PRIMEIRO (Prioridade Imediata)
+            // UPSERT BLOCKING: O sistema espera isso terminar antes de processar mensagens
             for (let i = 0; i < bulkPayload.length; i += BATCH_SIZE) {
                 const batch = bulkPayload.slice(i, i + BATCH_SIZE);
                 await upsertContactsBulk(batch);
-                await sleep(50);
             }
             
-            // DISPARA BUSCA DE FOTOS OTIMIZADA
+            // Background Fetch
             if (contactsToFetchPic.length > 0) {
                 fetchProfilePicsInBackground(sock, contactsToFetchPic, companyId);
             }
         }
 
-        // -----------------------------------------------------------
-        // ETAPA 2: MENSAGENS
-        // -----------------------------------------------------------
+        // =========================================================================
+        // BARREIRA DE SINCRONIZAÇÃO: FASE 2 - MENSAGENS
+        // =========================================================================
         if (messages && messages.length > 0) {
             
             const cutoffDate = new Date();
@@ -164,7 +139,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Name Injection
+                // Name Injection (Recupera nome da agenda processada acima)
                 const knownContact = contactsMap.get(jid);
                 if (knownContact && knownContact.isFromBook) {
                     clean._forcedName = knownContact.name;
@@ -178,22 +153,23 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             const chatJids = Object.keys(chats);
 
             for (const jid of chatJids) {
+                // Ordena e pega as N últimas
                 chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0)); 
                 
+                // Atualiza last_message_at
                 const latestMsg = chats[jid][0];
                 if (latestMsg && latestMsg.messageTimestamp) {
                     const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
                     supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
                 }
 
-                // Processa apenas as N últimas mensagens
+                // Insere mensagens recentes
                 const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT).reverse(); 
                 
                 for (const msg of topMessages) {
                     try {
                         const options = { 
                             downloadMedia: false, 
-                            // Tenta buscar foto se for mensagem recente
                             fetchProfilePic: true, 
                             createLead: true 
                         };
@@ -201,7 +177,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {}
                 }
-                await sleep(5); 
+                // Pequeno delay para não travar CPU
+                await sleep(2); 
             }
         }
 
