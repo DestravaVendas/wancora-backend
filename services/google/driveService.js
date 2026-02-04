@@ -9,6 +9,81 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 });
 
 /**
+ * Obtém informações de armazenamento (Quota)
+ */
+export const getStorageQuota = async (companyId) => {
+    const auth = await getAuthenticatedClient(companyId);
+    const drive = google.drive({ version: 'v3', auth });
+    
+    const res = await drive.about.get({
+        fields: 'storageQuota'
+    });
+    
+    return res.data.storageQuota;
+};
+
+/**
+ * Cria uma pasta no Drive
+ */
+export const createFolder = async (companyId, name, parentId = null) => {
+    const auth = await getAuthenticatedClient(companyId);
+    const drive = google.drive({ version: 'v3', auth });
+
+    const fileMetadata = {
+        name: name,
+        mimeType: 'application/vnd.google-apps.folder',
+        parents: parentId ? [parentId] : []
+    };
+
+    const res = await drive.files.create({
+        resource: fileMetadata,
+        fields: 'id, name, webViewLink, mimeType'
+    });
+
+    // Salva no cache
+    await supabase.from('drive_cache').insert({
+        company_id: companyId,
+        google_id: res.data.id,
+        name: res.data.name,
+        mime_type: res.data.mimeType,
+        web_view_link: res.data.webViewLink,
+        parent_id: parentId,
+        is_folder: true,
+        updated_at: new Date()
+    });
+
+    return res.data;
+};
+
+/**
+ * Deleta arquivos (Move para lixeira)
+ */
+export const deleteFiles = async (companyId, fileIds) => {
+    const auth = await getAuthenticatedClient(companyId);
+    const drive = google.drive({ version: 'v3', auth });
+
+    // Google Drive API não suporta batch delete nativo em uma chamada simples v3,
+    // então fazemos loop (Promise.all) para ser rápido.
+    // Em produção massiva, usaria batch request HTTP.
+    
+    const promises = fileIds.map(async (fileId) => {
+        try {
+            await drive.files.update({
+                fileId: fileId,
+                requestBody: { trashed: true }
+            });
+            // Remove do cache local
+            await supabase.from('drive_cache').delete().eq('google_id', fileId).eq('company_id', companyId);
+        } catch (e) {
+            console.error(`Erro ao deletar ${fileId}:`, e.message);
+        }
+    });
+
+    await Promise.all(promises);
+    return { success: true };
+};
+
+/**
  * Sincroniza metadados do Drive com o Banco (Cache)
  */
 export const syncDriveFiles = async (companyId, folderId = null) => {
@@ -75,7 +150,7 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
     const res = await drive.files.create({
         resource: fileMetadata,
         media: media,
-        fields: 'id, name, webViewLink, mimeType'
+        fields: 'id, name, webViewLink, mimeType, thumbnailLink, size'
     });
     
     // Adiciona ao cache imediatamente
@@ -85,7 +160,10 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
         name: res.data.name,
         mime_type: res.data.mimeType,
         web_view_link: res.data.webViewLink,
-        parent_id: folderId
+        thumbnail_link: res.data.thumbnailLink,
+        size: res.data.size ? parseInt(res.data.size) : 0,
+        parent_id: folderId,
+        is_folder: false
     });
 
     return res.data;
