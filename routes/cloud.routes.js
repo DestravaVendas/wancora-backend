@@ -1,6 +1,9 @@
 
 import express from "express";
-import { connectDrive, callbackDrive, listFiles, syncNow, sendFileToContact, uploadFileToDrive } from "../controllers/cloudController.js";
+import { 
+    connectDrive, callbackDrive, listFiles, syncNow, sendFileToContact, 
+    uploadFileToDrive, getQuota, createNewFolder, deleteItems 
+} from "../controllers/cloudController.js";
 import { requireAuth } from "../middleware/auth.js";
 import multer from 'multer';
 
@@ -26,6 +29,9 @@ router.use(requireAuth);
 router.post("/google/connect", connectDrive);
 router.post("/google/list", listFiles);
 router.post("/google/sync", syncNow);
+router.post("/google/quota", getQuota);
+router.post("/google/create-folder", createNewFolder);
+router.post("/google/delete", deleteItems);
 
 // Rota atualizada para usar Multer (Multipart Form Data)
 router.post("/google/upload", upload.single('file'), uploadFileToDrive);
