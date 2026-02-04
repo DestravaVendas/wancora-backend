@@ -17,7 +17,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 const leadLock = new Set(); 
 
-// WRAPPER DE RETRY (Com backoff maior)
+// WRAPPER DE RETRY
 const safeSupabaseCall = async (operation, retries = 3) => {
     for (let i = 0; i < retries; i++) {
         try {
@@ -59,9 +59,7 @@ export const updateInstanceStatus = async (sessionId, companyId, data) => {
             .eq('session_id', sessionId)
             .eq('company_id', companyId)
         );
-    } catch (e) {
-        // Fail silent
-    }
+    } catch (e) { }
 };
 
 export const updateSyncStatus = async (sessionId, status, percent = 0) => {
@@ -83,12 +81,11 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
 export const upsertContactsBulk = async (contactsArray) => {
     if (!contactsArray || contactsArray.length === 0) return;
     
-    // Normalização Prévia
+    // Normalização Prévia e Limpeza
     const validContacts = contactsArray
         .filter(c => c.jid && c.company_id)
         .map(c => {
             const cleanJid = normalizeJid(c.jid);
-            // Extrai telefone limpo (Apenas números)
             const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
             return {
                 ...c,
@@ -151,19 +148,20 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         const hasValidName = nameClean.length > 0;
         const isGeneric = isGenericName(incomingName, purePhone);
 
-        // --- LÓGICA DE PRIORIDADE DE NOME (CORRIGIDA) ---
-        // 1. Se veio da agenda (isFromBook) e é válido -> Força update do 'name'
+        // --- LÓGICA DE HIERARQUIA DE NOMES ---
+        // 1. Se veio da agenda (isFromBook) e é válido -> Força update do 'name' (Autoridade Máxima)
         if (isFromBook && hasValidName) {
             updateData.name = incomingName;
         } 
-        // 2. Se não veio da agenda, mas tem nome válido e não é genérico
-        //    E o campo 'name' no banco ainda é nulo (tratado pelo upsert parcial se não enviar name)
-        //    Aqui salvamos apenas no push_name para não sobrescrever agenda futura
-        else if (hasValidName && !isGeneric) {
-            updateData.push_name = incomingName;
+        // 2. Se não veio da agenda, apenas salvamos no push_name ou verified_name
+        //    O campo 'name' no banco DEVE ser preservado se já existir
+        else {
+             if (hasValidName && !isGeneric) {
+                 updateData.push_name = incomingName;
+             }
+             // NÃO setamos updateData.name aqui para não sobrescrever um nome de agenda existente com um pushname
         }
         
-        // Se temos verifiedName, é business
         if (verifiedName) {
             updateData.verified_name = verifiedName;
             updateData.is_business = true;
@@ -184,7 +182,6 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
         if (lid) {
             const cleanLid = normalizeJid(lid);
-            // Só linka se for diferente
             if (cleanLid !== cleanJid) {
                 supabase.rpc('link_identities', { 
                     p_lid: cleanLid, 
@@ -239,13 +236,14 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
         let finalName = null;
         
-        // Prioridade de nomes para o Lead
+        // Prioridade de nomes para o Lead (Herdada do Contato)
         if (contact) {
             if (contact.name && !isGenericName(contact.name, purePhone)) finalName = contact.name; 
             else if (contact.verified_name && !isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name;
             else if (contact.push_name && !isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
         }
         
+        // Fallback: PushName da mensagem atual
         if (!finalName && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
         }
@@ -312,7 +310,6 @@ export const upsertMessage = async (msgData) => {
     }
 };
 
-// ... Resto das funções mantidas (updateCampaignStats, deleteSessionData)
 export const updateCampaignStats = async (campaignId, status) => {
     try {
         await supabase.rpc('increment_campaign_count', { p_campaign_id: campaignId, p_field: status });
