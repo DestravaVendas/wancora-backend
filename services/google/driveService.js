@@ -3,6 +3,7 @@ import { google } from 'googleapis';
 import { getAuthenticatedClient } from './authService.js';
 import { createClient } from "@supabase/supabase-js";
 import { Readable } from 'stream';
+import mammoth from 'mammoth'; // Certifique-se de instalar: npm install mammoth
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -15,19 +16,61 @@ export const getStorageQuota = async (companyId) => {
     return res.data.storageQuota;
 };
 
+// --- BUSCA AO VIVO (Não usa cache) ---
+export const searchLiveFiles = async (companyId, query) => {
+    const auth = await getAuthenticatedClient(companyId);
+    const drive = google.drive({ version: 'v3', auth });
+
+    const q = `name contains '${query}' and trashed = false`;
+    
+    const res = await drive.files.list({
+        q: q,
+        fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, parents, createdTime)',
+        pageSize: 20
+    });
+
+    return res.data.files || [];
+};
+
+// --- IMPORTAÇÃO SELETIVA (Cache) ---
+export const importFilesToCache = async (companyId, files) => {
+    if (!files || files.length === 0) return;
+
+    const rows = files.map(f => ({
+        company_id: companyId,
+        google_id: f.id,
+        name: f.name,
+        mime_type: f.mimeType,
+        web_view_link: f.webViewLink,
+        thumbnail_link: f.thumbnailLink,
+        size: f.size ? parseInt(f.size) : 0,
+        parent_id: null, // Importados soltos ficam na raiz do sistema
+        is_folder: f.mimeType === 'application/vnd.google-apps.folder',
+        created_at: f.createdTime,
+        updated_at: new Date()
+    }));
+
+    await supabase.from('drive_cache').upsert(rows, { onConflict: 'company_id, google_id' });
+    return rows.length;
+};
+
 export const createFolder = async (companyId, name, parentId = null) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
-    // 1. Verifica se já existe para evitar duplicatas (Check prévio)
+    // 1. Verifica se já existe (Prevenção de Duplicatas)
     let q = `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false`;
-    if (parentId) q += ` and '${parentId}' in parents`;
     
+    // Se for na raiz (sem parentId), verifica estritamente na raiz
+    if (parentId) {
+        q += ` and '${parentId}' in parents`;
+    } 
+
     const existing = await drive.files.list({ q, fields: 'files(id, name, webViewLink)' });
     
     if (existing.data.files.length > 0) {
         const folder = existing.data.files[0];
-        // Garante que está no cache (Self-healing)
+        // Atualiza cache
         await supabase.from('drive_cache').upsert({
             company_id: companyId,
             google_id: folder.id,
@@ -54,7 +97,7 @@ export const createFolder = async (companyId, name, parentId = null) => {
         fields: 'id, name, webViewLink, mimeType'
     });
 
-    // 3. CACHE IMEDIATO (Critical Fix para Lixeira aparecer na hora)
+    // 3. CACHE IMEDIATO
     await supabase.from('drive_cache').insert({
         company_id: companyId,
         google_id: res.data.id,
@@ -89,23 +132,14 @@ export const deleteFiles = async (companyId, fileIds) => {
     return { success: true };
 };
 
-/**
- * Deep Sync: Busca TODOS os arquivos do Drive e atualiza o Cache local
- * Isso resolve o problema de arquivos "não encontrados"
- */
 export const syncDriveFiles = async (companyId, folderId = null) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
-    // Se folderId for nulo, busca tudo que não está na lixeira para popular o banco
-    // Isso garante que "Meus Arquivos" existentes apareçam
     let q = "trashed=false";
-    
     if (folderId) {
         q += ` and '${folderId}' in parents`;
     } 
-    // Se não tem folderId, não filtramos por parent para pegar TUDO (Deep Sync)
-    // Mas cuidado com performance em drives gigantes. Para MVP é ok.
 
     const res = await drive.files.list({
         q: q,
@@ -125,7 +159,6 @@ export const syncDriveFiles = async (companyId, folderId = null) => {
             web_view_link: f.webViewLink,
             thumbnail_link: f.thumbnailLink,
             size: f.size ? parseInt(f.size) : 0,
-            // Se parents existir, pega o primeiro. Se não, é root (null)
             parent_id: (f.parents && f.parents.length > 0) ? f.parents[0] : null,
             is_folder: f.mimeType === 'application/vnd.google-apps.folder',
             created_at: f.createdTime,
@@ -191,7 +224,6 @@ export const getFileStream = async (companyId, fileId) => {
     };
 };
 
-// [NOVO] Baixa buffer para edição no Frontend
 export const getFileBuffer = async (companyId, fileId) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
@@ -201,7 +233,7 @@ export const getFileBuffer = async (companyId, fileId) => {
     let res;
     let mimeType = meta.data.mimeType;
 
-    // Se for Google Doc/Sheet, EXPORTA para formato editável
+    // Exportação de Docs Google para formatos editáveis
     if (mimeType.includes('application/vnd.google-apps.document')) {
         res = await drive.files.export({ fileId, mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }, { responseType: 'arraybuffer' });
         mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
@@ -209,7 +241,7 @@ export const getFileBuffer = async (companyId, fileId) => {
         res = await drive.files.export({ fileId, mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, { responseType: 'arraybuffer' });
         mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
     } else {
-        // Arquivo binário normal (PDF, Imagem, Docx nativo)
+        // Arquivo binário normal
         const size = parseInt(meta.data.size || '0');
         if (size > 40 * 1024 * 1024) {
             return { isLargeFile: true, link: meta.data.webViewLink, fileName: meta.data.name, mimeType };
@@ -223,5 +255,28 @@ export const getFileBuffer = async (companyId, fileId) => {
         fileName: meta.data.name,
         mimeType,
         size: meta.data.size
+    };
+};
+
+// --- NOVO: CONVERSOR SERVER-SIDE ---
+export const convertDocxToHtml = async (companyId, fileId) => {
+    // 1. Obtém o buffer (seja de doc nativo ou convertido do GDoc)
+    const fileData = await getFileBuffer(companyId, fileId);
+    
+    if (fileData.isLargeFile) {
+        throw new Error("Arquivo muito grande para conversão.");
+    }
+    
+    if (!fileData.mimeType.includes('wordprocessingml.document')) {
+        throw new Error("Apenas documentos Word (.docx) ou Google Docs podem ser editados.");
+    }
+
+    // 2. Usa Mammoth no Backend
+    const result = await mammoth.convertToHtml({ buffer: fileData.buffer });
+    
+    return {
+        html: result.value,
+        filename: fileData.fileName,
+        messages: result.messages // Avisos de formatação
     };
 };
