@@ -1,6 +1,6 @@
 
 import { generateAuthUrl, handleAuthCallback } from "../services/google/authService.js";
-import { syncDriveFiles, uploadFile, getFileStream } from "../services/google/driveService.js";
+import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteFiles } from "../services/google/driveService.js";
 import { sendMessage } from "../services/baileys/sender.js";
 import { getSessionId } from "./whatsappController.js";
 import { createClient } from "@supabase/supabase-js";
@@ -126,6 +126,36 @@ export const uploadFileToDrive = async (req, res) => {
         res.json({ success: true, file: fileData });
     } catch (e) {
         console.error("Erro Upload Drive:", e);
+        res.status(500).json({ error: e.message });
+    }
+};
+
+export const getQuota = async (req, res) => {
+    const { companyId } = req.body;
+    try {
+        const quota = await getStorageQuota(companyId);
+        res.json({ success: true, quota });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+};
+
+export const createNewFolder = async (req, res) => {
+    const { companyId, name, parentId } = req.body;
+    try {
+        const folder = await createFolder(companyId, name, parentId);
+        res.json({ success: true, folder });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+};
+
+export const deleteItems = async (req, res) => {
+    const { companyId, fileIds } = req.body;
+    try {
+        await deleteFiles(companyId, fileIds);
+        res.json({ success: true });
+    } catch (e) {
         res.status(500).json({ error: e.message });
     }
 };
