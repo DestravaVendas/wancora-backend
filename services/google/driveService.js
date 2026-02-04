@@ -8,27 +8,41 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-/**
- * Obtém informações de armazenamento (Quota)
- */
 export const getStorageQuota = async (companyId) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
-    
-    const res = await drive.about.get({
-        fields: 'storageQuota'
-    });
-    
+    const res = await drive.about.get({ fields: 'storageQuota' });
     return res.data.storageQuota;
 };
 
-/**
- * Cria uma pasta no Drive
- */
 export const createFolder = async (companyId, name, parentId = null) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
+    // 1. Verifica se já existe para evitar duplicatas (Check prévio)
+    let q = `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false`;
+    if (parentId) q += ` and '${parentId}' in parents`;
+    
+    const existing = await drive.files.list({ q, fields: 'files(id, name, webViewLink)' });
+    
+    if (existing.data.files.length > 0) {
+        const folder = existing.data.files[0];
+        // Garante que está no cache
+        await supabase.from('drive_cache').upsert({
+            company_id: companyId,
+            google_id: folder.id,
+            name: folder.name,
+            mime_type: 'application/vnd.google-apps.folder',
+            web_view_link: folder.webViewLink,
+            parent_id: parentId,
+            is_folder: true,
+            updated_at: new Date()
+        }, { onConflict: 'company_id, google_id' });
+        
+        return folder;
+    }
+
+    // 2. Cria se não existir
     const fileMetadata = {
         name: name,
         mimeType: 'application/vnd.google-apps.folder',
@@ -40,7 +54,7 @@ export const createFolder = async (companyId, name, parentId = null) => {
         fields: 'id, name, webViewLink, mimeType'
     });
 
-    // Salva no cache
+    // 3. CACHE IMEDIATO (Critical Fix)
     await supabase.from('drive_cache').insert({
         company_id: companyId,
         google_id: res.data.id,
@@ -55,24 +69,16 @@ export const createFolder = async (companyId, name, parentId = null) => {
     return res.data;
 };
 
-/**
- * Deleta arquivos (Move para lixeira)
- */
 export const deleteFiles = async (companyId, fileIds) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
-    // Google Drive API não suporta batch delete nativo em uma chamada simples v3,
-    // então fazemos loop (Promise.all) para ser rápido.
-    // Em produção massiva, usaria batch request HTTP.
-    
     const promises = fileIds.map(async (fileId) => {
         try {
             await drive.files.update({
                 fileId: fileId,
                 requestBody: { trashed: true }
             });
-            // Remove do cache local
             await supabase.from('drive_cache').delete().eq('google_id', fileId).eq('company_id', companyId);
         } catch (e) {
             console.error(`Erro ao deletar ${fileId}:`, e.message);
@@ -84,28 +90,32 @@ export const deleteFiles = async (companyId, fileIds) => {
 };
 
 /**
- * Sincroniza metadados do Drive com o Banco (Cache)
+ * Deep Sync: Busca arquivos do Drive e atualiza o Cache local
  */
 export const syncDriveFiles = async (companyId, folderId = null) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
-    // Query: Não na lixeira e dentro da pasta (ou root se null)
+    // Se folderId for nulo, busca na raiz ('root' in parents)
+    // Se folderId for fornecido, busca dentro dele
     let q = "trashed=false";
     if (folderId) {
         q += ` and '${folderId}' in parents`;
+    } else {
+        // Se estamos na raiz, queremos ver tudo que não tem pai específico OU está explicitamente no root
+        // Mas o Google Drive API é chato. Vamos pegar tudo que está em 'root'
+        q += ` and 'root' in parents`;
     }
 
     const res = await drive.files.list({
         q: q,
-        fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, parents)',
+        fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, parents, createdTime, modifiedTime)',
         orderBy: 'folder,name',
-        pageSize: 100 // Paginação futura se necessário
+        pageSize: 1000 // Tenta pegar tudo de uma vez
     });
 
     const files = res.data.files;
     
-    // Bulk Upsert no Cache
     if (files && files.length > 0) {
         const rows = files.map(f => ({
             company_id: companyId,
@@ -113,10 +123,11 @@ export const syncDriveFiles = async (companyId, folderId = null) => {
             name: f.name,
             mime_type: f.mimeType,
             web_view_link: f.webViewLink,
-            thumbnail_link: f.thumbnailLink,
+            thumbnail_link: f.thumbnailLink, // Thumbnail do Google (pequena)
             size: f.size ? parseInt(f.size) : 0,
-            parent_id: f.parents ? f.parents[0] : null,
+            parent_id: folderId, // Forçamos o parent atual para manter a árvore local consistente
             is_folder: f.mimeType === 'application/vnd.google-apps.folder',
+            created_at: f.createdTime,
             updated_at: new Date()
         }));
 
@@ -126,9 +137,6 @@ export const syncDriveFiles = async (companyId, folderId = null) => {
     return files;
 };
 
-/**
- * Upload de Buffer (vinda do WhatsApp) para o Drive
- */
 export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId = null) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
@@ -153,7 +161,6 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
         fields: 'id, name, webViewLink, mimeType, thumbnailLink, size'
     });
     
-    // Adiciona ao cache imediatamente
     await supabase.from('drive_cache').insert({
         company_id: companyId,
         google_id: res.data.id,
@@ -169,21 +176,11 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
     return res.data;
 };
 
-/**
- * Gera um Stream de leitura do arquivo (Para enviar no WhatsApp)
- */
 export const getFileStream = async (companyId, fileId) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
-
-    // Busca metadados para saber mimetype
     const meta = await drive.files.get({ fileId, fields: 'name, mimeType, size' });
-    
-    // Download como stream
-    const res = await drive.files.get(
-        { fileId, alt: 'media' },
-        { responseType: 'stream' }
-    );
+    const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
 
     return {
         stream: res.data,
@@ -193,37 +190,37 @@ export const getFileStream = async (companyId, fileId) => {
     };
 };
 
-/**
- * [NOVO] Baixa arquivo completo para Buffer (Para envio nativo no WhatsApp)
- * Cuidado com arquivos grandes. Use getFileStream se possível, mas Baileys prefere buffer para Thumbnails.
- */
 export const getFileBuffer = async (companyId, fileId) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
+    // Se for Google Doc nativo, precisamos exportar, não baixar
     const meta = await drive.files.get({ fileId, fields: 'name, mimeType, size, webViewLink' });
-    const size = parseInt(meta.data.size || '0');
+    
+    let res;
+    let mimeType = meta.data.mimeType;
 
-    // Limite de segurança (40MB para buffer RAM). Acima disso, retorna apenas o link.
-    if (size > 40 * 1024 * 1024) {
-        return {
-            isLargeFile: true,
-            link: meta.data.webViewLink,
-            fileName: meta.data.name,
-            mimeType: meta.data.mimeType
-        };
+    // Lógica de Exportação para Docs/Sheets Google
+    if (mimeType.includes('application/vnd.google-apps.document')) {
+        res = await drive.files.export({ fileId, mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }, { responseType: 'arraybuffer' });
+        mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    } else if (mimeType.includes('application/vnd.google-apps.spreadsheet')) {
+        res = await drive.files.export({ fileId, mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, { responseType: 'arraybuffer' });
+        mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    } else {
+        // Arquivo binário normal
+        const size = parseInt(meta.data.size || '0');
+        if (size > 40 * 1024 * 1024) {
+            return { isLargeFile: true, link: meta.data.webViewLink, fileName: meta.data.name, mimeType };
+        }
+        res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
     }
-
-    const res = await drive.files.get(
-        { fileId, alt: 'media' },
-        { responseType: 'arraybuffer' }
-    );
 
     return {
         isLargeFile: false,
         buffer: Buffer.from(res.data),
         fileName: meta.data.name,
-        mimeType: meta.data.mimeType,
-        size: size
+        mimeType,
+        size: meta.data.size
     };
 };
