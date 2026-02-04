@@ -8,31 +8,28 @@ export const normalizeJid = (jid) => {
     if (jid === 'status@broadcast') return jid;
     
     // Separa o JID de sufixos de dispositivo (Ex: :12)
-    const [user, domain] = jid.split('@');
-    
-    // Se não tiver @, retorna como está (invalido, mas evita crash)
-    if (!domain) return jid;
-    
-    // Limpa a parte do usuário (remove :12 no final se houver antes do @, embora raro no formato novo)
-    // E limpa a parte do domínio se houver :
-    
     // Formato padrão Baileys: 55119999@s.whatsapp.net:12
-    // Deve virar: 55119999@s.whatsapp.net
+    const parts = jid.split(':');
+    const userDomain = parts[0]; // Pega tudo antes do :
     
     // Se já contém o domínio correto
-    if (jid.includes('@g.us')) {
-        return jid.split('@')[0] + '@g.us';
+    if (userDomain.includes('@g.us')) {
+        return userDomain.split('@')[0] + '@g.us';
     }
     
-    if (jid.includes('@s.whatsapp.net')) {
-        return jid.split('@')[0].split(':')[0] + '@s.whatsapp.net';
+    if (userDomain.includes('@s.whatsapp.net')) {
+        return userDomain.split('@')[0] + '@s.whatsapp.net';
     }
     
-    if (jid.includes('@lid')) {
-         return jid.split('@')[0].split(':')[0] + '@lid';
+    if (userDomain.includes('@lid')) {
+         return userDomain.split('@')[0] + '@lid';
+    }
+    
+    if (userDomain.includes('@newsletter')) {
+        return userDomain;
     }
 
-    return jid; // Fallback
+    return jid; // Fallback se não bater padrões
 };
 
 // Desenrola mensagens complexas (ViewOnce, Ephemeral, Edited, DocumentWithCaption)
