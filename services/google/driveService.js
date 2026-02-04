@@ -27,7 +27,7 @@ export const createFolder = async (companyId, name, parentId = null) => {
     
     if (existing.data.files.length > 0) {
         const folder = existing.data.files[0];
-        // Garante que está no cache
+        // Garante que está no cache (Self-healing)
         await supabase.from('drive_cache').upsert({
             company_id: companyId,
             google_id: folder.id,
@@ -54,7 +54,7 @@ export const createFolder = async (companyId, name, parentId = null) => {
         fields: 'id, name, webViewLink, mimeType'
     });
 
-    // 3. CACHE IMEDIATO (Critical Fix)
+    // 3. CACHE IMEDIATO (Critical Fix para Lixeira aparecer na hora)
     await supabase.from('drive_cache').insert({
         company_id: companyId,
         google_id: res.data.id,
@@ -90,28 +90,28 @@ export const deleteFiles = async (companyId, fileIds) => {
 };
 
 /**
- * Deep Sync: Busca arquivos do Drive e atualiza o Cache local
+ * Deep Sync: Busca TODOS os arquivos do Drive e atualiza o Cache local
+ * Isso resolve o problema de arquivos "não encontrados"
  */
 export const syncDriveFiles = async (companyId, folderId = null) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
-    // Se folderId for nulo, busca na raiz ('root' in parents)
-    // Se folderId for fornecido, busca dentro dele
+    // Se folderId for nulo, busca tudo que não está na lixeira para popular o banco
+    // Isso garante que "Meus Arquivos" existentes apareçam
     let q = "trashed=false";
+    
     if (folderId) {
         q += ` and '${folderId}' in parents`;
-    } else {
-        // Se estamos na raiz, queremos ver tudo que não tem pai específico OU está explicitamente no root
-        // Mas o Google Drive API é chato. Vamos pegar tudo que está em 'root'
-        q += ` and 'root' in parents`;
-    }
+    } 
+    // Se não tem folderId, não filtramos por parent para pegar TUDO (Deep Sync)
+    // Mas cuidado com performance em drives gigantes. Para MVP é ok.
 
     const res = await drive.files.list({
         q: q,
         fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, parents, createdTime, modifiedTime)',
         orderBy: 'folder,name',
-        pageSize: 1000 // Tenta pegar tudo de uma vez
+        pageSize: 1000 
     });
 
     const files = res.data.files;
@@ -123,9 +123,10 @@ export const syncDriveFiles = async (companyId, folderId = null) => {
             name: f.name,
             mime_type: f.mimeType,
             web_view_link: f.webViewLink,
-            thumbnail_link: f.thumbnailLink, // Thumbnail do Google (pequena)
+            thumbnail_link: f.thumbnailLink,
             size: f.size ? parseInt(f.size) : 0,
-            parent_id: folderId, // Forçamos o parent atual para manter a árvore local consistente
+            // Se parents existir, pega o primeiro. Se não, é root (null)
+            parent_id: (f.parents && f.parents.length > 0) ? f.parents[0] : null,
             is_folder: f.mimeType === 'application/vnd.google-apps.folder',
             created_at: f.createdTime,
             updated_at: new Date()
@@ -190,17 +191,17 @@ export const getFileStream = async (companyId, fileId) => {
     };
 };
 
+// [NOVO] Baixa buffer para edição no Frontend
 export const getFileBuffer = async (companyId, fileId) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
-    // Se for Google Doc nativo, precisamos exportar, não baixar
     const meta = await drive.files.get({ fileId, fields: 'name, mimeType, size, webViewLink' });
     
     let res;
     let mimeType = meta.data.mimeType;
 
-    // Lógica de Exportação para Docs/Sheets Google
+    // Se for Google Doc/Sheet, EXPORTA para formato editável
     if (mimeType.includes('application/vnd.google-apps.document')) {
         res = await drive.files.export({ fileId, mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }, { responseType: 'arraybuffer' });
         mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
@@ -208,7 +209,7 @@ export const getFileBuffer = async (companyId, fileId) => {
         res = await drive.files.export({ fileId, mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, { responseType: 'arraybuffer' });
         mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
     } else {
-        // Arquivo binário normal
+        // Arquivo binário normal (PDF, Imagem, Docx nativo)
         const size = parseInt(meta.data.size || '0');
         if (size > 40 * 1024 * 1024) {
             return { isLargeFile: true, link: meta.data.webViewLink, fileName: meta.data.name, mimeType };
