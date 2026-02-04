@@ -26,7 +26,7 @@ const processReminders = async () => {
             }
         }
 
-        console.log('⏰ [Agenda Worker] Verificando lembretes pendentes...');
+        // LOG-DESATIVADA-console.log('⏰ [Agenda Worker] Verificando lembretes pendentes...');
         
         // 1. Busca agendamentos das próximas 24h que ainda não foram notificados
         const now = new Date();
