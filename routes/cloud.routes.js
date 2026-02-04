@@ -2,28 +2,23 @@
 import express from "express";
 import { 
     connectDrive, callbackDrive, listFiles, syncNow, sendFileToContact, 
-    uploadFileToDrive, getQuota, createNewFolder, deleteItems 
+    uploadFileToDrive, getQuota, createNewFolder, deleteItems,
+    searchDrive, importDriveFiles, convertDocument
 } from "../controllers/cloudController.js";
 import { requireAuth } from "../middleware/auth.js";
 import multer from 'multer';
 
 const router = express.Router();
 
-// Configuração do Multer (Armazena em memória para passar ao Drive Service)
 const upload = multer({ 
     storage: multer.memoryStorage(),
-    limits: { fileSize: 50 * 1024 * 1024 } // Limite 50MB
+    limits: { fileSize: 50 * 1024 * 1024 } // 50MB
 });
 
-// ==============================================================================
-// 🔓 ZONA PÚBLICA
-// ==============================================================================
+// ZONA PÚBLICA
 router.get("/google/callback", callbackDrive);
 
-
-// ==============================================================================
-// 🔒 ZONA PROTEGIDA
-// ==============================================================================
+// ZONA PROTEGIDA
 router.use(requireAuth);
 
 router.post("/google/connect", connectDrive);
@@ -32,10 +27,12 @@ router.post("/google/sync", syncNow);
 router.post("/google/quota", getQuota);
 router.post("/google/create-folder", createNewFolder);
 router.post("/google/delete", deleteItems);
-
-// Rota atualizada para usar Multer (Multipart Form Data)
 router.post("/google/upload", upload.single('file'), uploadFileToDrive);
-
 router.post("/google/send-to-whatsapp", sendFileToContact);
+
+// Novas Rotas para Correções
+router.post("/google/search-live", searchDrive);
+router.post("/google/import", importDriveFiles);
+router.post("/convert/docx", convertDocument);
 
 export default router;
