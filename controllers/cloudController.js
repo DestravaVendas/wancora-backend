@@ -4,11 +4,9 @@ import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolde
 import { sendMessage } from "../services/baileys/sender.js";
 import { getSessionId } from "./whatsappController.js";
 import { createClient } from "@supabase/supabase-js";
-import fs from 'fs'; 
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// ... (Códigos de Auth e Callback mantidos) ...
 export const connectDrive = async (req, res) => {
     const { companyId } = req.body; 
     console.log(`🔌 [CLOUD] Iniciando conexão Drive para empresa: ${companyId}`);
@@ -39,30 +37,52 @@ export const callbackDrive = async (req, res) => {
 
 export const listFiles = async (req, res) => {
     const { companyId } = req.body;
-    const { folderId } = req.query;
+    const { folderId, isTrash } = req.query; // isTrash adicionado
+
     try {
+        if (isTrash === 'true') {
+            // Modo Lixeira: Busca direto do Google (sem cache local) para garantir estado real
+            const trashFiles = await syncDriveFiles(companyId, null, true);
+            return res.json({ files: trashFiles, source: 'live' });
+        }
+
+        // Modo Normal: Cache + Sync Background
         let query = supabase.from('drive_cache').select('*').eq('company_id', companyId);
-        if (folderId) query = query.eq('parent_id', folderId);
-        else query = query.is('parent_id', null); 
+        
+        if (folderId && folderId !== 'null') query = query.eq('parent_id', folderId);
+        else query = query.is('parent_id', null); // Raiz
 
         let { data: cached } = await query;
 
-        // Se cache vazio (Cold Start), força sync. Se não, apenas retorna e sync em background.
-        if ((!cached || cached.length === 0) && !folderId) {
-             await syncDriveFiles(companyId, folderId);
-             const { data: refreshed } = await supabase.from('drive_cache').select('*').eq('company_id', companyId).is('parent_id', null);
-             cached = refreshed;
+        // Se cache vazio, tenta sync imediato
+        if ((!cached || cached.length === 0)) {
+             const freshFiles = await syncDriveFiles(companyId, folderId === 'null' ? null : folderId);
+             // Se sync retornou arquivos, retornamos eles (mapeados para formato do cache)
+             if (freshFiles && freshFiles.length > 0) {
+                 cached = freshFiles.map(f => ({
+                    id: f.id, 
+                    google_id: f.id,
+                    name: f.name,
+                    mime_type: f.mimeType,
+                    web_view_link: f.webViewLink,
+                    thumbnail_link: f.thumbnailLink,
+                    size: f.size,
+                    is_folder: f.mimeType === 'application/vnd.google-apps.folder',
+                    updated_at: f.modifiedTime
+                 }));
+             }
         } else {
-             syncDriveFiles(companyId, folderId).catch(() => {});
+             // Trigger sync background
+             syncDriveFiles(companyId, folderId === 'null' ? null : folderId).catch(() => {});
         }
 
         res.json({ files: cached || [], source: 'hybrid' });
     } catch (e) {
+        console.error("Erro listFiles:", e);
         res.status(500).json({ error: e.message });
     }
 };
 
-// [NOVO] Busca ao Vivo no Google Drive
 export const searchDrive = async (req, res) => {
     const { companyId, query } = req.body;
     if (!query) return res.status(400).json({ error: "Query vazia." });
@@ -74,9 +94,8 @@ export const searchDrive = async (req, res) => {
     }
 };
 
-// [NOVO] Importar Arquivos Selecionados
 export const importDriveFiles = async (req, res) => {
-    const { companyId, files } = req.body; // files é array de objetos Google File
+    const { companyId, files } = req.body; 
     try {
         const count = await importFilesToCache(companyId, files);
         res.json({ success: true, count });
@@ -85,7 +104,6 @@ export const importDriveFiles = async (req, res) => {
     }
 };
 
-// [NOVO] Converter DOCX/GDoc para HTML
 export const convertDocument = async (req, res) => {
     const { companyId, fileId } = req.body;
     try {
