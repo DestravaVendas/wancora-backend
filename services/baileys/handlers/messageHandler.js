@@ -42,6 +42,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         // --- GHOST CHAT PREVENTION & GROUP MEMBER SYNC ---
         // Se for grupo, salvamos o remetente como contato (para ter nome/foto), mas NÃO como Lead.
         if (isGroup && participantJid && !fromMe) {
+            // Atualiza push_name do participante no banco (sem criar lead)
             if (pushName) {
                await upsertContact(participantJid, companyId, null, null, false, null, false, null, { push_name: pushName });
             }
@@ -58,7 +59,9 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
             const myJid = normalizeJid(sock.user?.id);
             if (isRealtime || createLead) {
+                // Tenta criar o Lead. A função ensureLeadExists já tem proteção interna contra grupos.
                 await ensureLeadExists(jid, companyId, pushName, myJid);
+                
                 if (isRealtime || fetchProfilePic) {
                     refreshContactInfo(sock, jid, companyId, pushName).catch(err => console.error("Refresh Error", err));
                 }
@@ -102,7 +105,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             lead_id: isGroup ? null : undefined 
         };
         
-        // Se for DM, vincula lead_id
+        // Se for DM, tenta vincular lead_id para exibir no Kanban/Logs
         if (!isGroup && !fromMe) {
              const purePhone = jid.split('@')[0].replace(/\D/g, '');
              const { data: lead } = await supabase.from('leads').select('id').eq('phone', purePhone).eq('company_id', companyId).maybeSingle();
@@ -146,7 +149,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
     }
 };
 
-// ... (Resto das funções handleMessageUpdate, handleReceiptUpdate, handleReaction permanecem iguais)
+// ... (handleMessageUpdate, handleReceiptUpdate, handleReaction mantidos iguais)
 export const handleMessageUpdate = async (updates, companyId) => {
     for (const update of updates) {
         if (update.pollUpdates) {
