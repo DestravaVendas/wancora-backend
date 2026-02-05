@@ -1,6 +1,6 @@
 
 import { generateAuthUrl, handleAuthCallback } from "../services/google/authService.js";
-import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteFiles, searchLiveFiles, importFilesToCache, convertDocxToHtml } from "../services/google/driveService.js";
+import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteFiles, searchLiveFiles, importFilesToCache, convertDocxToHtml, emptyTrash } from "../services/google/driveService.js";
 import { sendMessage } from "../services/baileys/sender.js";
 import { getSessionId } from "./whatsappController.js";
 import { createClient } from "@supabase/supabase-js";
@@ -37,11 +37,10 @@ export const callbackDrive = async (req, res) => {
 
 export const listFiles = async (req, res) => {
     const { companyId } = req.body;
-    const { folderId, isTrash } = req.query; // isTrash adicionado
+    const { folderId, isTrash } = req.query; 
 
     try {
         if (isTrash === 'true') {
-            // Modo Lixeira: Busca direto do Google (sem cache local) para garantir estado real
             const trashFiles = await syncDriveFiles(companyId, null, true);
             return res.json({ files: trashFiles, source: 'live' });
         }
@@ -50,14 +49,14 @@ export const listFiles = async (req, res) => {
         let query = supabase.from('drive_cache').select('*').eq('company_id', companyId);
         
         if (folderId && folderId !== 'null') query = query.eq('parent_id', folderId);
-        else query = query.is('parent_id', null); // Raiz
+        else query = query.is('parent_id', null); 
 
         let { data: cached } = await query;
 
         // Se cache vazio, tenta sync imediato
         if ((!cached || cached.length === 0)) {
              const freshFiles = await syncDriveFiles(companyId, folderId === 'null' ? null : folderId);
-             // Se sync retornou arquivos, retornamos eles (mapeados para formato do cache)
+             
              if (freshFiles && freshFiles.length > 0) {
                  cached = freshFiles.map(f => ({
                     id: f.id, 
@@ -72,7 +71,7 @@ export const listFiles = async (req, res) => {
                  }));
              }
         } else {
-             // Trigger sync background
+             // Trigger sync background para limpar fantasmas
              syncDriveFiles(companyId, folderId === 'null' ? null : folderId).catch(() => {});
         }
 
@@ -154,6 +153,14 @@ export const deleteItems = async (req, res) => {
     const { companyId, fileIds } = req.body;
     try {
         await deleteFiles(companyId, fileIds);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+};
+
+export const emptyTrashItems = async (req, res) => {
+    const { companyId } = req.body;
+    try {
+        await emptyTrash(companyId);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 };
