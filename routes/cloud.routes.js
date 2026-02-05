@@ -2,7 +2,7 @@
 import express from "express";
 import { 
     connectDrive, callbackDrive, listFiles, syncNow, sendFileToContact, 
-    uploadFileToDrive, getQuota, createNewFolder, deleteItems,
+    uploadFileToDrive, getQuota, createNewFolder, deleteItems, emptyTrashItems,
     searchDrive, importDriveFiles, convertDocument
 } from "../controllers/cloudController.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -27,10 +27,10 @@ router.post("/google/sync", syncNow);
 router.post("/google/quota", getQuota);
 router.post("/google/create-folder", createNewFolder);
 router.post("/google/delete", deleteItems);
+router.post("/google/empty-trash", emptyTrashItems); // NOVO
 router.post("/google/upload", upload.single('file'), uploadFileToDrive);
 router.post("/google/send-to-whatsapp", sendFileToContact);
 
-// Novas Rotas para Correções
 router.post("/google/search-live", searchDrive);
 router.post("/google/import", importDriveFiles);
 router.post("/convert/docx", convertDocument);
