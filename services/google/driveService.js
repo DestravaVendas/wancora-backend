@@ -121,8 +121,7 @@ export const deleteFiles = async (companyId, fileIds) => {
                 fileId: fileId,
                 requestBody: { trashed: true }
             });
-            // Não removemos do cache, apenas marcamos ou deixamos o sync lidar
-            // Mas para feedback imediato no frontend, podemos remover da tabela de cache "visível"
+            // Remove do cache imediatamente
             await supabase.from('drive_cache').delete().eq('google_id', fileId).eq('company_id', companyId);
         } catch (e) {
             console.error(`Erro ao deletar ${fileId}:`, e.message);
@@ -133,7 +132,14 @@ export const deleteFiles = async (companyId, fileIds) => {
     return { success: true };
 };
 
-// --- SYNC PRINCIPAL ---
+export const emptyTrash = async (companyId) => {
+    const auth = await getAuthenticatedClient(companyId);
+    const drive = google.drive({ version: 'v3', auth });
+    await drive.files.emptyTrash();
+    return { success: true };
+};
+
+// --- SYNC PRINCIPAL (COM LIMPEZA DE FANTASMAS) ---
 export const syncDriveFiles = async (companyId, folderId = null, isTrash = false) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
@@ -146,6 +152,9 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
         q = "trashed = false";
         if (folderId) {
             q += ` and '${folderId}' in parents`;
+        } else {
+             // Se for raiz, busca arquivos que não têm parent ou que o parent é o root
+             q += ` and 'root' in parents`; 
         }
     }
 
@@ -157,13 +166,12 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
             pageSize: 1000 
         });
 
-        const files = res.data.files;
+        const liveFiles = res.data.files;
         
-        // Se for modo lixeira, retornamos direto sem cachear (pois o cache atual não tem coluna 'trashed')
-        // Ou implementamos uma lógica de cache temporário no frontend
+        // MODO LIXEIRA: Retorna direto, sem cachear (pois não gerenciamos trash state no banco)
         if (isTrash) {
-             return files.map(f => ({
-                id: f.id, // Para lixeira usamos o ID direto
+             return liveFiles.map(f => ({
+                id: f.id, 
                 google_id: f.id,
                 name: f.name,
                 mime_type: f.mimeType,
@@ -176,8 +184,12 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
             }));
         }
         
-        if (files && files.length > 0) {
-            const rows = files.map(f => ({
+        // MODO PASTA: Atualização + Limpeza de Fantasmas
+        if (liveFiles) {
+            const liveIds = new Set(liveFiles.map(f => f.id));
+            
+            // 1. Upsert dos arquivos vivos
+            const rows = liveFiles.map(f => ({
                 company_id: companyId,
                 google_id: f.id,
                 name: f.name,
@@ -185,16 +197,36 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
                 web_view_link: f.webViewLink,
                 thumbnail_link: f.thumbnailLink,
                 size: f.size ? parseInt(f.size) : 0,
-                parent_id: (f.parents && f.parents.length > 0) ? f.parents[0] : null,
+                parent_id: folderId, // Força parent_id atual para corrigir arquivos movidos
                 is_folder: f.mimeType === 'application/vnd.google-apps.folder',
                 created_at: f.createdTime,
                 updated_at: new Date()
             }));
 
-            await supabase.from('drive_cache').upsert(rows, { onConflict: 'company_id, google_id' });
+            if (rows.length > 0) {
+                await supabase.from('drive_cache').upsert(rows, { onConflict: 'company_id, google_id' });
+            }
+
+            // 2. Remoção de Fantasmas (Arquivos no Banco que NÃO estão no Google nesta pasta)
+            // Busca o que o banco acha que está nesta pasta
+            let dbQuery = supabase.from('drive_cache').select('google_id').eq('company_id', companyId);
+            if (folderId) dbQuery = dbQuery.eq('parent_id', folderId);
+            else dbQuery = dbQuery.is('parent_id', null);
+
+            const { data: dbFiles } = await dbQuery;
+
+            if (dbFiles) {
+                const idsToDelete = dbFiles
+                    .filter(dbf => !liveIds.has(dbf.google_id))
+                    .map(dbf => dbf.google_id);
+                
+                if (idsToDelete.length > 0) {
+                    await supabase.from('drive_cache').delete().eq('company_id', companyId).in('google_id', idsToDelete);
+                }
+            }
         }
         
-        return files;
+        return liveFiles;
     } catch (e) {
         console.error("Erro syncDriveFiles:", e);
         return [];
@@ -234,7 +266,8 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
         thumbnail_link: res.data.thumbnailLink,
         size: res.data.size ? parseInt(res.data.size) : 0,
         parent_id: folderId,
-        is_folder: false
+        is_folder: false,
+        updated_at: new Date()
     });
 
     return res.data;
