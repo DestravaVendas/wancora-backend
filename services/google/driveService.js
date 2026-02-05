@@ -16,7 +16,7 @@ export const getStorageQuota = async (companyId) => {
     return res.data.storageQuota;
 };
 
-// --- BUSCA AO VIVO (Não usa cache) ---
+// --- BUSCA AO VIVO ---
 export const searchLiveFiles = async (companyId, query) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
@@ -32,9 +32,12 @@ export const searchLiveFiles = async (companyId, query) => {
     return res.data.files || [];
 };
 
-// --- IMPORTAÇÃO SELETIVA (Cache) ---
-export const importFilesToCache = async (companyId, files) => {
+// --- IMPORTAÇÃO CORRIGIDA (Usa folderId) ---
+export const importFilesToCache = async (companyId, files, targetParentId = null) => {
     if (!files || files.length === 0) return;
+
+    // Normaliza 'null' string para null real
+    const finalParentId = (targetParentId === 'null' || !targetParentId) ? null : targetParentId;
 
     const rows = files.map(f => ({
         company_id: companyId,
@@ -44,9 +47,9 @@ export const importFilesToCache = async (companyId, files) => {
         web_view_link: f.webViewLink,
         thumbnail_link: f.thumbnailLink,
         size: f.size ? parseInt(f.size) : 0,
-        parent_id: null, 
+        parent_id: finalParentId, // CRÍTICO: Usa o ID da pasta onde o usuário está
         is_folder: f.mimeType === 'application/vnd.google-apps.folder',
-        created_at: f.createdTime,
+        created_at: f.createdTime || new Date(),
         updated_at: new Date()
     }));
 
@@ -58,18 +61,13 @@ export const createFolder = async (companyId, name, parentId = null) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
-    // 1. Verifica se já existe (Prevenção de Duplicatas)
     let q = `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false`;
-    
-    if (parentId) {
-        q += ` and '${parentId}' in parents`;
-    } 
+    if (parentId) q += ` and '${parentId}' in parents`;
 
     const existing = await drive.files.list({ q, fields: 'files(id, name, webViewLink)' });
     
     if (existing.data.files.length > 0) {
         const folder = existing.data.files[0];
-        // Atualiza cache
         await supabase.from('drive_cache').upsert({
             company_id: companyId,
             google_id: folder.id,
@@ -80,11 +78,9 @@ export const createFolder = async (companyId, name, parentId = null) => {
             is_folder: true,
             updated_at: new Date()
         }, { onConflict: 'company_id, google_id' });
-        
         return folder;
     }
 
-    // 2. Cria se não existir
     const fileMetadata = {
         name: name,
         mimeType: 'application/vnd.google-apps.folder',
@@ -96,7 +92,6 @@ export const createFolder = async (companyId, name, parentId = null) => {
         fields: 'id, name, webViewLink, mimeType'
     });
 
-    // 3. CACHE IMEDIATO
     await supabase.from('drive_cache').insert({
         company_id: companyId,
         google_id: res.data.id,
@@ -121,7 +116,6 @@ export const deleteFiles = async (companyId, fileIds) => {
                 fileId: fileId,
                 requestBody: { trashed: true }
             });
-            // Remove do cache imediatamente
             await supabase.from('drive_cache').delete().eq('google_id', fileId).eq('company_id', companyId);
         } catch (e) {
             console.error(`Erro ao deletar ${fileId}:`, e.message);
@@ -139,13 +133,12 @@ export const emptyTrash = async (companyId) => {
     return { success: true };
 };
 
-// --- SYNC PRINCIPAL (COM LIMPEZA DE FANTASMAS) ---
+// --- SYNC POR SUBTRAÇÃO (KILL GHOSTS) ---
 export const syncDriveFiles = async (companyId, folderId = null, isTrash = false) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
     let q = "";
-    
     if (isTrash) {
         q = "trashed = true";
     } else {
@@ -153,7 +146,6 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
         if (folderId) {
             q += ` and '${folderId}' in parents`;
         } else {
-             // Se for raiz, busca arquivos que não têm parent ou que o parent é o root
              q += ` and 'root' in parents`; 
         }
     }
@@ -166,9 +158,8 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
             pageSize: 1000 
         });
 
-        const liveFiles = res.data.files;
+        const liveFiles = res.data.files || [];
         
-        // MODO LIXEIRA: Retorna direto, sem cachear (pois não gerenciamos trash state no banco)
         if (isTrash) {
              return liveFiles.map(f => ({
                 id: f.id, 
@@ -184,11 +175,31 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
             }));
         }
         
-        // MODO PASTA: Atualização + Limpeza de Fantasmas
-        if (liveFiles) {
-            const liveIds = new Set(liveFiles.map(f => f.id));
-            
-            // 1. Upsert dos arquivos vivos
+        // --- GHOST KILLER LOGIC ---
+        // 1. O que está vivo no Google AGORA?
+        const liveIds = new Set(liveFiles.map(f => f.id));
+        
+        // 2. O que o banco DIZ que está nesta pasta?
+        let dbQuery = supabase.from('drive_cache').select('google_id').eq('company_id', companyId);
+        if (folderId) dbQuery = dbQuery.eq('parent_id', folderId);
+        else dbQuery = dbQuery.is('parent_id', null);
+        
+        const { data: dbFiles } = await dbQuery;
+        
+        // 3. Se está no Banco mas NÃO no Google => DELETE (É Fantasma)
+        if (dbFiles) {
+            const idsToDelete = dbFiles
+                .filter(dbf => !liveIds.has(dbf.google_id))
+                .map(dbf => dbf.google_id);
+
+            if (idsToDelete.length > 0) {
+                console.log(`🧹 [SYNC] Apagando ${idsToDelete.length} arquivos fantasmas.`);
+                await supabase.from('drive_cache').delete().eq('company_id', companyId).in('google_id', idsToDelete);
+            }
+        }
+
+        // 4. Upsert (Atualiza/Insere Vivos)
+        if (liveFiles.length > 0) {
             const rows = liveFiles.map(f => ({
                 company_id: companyId,
                 google_id: f.id,
@@ -197,36 +208,16 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
                 web_view_link: f.webViewLink,
                 thumbnail_link: f.thumbnailLink,
                 size: f.size ? parseInt(f.size) : 0,
-                parent_id: folderId, // Força parent_id atual para corrigir arquivos movidos
+                parent_id: folderId,
                 is_folder: f.mimeType === 'application/vnd.google-apps.folder',
                 created_at: f.createdTime,
                 updated_at: new Date()
             }));
-
-            if (rows.length > 0) {
-                await supabase.from('drive_cache').upsert(rows, { onConflict: 'company_id, google_id' });
-            }
-
-            // 2. Remoção de Fantasmas (Arquivos no Banco que NÃO estão no Google nesta pasta)
-            // Busca o que o banco acha que está nesta pasta
-            let dbQuery = supabase.from('drive_cache').select('google_id').eq('company_id', companyId);
-            if (folderId) dbQuery = dbQuery.eq('parent_id', folderId);
-            else dbQuery = dbQuery.is('parent_id', null);
-
-            const { data: dbFiles } = await dbQuery;
-
-            if (dbFiles) {
-                const idsToDelete = dbFiles
-                    .filter(dbf => !liveIds.has(dbf.google_id))
-                    .map(dbf => dbf.google_id);
-                
-                if (idsToDelete.length > 0) {
-                    await supabase.from('drive_cache').delete().eq('company_id', companyId).in('google_id', idsToDelete);
-                }
-            }
+            await supabase.from('drive_cache').upsert(rows, { onConflict: 'company_id, google_id' });
         }
         
         return liveFiles;
+
     } catch (e) {
         console.error("Erro syncDriveFiles:", e);
         return [];
@@ -273,6 +264,7 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
     return res.data;
 };
 
+// ... (Manter getFileStream, getFileBuffer, convertDocxToHtml inalterados) ...
 export const getFileStream = async (companyId, fileId) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
@@ -321,17 +313,10 @@ export const getFileBuffer = async (companyId, fileId) => {
 
 export const convertDocxToHtml = async (companyId, fileId) => {
     const fileData = await getFileBuffer(companyId, fileId);
-    
-    if (fileData.isLargeFile) {
-        throw new Error("Arquivo muito grande para conversão.");
-    }
-    
-    if (!fileData.mimeType.includes('wordprocessingml.document')) {
-        throw new Error("Apenas documentos Word (.docx) ou Google Docs podem ser editados.");
-    }
+    if (fileData.isLargeFile) throw new Error("Arquivo muito grande para conversão.");
+    if (!fileData.mimeType.includes('wordprocessingml.document')) throw new Error("Apenas documentos Word (.docx) ou Google Docs podem ser editados.");
 
     const result = await mammoth.convertToHtml({ buffer: fileData.buffer });
-    
     return {
         html: result.value,
         filename: fileData.fileName,
