@@ -11,13 +11,14 @@ import { createClient } from "@supabase/supabase-js";
 import { startSession } from './services/baileys/connection.js';
 import { startSentinel } from './services/scheduler/sentinel.js';
 import { startAgendaWorker } from './workers/agendaWorker.js';
+import { startRetentionWorker } from './workers/retentionWorker.js'; // NOVO
 
 // Rotas Modulares
 import sessionRoutes from './routes/session.routes.js';
 import messageRoutes from './routes/message.routes.js';
 import automationRoutes from './routes/automation.routes.js';
 import managementRoutes from './routes/management.routes.js';
-import cloudRoutes from './routes/cloud.routes.js'; // [NOVO]
+import cloudRoutes from './routes/cloud.routes.js'; 
 
 // 🔥 PATCH CRÍTICO: USER-AGENT SPOOFING (INTERCEPTOR) 🔥
 const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -41,7 +42,6 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 // --- MIDDLEWARES & SEGURANÇA ---
 
 // Helmet: Proteção de Headers HTTP
-// crossOriginResourcePolicy: false -> Permite carregar imagens/mídia de outros domínios (Necessário para WhatsApp)
 app.use(helmet({
     crossOriginResourcePolicy: false,
     contentSecurityPolicy: false // Desativa CSP estrito para APIs
@@ -57,7 +57,7 @@ app.use('/api/v1/session', sessionRoutes);
 app.use('/api/v1/message', messageRoutes);
 app.use('/api/v1', automationRoutes); 
 app.use('/api/v1/management', managementRoutes);
-app.use('/api/v1/cloud', cloudRoutes); // [NOVO]
+app.use('/api/v1/cloud', cloudRoutes);
 
 // Sentry Error Handler (Deve vir depois das rotas)
 Sentry.setupExpressErrorHandler(app);
@@ -117,6 +117,7 @@ app.listen(PORT, () => {
     restoreSessions();     
     startSentinel();       
     startAgendaWorker();   
+    startRetentionWorker(); // Inicia limpeza automática
 });
 
 export default app;
