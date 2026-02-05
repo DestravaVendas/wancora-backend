@@ -1,206 +1,217 @@
 
-import { generateAuthUrl, handleAuthCallback } from "../services/google/authService.js";
-import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteFiles, searchLiveFiles, importFilesToCache, convertDocxToHtml, emptyTrash } from "../services/google/driveService.js";
-import { sendMessage } from "../services/baileys/sender.js";
-import { getSessionId } from "./whatsappController.js";
 import { createClient } from "@supabase/supabase-js";
+import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
+import { sendMessage as sendService } from '../services/baileys/sender.js';
+import { 
+    createGroup as createGroupService, 
+    manageGroupParticipants as manageParticipantsService,
+    updateGroupSettings as updateGroupService,
+    updateGroupPicture as updatePictureService,
+    getGroupInviteCode as getInviteService,
+    createCommunity as createCommunityService
+} from '../services/baileys/community.js';
+import { fetchCatalog } from '../services/baileys/catalog.js';
+import { normalizeJid } from '../utils/wppParsers.js';
+import { proto } from '@whiskeysockets/baileys';
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+    auth: { persistSession: false }
+});
 
-export const connectDrive = async (req, res) => {
-    const { companyId } = req.body; 
-    console.log(`🔌 [CLOUD] Iniciando conexão Drive para empresa: ${companyId}`);
-    if (!companyId) return res.status(400).json({ error: "Company ID é obrigatório para conectar." });
+// --- SESSÃO & MENSAGEM ---
+export const startSession = async (sessionId, companyId) => {
     try {
-        const url = generateAuthUrl(companyId);
-        res.json({ url });
-    } catch (e) {
-        console.error("❌ [CLOUD] Erro ao gerar URL:", e);
-        res.status(500).json({ error: e.message });
+        console.log(`[Controller] Solicitando início da sessão ${sessionId}`);
+        return await startService(sessionId, companyId);
+    } catch (error) {
+        console.error(`[Controller] Erro ao iniciar sessão:`, error);
+        throw error;
     }
 };
 
-export const callbackDrive = async (req, res) => {
-    const { code, state } = req.query; 
+export const deleteSession = async (sessionId, companyId) => {
     try {
-        if (!code || !state) throw new Error(`Parâmetros inválidos do Google.`);
-        const userInfo = await handleAuthCallback(code, state);
-        syncDriveFiles(state).catch(err => console.error("Initial Sync Error:", err));
-        const host = req.get('host');
-        let frontendBaseUrl = (host.includes('localhost') || host.includes('127.0.0.1')) ? 'http://localhost:3000' : (process.env.FRONTEND_URL || 'https://wancora-crm.netlify.app');
-        if (frontendBaseUrl.endsWith('/')) frontendBaseUrl = frontendBaseUrl.slice(0, -1);
-        res.redirect(`${frontendBaseUrl}/cloud?google=success&email=${encodeURIComponent(userInfo.email)}`);
-    } catch (e) {
-        res.status(500).send(`Erro na autenticação: ${e.message}`);
+        console.log(`[Controller] Solicitando remoção da sessão ${sessionId}`);
+        return await deleteService(sessionId, companyId);
+    } catch (error) {
+        console.error(`[Controller] Erro ao deletar sessão:`, error);
+        throw error;
     }
 };
 
-export const listFiles = async (req, res) => {
-    const { companyId } = req.body;
-    const { folderId, isTrash } = req.query; 
+export const sendMessage = async (payload) => sendService(payload);
 
+// --- COMUNIDADES & GRUPOS ---
+
+export const createGroup = async (req, res) => {
+    const { sessionId, companyId, subject, participants } = req.body;
     try {
-        if (isTrash === 'true') {
-            const trashFiles = await syncDriveFiles(companyId, null, true);
-            return res.json({ files: trashFiles, source: 'live' });
-        }
+        const group = await createGroupService(sessionId, companyId, subject, participants);
+        res.json({ success: true, group });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+};
 
-        // Modo Normal: Cache + Sync Background
-        let query = supabase.from('drive_cache').select('*').eq('company_id', companyId);
-        
-        if (folderId && folderId !== 'null') query = query.eq('parent_id', folderId);
-        else query = query.is('parent_id', null); 
-
-        let { data: cached } = await query;
-
-        // Se cache vazio, tenta sync imediato
-        if ((!cached || cached.length === 0)) {
-             const freshFiles = await syncDriveFiles(companyId, folderId === 'null' ? null : folderId);
-             
-             if (freshFiles && freshFiles.length > 0) {
-                 cached = freshFiles.map(f => ({
-                    id: f.id, 
-                    google_id: f.id,
-                    name: f.name,
-                    mime_type: f.mimeType,
-                    web_view_link: f.webViewLink,
-                    thumbnail_link: f.thumbnailLink,
-                    size: f.size,
-                    is_folder: f.mimeType === 'application/vnd.google-apps.folder',
-                    updated_at: f.modifiedTime
-                 }));
-             }
+export const updateGroup = async (req, res) => {
+    const { sessionId, groupId, action, value, participants } = req.body;
+    try {
+        let result;
+        if (['add', 'remove', 'promote', 'demote'].includes(action)) {
+            result = await manageParticipantsService(sessionId, groupId, action, participants);
+        } else if (action === 'invite_code') {
+            result = { code: await getInviteService(sessionId, groupId) };
+        } else if (action === 'picture') {
+            result = await updatePictureService(sessionId, groupId, value);
         } else {
-             // Trigger sync background para limpar fantasmas
-             syncDriveFiles(companyId, folderId === 'null' ? null : folderId).catch(() => {});
+            result = await updateGroupService(sessionId, groupId, action, value);
+        }
+        res.json({ success: true, result });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+};
+
+// [NOVO] Endpoint para buscar metadados do grupo (Participantes)
+export const getGroupMetadata = async (req, res) => {
+    const { sessionId, groupId } = req.body;
+    
+    try {
+        const session = sessions.get(sessionId);
+        if (!session || !session.sock) throw new Error("Sessão desconectada.");
+
+        const jid = normalizeJid(groupId);
+        const metadata = await session.sock.groupMetadata(jid);
+
+        res.json({ success: true, metadata });
+    } catch (error) {
+        console.error("Erro getGroupMetadata:", error);
+        res.status(500).json({ error: error.message });
+    }
+};
+
+export const createCommunity = async (req, res) => {
+    const { sessionId, companyId, subject, description } = req.body;
+    try {
+        const community = await createCommunityService(sessionId, companyId, subject, description);
+        res.json({ success: true, community });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+};
+
+// --- CATÁLOGO ---
+export const syncCatalog = async (req, res) => {
+    const { sessionId, companyId } = req.body;
+    try {
+        const result = await fetchCatalog(sessionId, companyId);
+        res.json({ success: true, result });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+};
+
+// --- INTERATIVIDADE (VOTE/REACT/DELETE) ---
+export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, optionId) => {
+    try {
+        const session = sessions.get(sessionId);
+        if (!session || !session.sock) throw new Error("Sessão desconectada.");
+
+        const { data: pollMsg } = await supabase.from('messages').select('whatsapp_id, from_me, content').eq('id', pollId).single();
+        if (!pollMsg) throw new Error("Enquete não encontrada no banco.");
+
+        let pollContent;
+        try {
+            pollContent = typeof pollMsg.content === 'string' ? JSON.parse(pollMsg.content) : pollMsg.content;
+        } catch (e) { throw new Error("Conteúdo da enquete corrompido."); }
+
+        let optionsList = [];
+        if (Array.isArray(pollContent.options)) {
+            optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
+        } else if (pollContent.values) {
+            optionsList = pollContent.values;
         }
 
-        res.json({ files: cached || [], source: 'hybrid' });
-    } catch (e) {
-        console.error("Erro listFiles:", e);
-        res.status(500).json({ error: e.message });
-    }
-};
+        const selectedOptionText = optionsList[optionId];
+        if (selectedOptionText === undefined) throw new Error(`Opção inválida: Index ${optionId} não existe.`);
 
-export const searchDrive = async (req, res) => {
-    const { companyId, query } = req.body;
-    if (!query) return res.status(400).json({ error: "Query vazia." });
-    try {
-        const files = await searchLiveFiles(companyId, query);
-        res.json({ files });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-};
-
-export const importDriveFiles = async (req, res) => {
-    const { companyId, files, currentFolderId } = req.body; 
-    try {
-        // Passa o currentFolderId para garantir que o arquivo apareça na pasta que o usuário está vendo
-        const count = await importFilesToCache(companyId, files, currentFolderId);
-        res.json({ success: true, count });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-};
-
-export const convertDocument = async (req, res) => {
-    const { companyId, fileId } = req.body;
-    try {
-        const result = await convertDocxToHtml(companyId, fileId);
-        res.json({ success: true, ...result });
-    } catch (e) {
-        console.error("Erro conversão:", e);
-        res.status(500).json({ error: e.message });
-    }
-};
-
-export const syncNow = async (req, res) => {
-    const { companyId } = req.body;
-    try {
-        const files = await syncDriveFiles(companyId);
-        res.json({ success: true, count: files.length });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-};
-
-export const uploadFileToDrive = async (req, res) => {
-    const { companyId, name, folderId } = req.body;
-    const file = req.file;
-    if (!companyId || !file) return res.status(400).json({ error: "Arquivo ou CompanyId ausentes." });
-
-    try {
-        const fileData = await uploadFile(companyId, file.buffer, name || file.originalname, file.mimetype, folderId === 'null' ? null : folderId);
-        res.json({ success: true, file: fileData });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-};
-
-export const getQuota = async (req, res) => {
-    const { companyId } = req.body;
-    try {
-        const quota = await getStorageQuota(companyId);
-        res.json({ success: true, quota });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-};
-
-export const createNewFolder = async (req, res) => {
-    const { companyId, name, parentId } = req.body;
-    try {
-        const folder = await createFolder(companyId, name, parentId);
-        res.json({ success: true, folder });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-};
-
-export const deleteItems = async (req, res) => {
-    const { companyId, fileIds } = req.body;
-    try {
-        await deleteFiles(companyId, fileIds);
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-};
-
-export const emptyTrashItems = async (req, res) => {
-    const { companyId } = req.body;
-    try {
-        await emptyTrash(companyId);
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-};
-
-export const sendFileToContact = async (req, res) => {
-    const { companyId, fileId, to, caption } = req.body;
-    if (!fileId || !to) return res.status(400).json({ error: "FileId e Destinatário obrigatórios" });
-
-    try {
-        const sessionId = await getSessionId(companyId);
-        if (!sessionId) return res.status(503).json({ error: "WhatsApp desconectado." });
-
-        const { stream, fileName, mimeType } = await getFileStream(companyId, fileId);
-        const chunks = [];
-        for await (const chunk of stream) chunks.push(chunk);
-        const buffer = Buffer.concat(chunks);
-
-        let type = 'document';
-        if (mimeType.startsWith('image/')) type = 'image';
-        else if (mimeType.startsWith('video/')) type = 'video';
-        else if (mimeType.startsWith('audio/')) type = 'audio';
-
-        const payload = {
-            sessionId,
-            to,
-            type,
-            companyId,
-            caption: caption || fileName,
-            fileName: fileName,
-            mimetype: mimeType,
-        };
-
-        const tempName = `temp_${Date.now()}_${fileName}`;
-        await supabase.storage.from('chat-media').upload(`${companyId}/${tempName}`, buffer, { contentType: mimeType });
-        const { data: publicData } = supabase.storage.from('chat-media').getPublicUrl(`${companyId}/${tempName}`);
+        const chatJid = normalizeJid(remoteJid);
         
-        payload.url = publicData.publicUrl;
-        await sendMessage(payload);
+        await session.sock.sendMessage(chatJid, {
+            poll: {
+                vote: {
+                    key: { remoteJid: chatJid, id: pollMsg.whatsapp_id, fromMe: pollMsg.from_me },
+                    selectedOptions: [selectedOptionText] 
+                }
+            }
+        });
 
-        res.json({ success: true, message: "Arquivo enviado para o WhatsApp." });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+        const myJid = normalizeJid(session.sock.user?.id);
+        const { data: currentMsg } = await supabase.from('messages').select('poll_votes').eq('whatsapp_id', pollMsg.whatsapp_id).single();
+        let votes = currentMsg?.poll_votes || [];
+        votes = votes.filter(v => v.voterJid !== myJid);
+        votes.push({ voterJid: myJid, ts: Date.now(), selectedOptions: [selectedOptionText] });
+
+        await supabase.from('messages').update({ poll_votes: votes }).eq('whatsapp_id', pollMsg.whatsapp_id).eq('company_id', companyId);
+
+        return { success: true };
+    } catch (error) {
+        console.error(`[Controller] Erro ao votar:`, error.message);
+        throw error;
+    }
+};
+
+export const sendReaction = async (sessionId, companyId, remoteJid, msgId, reaction) => {
+    try {
+        const session = sessions.get(sessionId);
+        if (!session?.sock) throw new Error("Sessão desconectada.");
+
+        const { data: targetMsg } = await supabase.from('messages').select('whatsapp_id, from_me').eq('id', msgId).single();
+        if (!targetMsg) throw new Error("Mensagem alvo não encontrada.");
+
+        const key = { remoteJid: normalizeJid(remoteJid), id: targetMsg.whatsapp_id, fromMe: targetMsg.from_me };
+        await session.sock.sendMessage(normalizeJid(remoteJid), { react: { text: reaction, key: key } });
+        return { success: true };
+    } catch (error) {
+        console.error(`[Controller] Erro ao reagir:`, error);
+        throw error;
+    }
+};
+
+export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, everyone = false) => {
+    try {
+        await supabase.from('messages').update({ is_deleted: true, content: '⊘ Mensagem apagada' }).eq('id', msgId).eq('company_id', companyId);
+        if (everyone) {
+            const session = sessions.get(sessionId);
+            if (session?.sock) {
+                const { data: targetMsg } = await supabase.from('messages').select('whatsapp_id, from_me').eq('id', msgId).single();
+                if (targetMsg) {
+                    const key = { remoteJid: normalizeJid(remoteJid), id: targetMsg.whatsapp_id, fromMe: targetMsg.from_me };
+                    await session.sock.sendMessage(normalizeJid(remoteJid), { delete: key });
+                }
+            }
+        }
+        return { success: true };
+    } catch (error) {
+        console.error(`[Controller] Erro ao deletar:`, error);
+        throw error;
+    }
+};
+
+export const markChatAsRead = async (sessionId, companyId, remoteJid) => {
+    try {
+        const session = sessions.get(sessionId);
+        if (!session?.sock) return; 
+        const jid = normalizeJid(remoteJid);
+        await session.sock.presenceSubscribe(jid);
+        const { data: unreadMsgs } = await supabase.from('messages').select('whatsapp_id, from_me').eq('company_id', companyId).eq('remote_jid', jid).eq('from_me', false).neq('status', 'read').limit(20); 
+        if (unreadMsgs && unreadMsgs.length > 0) {
+            const keys = unreadMsgs.map(m => ({ remoteJid: jid, id: m.whatsapp_id, fromMe: false }));
+            await session.sock.readMessages(keys);
+            await supabase.from('messages').update({ status: 'read', read_at: new Date() }).eq('company_id', companyId).eq('remote_jid', jid).in('whatsapp_id', unreadMsgs.map(m => m.whatsapp_id));
+            await supabase.from('contacts').update({ unread_count: 0 }).eq('company_id', companyId).eq('jid', jid);
+        }
+        return { success: true };
+    } catch (error) { return { success: false, error: error.message }; }
+};
+
+export const getSessionId = async (companyId) => {
+    try {
+        const { data } = await supabase.from('instances').select('session_id').eq('company_id', companyId).eq('status', 'connected').limit(1).maybeSingle();
+        if (data) return data.session_id;
+        const { data: anySession } = await supabase.from('instances').select('session_id').eq('company_id', companyId).limit(1).maybeSingle();
+        return anySession?.session_id || null;
+    } catch (error) { return null; }
 };
