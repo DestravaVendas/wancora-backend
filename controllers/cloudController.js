@@ -94,9 +94,10 @@ export const searchDrive = async (req, res) => {
 };
 
 export const importDriveFiles = async (req, res) => {
-    const { companyId, files } = req.body; 
+    const { companyId, files, currentFolderId } = req.body; 
     try {
-        const count = await importFilesToCache(companyId, files);
+        // Passa o currentFolderId para garantir que o arquivo apareça na pasta que o usuário está vendo
+        const count = await importFilesToCache(companyId, files, currentFolderId);
         res.json({ success: true, count });
     } catch (e) {
         res.status(500).json({ error: e.message });
