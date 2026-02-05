@@ -39,7 +39,9 @@ export const searchLiveFiles = async (companyId, query) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
-    const q = `name contains '${query}' and trashed = false`;
+    // Remove aspas simples da query para evitar erros de sintaxe
+    const safeQuery = query.replace(/'/g, "\\'");
+    const q = `name contains '${safeQuery}' and trashed = false`;
     
     const res = await drive.files.list({
         q: q,
@@ -50,29 +52,43 @@ export const searchLiveFiles = async (companyId, query) => {
     return res.data.files || [];
 };
 
-// --- IMPORTAÇÃO ---
+// --- IMPORTAÇÃO (CRIAÇÃO DE ATALHOS) ---
 export const importFilesToCache = async (companyId, files, targetParentId = null) => {
-    if (!files || files.length === 0) return;
+    if (!files || files.length === 0) return 0;
 
-    // Normaliza 'null' string para null real
-    const finalParentId = (targetParentId === 'null' || !targetParentId) ? null : targetParentId;
+    const auth = await getAuthenticatedClient(companyId);
+    const drive = google.drive({ version: 'v3', auth });
+    
+    // Se não tiver pasta pai, usa root. Se for 'null' string, usa root.
+    const finalParentId = (targetParentId === 'null' || !targetParentId) ? 'root' : targetParentId;
 
-    const rows = files.map(f => ({
-        company_id: companyId,
-        google_id: f.id,
-        name: f.name,
-        mime_type: f.mimeType,
-        web_view_link: f.webViewLink,
-        thumbnail_link: f.thumbnailLink,
-        size: f.size ? parseInt(f.size) : 0,
-        parent_id: finalParentId, 
-        is_folder: f.mimeType === 'application/vnd.google-apps.folder',
-        created_at: f.createdTime || new Date(),
-        updated_at: new Date()
-    }));
+    let successCount = 0;
 
-    await supabase.from('drive_cache').upsert(rows, { onConflict: 'company_id, google_id' });
-    return rows.length;
+    for (const file of files) {
+        try {
+            // Cria um ATALHO no Google Drive.
+            // Isso faz o arquivo existir "fisicamente" na pasta sem duplicar dados.
+            await drive.files.create({
+                resource: {
+                    name: file.name,
+                    mimeType: 'application/vnd.google-apps.shortcut',
+                    parents: [finalParentId],
+                    shortcutDetails: {
+                        targetId: file.id // Aponta para o arquivo original
+                    }
+                },
+                fields: 'id'
+            });
+            successCount++;
+        } catch (e) {
+            console.error(`Erro ao criar atalho para ${file.name}:`, e.message);
+        }
+    }
+
+    // Dispara Sync imediato para atualizar o cache local com os novos atalhos
+    await syncDriveFiles(companyId, finalParentId === 'root' ? null : finalParentId);
+
+    return successCount;
 };
 
 export const createFolder = async (companyId, name, parentId = null) => {
@@ -199,7 +215,7 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
     try {
         const res = await drive.files.list({
             q: q,
-            fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, parents, createdTime, modifiedTime, trashed)',
+            fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, parents, createdTime, modifiedTime, trashed, shortcutDetails)',
             orderBy: 'folder,name',
             pageSize: 1000 
         });
@@ -248,19 +264,28 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
 
         // 4. Upsert Vivos
         if (liveFiles.length > 0) {
-            const rows = liveFiles.map(f => ({
-                company_id: companyId,
-                google_id: f.id,
-                name: f.name,
-                mime_type: f.mimeType,
-                web_view_link: f.webViewLink,
-                thumbnail_link: f.thumbnailLink,
-                size: f.size ? parseInt(f.size) : 0,
-                parent_id: actualParentId,
-                is_folder: f.mimeType === 'application/vnd.google-apps.folder',
-                created_at: f.createdTime,
-                updated_at: new Date()
-            }));
+            const rows = liveFiles.map(f => {
+                // Se for atalho, tenta resolver o MIME real se possível, ou mantém shortcut
+                // O Google Drive trata shortcuts como arquivos normais na listagem
+                let mime = f.mimeType;
+                if (mime === 'application/vnd.google-apps.shortcut' && f.shortcutDetails?.targetMimeType) {
+                    // Opcional: Poderíamos mascarar, mas é melhor manter como shortcut para ícone visual
+                }
+
+                return {
+                    company_id: companyId,
+                    google_id: f.id,
+                    name: f.name,
+                    mime_type: mime,
+                    web_view_link: f.webViewLink,
+                    thumbnail_link: f.thumbnailLink,
+                    size: f.size ? parseInt(f.size) : 0,
+                    parent_id: actualParentId,
+                    is_folder: f.mimeType === 'application/vnd.google-apps.folder',
+                    created_at: f.createdTime,
+                    updated_at: new Date()
+                }
+            });
             await supabase.from('drive_cache').upsert(rows, { onConflict: 'company_id, google_id' });
         }
         
