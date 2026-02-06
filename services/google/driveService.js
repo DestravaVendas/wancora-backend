@@ -52,23 +52,65 @@ export const searchLiveFiles = async (companyId, query) => {
     return res.data.files || [];
 };
 
-// --- IMPORTAÇÃO ( REFERÊNCIA VIRTUAL ) ---
-// Agora APENAS salva no banco. Não cria atalho no Google Drive.
+// --- HELPER: Recursão para buscar filhos ---
+const fetchChildrenRecursively = async (drive, folderId, dbRecords, companyId) => {
+    let pageToken = null;
+    do {
+        const q = `'${folderId}' in parents and trashed = false`;
+        const res = await drive.files.list({
+            q,
+            fields: 'nextPageToken, files(id, name, mimeType, webViewLink, thumbnailLink, size, createdTime)',
+            pageToken,
+            pageSize: 1000
+        });
+
+        const files = res.data.files;
+        pageToken = res.data.nextPageToken;
+
+        for (const file of files) {
+            const isFolder = file.mimeType === 'application/vnd.google-apps.folder';
+            
+            dbRecords.push({
+                company_id: companyId,
+                google_id: file.id,
+                name: file.name,
+                mime_type: file.mimeType,
+                web_view_link: file.webViewLink,
+                thumbnail_link: file.thumbnailLink || null,
+                size: file.size ? parseInt(file.size) : 0,
+                parent_id: folderId, // Define o pai como a pasta atual
+                is_folder: isFolder,
+                created_at: file.createdTime || new Date(),
+                updated_at: new Date()
+            });
+
+            if (isFolder) {
+                // Se for pasta, mergulha nela
+                await fetchChildrenRecursively(drive, file.id, dbRecords, companyId);
+            }
+        }
+    } while (pageToken);
+};
+
+// --- IMPORTAÇÃO ( REFERÊNCIA VIRTUAL + RECURSÃO ) ---
 export const importFilesToCache = async (companyId, files, targetParentId = null) => {
     if (!files || files.length === 0) return 0;
 
-    // Resolve o parent_id para o banco de dados
-    // Se targetParentId for 'null' string, null object ou undefined, vira NULL no banco (Raiz do Wancora)
+    const auth = await getAuthenticatedClient(companyId);
+    const drive = google.drive({ version: 'v3', auth });
+
+    // Resolve o parent_id para o banco de dados (Pasta onde o usuário está "soltando" a importação)
     const dbParentId = (targetParentId === 'null' || !targetParentId) ? null : targetParentId;
 
-    let successCount = 0;
     const recordsToInsert = [];
 
+    // 1. Processa os arquivos/pastas raiz da seleção
     for (const file of files) {
         try {
-            // Prepara o registro para o banco Wancora
-            // Usamos o ID real do arquivo do Google.
-            const newRecord = {
+            const isFolder = file.mimeType === 'application/vnd.google-apps.folder';
+
+            // Adiciona o item selecionado
+            recordsToInsert.push({
                 company_id: companyId,
                 google_id: file.id, // ID Original
                 name: file.name,
@@ -76,49 +118,45 @@ export const importFilesToCache = async (companyId, files, targetParentId = null
                 web_view_link: file.webViewLink,
                 thumbnail_link: file.thumbnailLink || null,
                 size: file.size ? parseInt(file.size) : 0,
-                parent_id: dbParentId, // Coloca na pasta atual do Wancora (Virtualmente)
-                is_folder: file.mimeType === 'application/vnd.google-apps.folder',
+                parent_id: dbParentId, 
+                is_folder: isFolder,
                 created_at: file.createdTime || new Date(),
                 updated_at: new Date() 
-            };
+            });
 
-            recordsToInsert.push(newRecord);
-            successCount++;
+            // Se for pasta, busca todo o conteúdo interno recursivamente
+            if (isFolder) {
+                await fetchChildrenRecursively(drive, file.id, recordsToInsert, companyId);
+            }
+
         } catch (e) {
             console.error(`Erro ao preparar importação de ${file.name}:`, e.message);
         }
     }
 
+    // 2. Upsert em Lote
     if (recordsToInsert.length > 0) {
-        // Upsert: Se já existir (mesmo ID na mesma empresa), atualiza a pasta (move virtualmente)
-        // Isso previne duplicatas de 5 cópias. O arquivo só pode estar em um lugar no Wancora por vez.
-        const { error } = await supabase.from('drive_cache').upsert(recordsToInsert, { 
-            onConflict: 'company_id, google_id' 
-        });
-
-        if (error) {
-            console.error("Erro ao salvar no banco:", error.message);
+        // Chunking para não estourar o limite do Supabase em imports gigantes
+        const CHUNK_SIZE = 100;
+        for (let i = 0; i < recordsToInsert.length; i += CHUNK_SIZE) {
+            const chunk = recordsToInsert.slice(i, i + CHUNK_SIZE);
+            const { error } = await supabase.from('drive_cache').upsert(chunk, { 
+                onConflict: 'company_id, google_id' 
+            });
+            if (error) console.error("Erro partial upsert:", error.message);
         }
     }
 
-    return successCount;
+    return recordsToInsert.length;
 };
 
 export const createFolder = async (companyId, name, parentId = null) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
-
-    // Se tiver parentId no Wancora, precisamos saber qual é o ID real no Google.
-    // Mas como estamos trabalhando com estrutura virtual, é mais seguro criar na Raiz do Google
-    // ou tentar achar a pasta pai se ela também estiver sincronizada.
-    // Simplificação: Cria na raiz do Google, mas organiza visualmente no Wancora.
-    // Para consistência total, o ideal é criar na raiz do Google Drive para não perder o arquivo.
     
     const fileMetadata = {
         name: name,
         mimeType: 'application/vnd.google-apps.folder',
-        // Se quiséssemos criar dentro de outra pasta no Google, precisaríamos do google_id do pai.
-        // Por segurança, criamos na raiz ou na pasta pai se fornecida e válida.
         parents: parentId ? [parentId] : [] 
     };
 
@@ -130,7 +168,6 @@ export const createFolder = async (companyId, name, parentId = null) => {
             fields: 'id, name, webViewLink, mimeType, createdTime'
         });
     } catch (e) {
-        // Se falhar (ex: parentId não existe no google), cria na raiz
         delete fileMetadata.parents;
         res = await drive.files.create({
             resource: fileMetadata,
@@ -138,14 +175,14 @@ export const createFolder = async (companyId, name, parentId = null) => {
         });
     }
 
-    // Salva no Banco Wancora na pasta correta
+    // Salva no Banco Wancora
     await supabase.from('drive_cache').insert({
         company_id: companyId,
         google_id: res.data.id,
         name: res.data.name,
         mime_type: res.data.mimeType,
         web_view_link: res.data.webViewLink,
-        parent_id: parentId, // Mantém a hierarquia visual do Wancora
+        parent_id: parentId, 
         is_folder: true,
         created_at: res.data.createdTime || new Date(),
         updated_at: new Date()
@@ -154,6 +191,7 @@ export const createFolder = async (companyId, name, parentId = null) => {
     return res.data;
 };
 
+// Deleta do Drive REAL e do Cache
 export const deleteFiles = async (companyId, fileIds) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
@@ -164,6 +202,10 @@ export const deleteFiles = async (companyId, fileIds) => {
                 fileId: fileId,
                 requestBody: { trashed: true }
             });
+            // O delete cascade do banco cuida dos filhos se estiver bem configurado, 
+            // mas por segurança vamos deletar apenas o registro direto aqui,
+            // e confiar no sync ou na lógica de "orphans" para limpar o resto visualmente.
+            // Para simplificar: Removemos do banco.
             await supabase.from('drive_cache').delete().eq('google_id', fileId).eq('company_id', companyId);
         } catch (e) {
             console.error(`Erro ao deletar ${fileId}:`, e.message);
@@ -172,6 +214,28 @@ export const deleteFiles = async (companyId, fileIds) => {
 
     await Promise.all(promises);
     return { success: true };
+};
+
+// REMOVE APENAS DO CACHE (Sem tocar no Google Drive)
+export const removeFilesFromCache = async (companyId, fileIds) => {
+    try {
+        // Remove do banco. Se for pasta, idealmente removeríamos os filhos também.
+        // Vamos fazer uma remoção em cascata baseada no parent_id se possível,
+        // mas como SQL simples, removemos os IDs selecionados.
+        // Se o usuário remover uma pasta importada, os filhos ficarão "órfãos" no banco
+        // e não aparecerão na navegação (pois dependem do pai). 
+        // Um sync posterior ou garbage collector limparia isso.
+        
+        await supabase.from('drive_cache')
+            .delete()
+            .eq('company_id', companyId)
+            .in('google_id', fileIds);
+
+        return { success: true };
+    } catch (e) {
+        console.error("Erro ao remover importação:", e);
+        throw e;
+    }
 };
 
 export const emptyTrash = async (companyId) => {
@@ -193,11 +257,6 @@ export const emptyTrash = async (companyId) => {
 };
 
 export const syncDriveFiles = async (companyId, folderId = null, isTrash = false) => {
-    // Apenas retorna o que está no banco para evitar sobrescrever a estrutura virtual
-    // com a estrutura real do Google (que pode ser diferente).
-    // O Sync com a API do Google só deve ocorrer se explicitamente solicitado ou para atualizar metadados (tamanho/nome),
-    // mas NÃO para deletar arquivos que não estão na pasta exata do Google.
-    
     if (isTrash) {
          // Para lixeira, sempre consultamos a API ao vivo
          const auth = await getAuthenticatedClient(companyId);
@@ -214,15 +273,6 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
         
         return res.data.files || [];
     }
-
-    // Para pastas normais, confiamos no banco de dados (Cache Virtual)
-    // O "Sync" real (Ghost Killer) é perigoso aqui porque estamos misturando arquivos de várias pastas do Google
-    // em uma pasta virtual do Wancora.
-    
-    // Então, retornamos vazio aqui e deixamos o controller ler do banco.
-    // Se precisar atualizar metadados, faríamos um check individual, mas por agora, 
-    // removemos a lógica de deletar coisas do banco baseado na listagem do Google.
-    
     return []; 
 };
 
@@ -234,7 +284,6 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
     stream.push(buffer);
     stream.push(null);
 
-    // Upload na raiz do Google ou na pasta específica se soubermos o ID
     const fileMetadata = {
         name: fileName,
         parents: folderId ? [folderId] : []
@@ -253,7 +302,6 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
             fields: 'id, name, webViewLink, mimeType, thumbnailLink, size, createdTime'
         });
     } catch (e) {
-        // Fallback para raiz
         delete fileMetadata.parents;
         res = await drive.files.create({
             resource: fileMetadata,
