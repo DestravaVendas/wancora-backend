@@ -95,11 +95,15 @@ export const searchDrive = async (req, res) => {
 
 export const importDriveFiles = async (req, res) => {
     const { companyId, files, currentFolderId } = req.body; 
+    
+    console.log("📥 [CLOUD] Request Importação:", { companyId, filesCount: files?.length, currentFolderId });
+
     try {
         // Passa o currentFolderId para garantir que o arquivo apareça na pasta que o usuário está vendo
         const count = await importFilesToCache(companyId, files, currentFolderId);
         res.json({ success: true, count });
     } catch (e) {
+        console.error("❌ [CLOUD] Erro na importação:", e);
         res.status(500).json({ error: e.message });
     }
 };
