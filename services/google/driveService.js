@@ -219,13 +219,7 @@ export const deleteFiles = async (companyId, fileIds) => {
 // REMOVE APENAS DO CACHE (Sem tocar no Google Drive)
 export const removeFilesFromCache = async (companyId, fileIds) => {
     try {
-        // Remove do banco. Se for pasta, idealmente removeríamos os filhos também.
-        // Vamos fazer uma remoção em cascata baseada no parent_id se possível,
-        // mas como SQL simples, removemos os IDs selecionados.
-        // Se o usuário remover uma pasta importada, os filhos ficarão "órfãos" no banco
-        // e não aparecerão na navegação (pois dependem do pai). 
-        // Um sync posterior ou garbage collector limparia isso.
-        
+        // Remove do banco
         await supabase.from('drive_cache')
             .delete()
             .eq('company_id', companyId)
@@ -266,12 +260,26 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
          
          const res = await drive.files.list({
             q: q,
-            fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, parents, createdTime, modifiedTime)',
+            fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, parents, createdTime, modifiedTime, shortcutDetails)',
             orderBy: 'folder,name',
             pageSize: 100
         });
         
-        return res.data.files || [];
+        // Mapeamento ROBUSTO para evitar crash no frontend
+        const safeFiles = (res.data.files || []).map(f => ({
+            id: f.id, // ID local (usando o do Google na lixeira pois não está no banco)
+            google_id: f.id,
+            name: f.name,
+            mime_type: f.mimeType || 'application/octet-stream', // Fallback seguro
+            web_view_link: f.webViewLink || '#',
+            thumbnail_link: f.thumbnailLink || null,
+            size: f.size ? parseInt(f.size) : 0,
+            is_folder: f.mimeType === 'application/vnd.google-apps.folder',
+            created_at: f.createdTime || new Date().toISOString(),
+            updated_at: f.modifiedTime || new Date().toISOString()
+        }));
+
+        return safeFiles;
     }
     return []; 
 };
@@ -327,7 +335,7 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
     return res.data;
 };
 
-// ... Resto das funções
+// ... Resto das funções (getFileStream, getFileBuffer, convertDocxToHtml) mantidas iguais
 export const getFileStream = async (companyId, fileId) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
