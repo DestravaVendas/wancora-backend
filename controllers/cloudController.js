@@ -1,6 +1,6 @@
 
 import { generateAuthUrl, handleAuthCallback } from "../services/google/authService.js";
-import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteFiles, searchLiveFiles, importFilesToCache, convertDocxToHtml, emptyTrash } from "../services/google/driveService.js";
+import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteFiles, searchLiveFiles, importFilesToCache, convertDocxToHtml, emptyTrash, removeFilesFromCache } from "../services/google/driveService.js";
 import { sendMessage } from "../services/baileys/sender.js";
 import { getSessionId } from "./whatsappController.js";
 import { createClient } from "@supabase/supabase-js";
@@ -155,6 +155,14 @@ export const deleteItems = async (req, res) => {
     const { companyId, fileIds } = req.body;
     try {
         await deleteFiles(companyId, fileIds);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+};
+
+export const removeImportedFiles = async (req, res) => {
+    const { companyId, fileIds } = req.body;
+    try {
+        await removeFilesFromCache(companyId, fileIds);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 };
