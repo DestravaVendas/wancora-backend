@@ -1,6 +1,6 @@
 
 import { generateAuthUrl, handleAuthCallback } from "../services/google/authService.js";
-import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteItems, searchLiveFiles, importFilesToCache, convertDocxToHtml, emptyTrash, removeFilesFromCache, getFileBuffer } from "../services/google/driveService.js";
+import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteFiles, searchLiveFiles, importFilesToCache, convertDocxToHtml, emptyTrash, removeFilesFromCache, getFileBuffer } from "../services/google/driveService.js";
 import { sendMessage } from "../services/baileys/sender.js";
 import { getSessionId } from "./whatsappController.js";
 import { createClient } from "@supabase/supabase-js";
@@ -116,7 +116,6 @@ export const convertDocument = async (req, res) => {
     }
 };
 
-// NOVO: Baixa conteúdo para o Frontend (Excel/Sheet)
 export const downloadFileContent = async (req, res) => {
     const { companyId, fileId } = req.body;
     try {
