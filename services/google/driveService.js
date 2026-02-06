@@ -53,8 +53,6 @@ export const searchLiveFiles = async (companyId, query) => {
 
 // --- IMPORTAÇÃO (CRIAÇÃO DE ATALHOS + INSERT IMEDIATO) ---
 export const importFilesToCache = async (companyId, files, targetParentId = null) => {
-    console.log(`🔍 [DEBUG] Iniciando importFilesToCache. TargetParent: ${targetParentId}, Arquivos: ${files?.length}`);
-
     if (!files || files.length === 0) return 0;
 
     const auth = await getAuthenticatedClient(companyId);
@@ -64,15 +62,11 @@ export const importFilesToCache = async (companyId, files, targetParentId = null
     // IMPORTANTE: Se for root, dbParentId DEVE ser null para bater com a query de listagem
     const dbParentId = (targetParentId === 'null' || !targetParentId) ? null : targetParentId;
 
-    console.log(`🔍 [DEBUG] Parent ID resolvido -> Google: ${googleParentId}, DB: ${dbParentId}`);
-
     let successCount = 0;
     const recordsToInsert = [];
 
     for (const file of files) {
         try {
-            console.log(`🔍 [DEBUG] Criando atalho para: ${file.name} (${file.id})`);
-            
             // Cria o ATALHO no Google Drive
             const res = await drive.files.create({
                 resource: {
@@ -87,7 +81,6 @@ export const importFilesToCache = async (companyId, files, targetParentId = null
             });
 
             const shortcut = res.data;
-            console.log(`✅ [DEBUG] Atalho criado no Google. ID: ${shortcut.id}`);
 
             // Determina o MIME type real para exibição
             const displayMime = shortcut.shortcutDetails?.targetMimeType || shortcut.mimeType;
@@ -102,29 +95,19 @@ export const importFilesToCache = async (companyId, files, targetParentId = null
                 size: file.size ? parseInt(file.size) : 0,
                 parent_id: dbParentId, 
                 is_folder: displayMime === 'application/vnd.google-apps.folder',
-                created_at: shortcut.createdTime || new Date().toISOString(),
-                updated_at: new Date().toISOString()
+                created_at: shortcut.createdTime || new Date(),
+                updated_at: new Date() // Importante: updated_at é usado pelo Ghost Killer
             };
 
             recordsToInsert.push(newRecord);
             successCount++;
         } catch (e) {
-            console.error(`❌ [DEBUG] Erro ao criar atalho para ${file.name}:`, e.message);
-            if (e.response) console.error('Response data:', e.response.data);
+            console.error(`Erro ao importar ${file.name}:`, e.message);
         }
     }
 
     if (recordsToInsert.length > 0) {
-        console.log(`🔍 [DEBUG] Tentando inserir ${recordsToInsert.length} registros no Supabase...`);
-        const { error, data } = await supabase.from('drive_cache').upsert(recordsToInsert, { onConflict: 'company_id, google_id' }).select();
-        
-        if (error) {
-            console.error(`❌ [DEBUG] ERRO CRÍTICO AO SALVAR NO BANCO:`, error);
-        } else {
-            console.log(`✅ [DEBUG] Salvo no banco com sucesso. Registros retornados:`, data?.length);
-        }
-    } else {
-        console.warn(`⚠️ [DEBUG] Nada para salvar no banco.`);
+        await supabase.from('drive_cache').upsert(recordsToInsert, { onConflict: 'company_id, google_id' });
     }
 
     return successCount;
@@ -220,7 +203,6 @@ export const emptyTrash = async (companyId) => {
 };
 
 export const syncDriveFiles = async (companyId, folderId = null, isTrash = false) => {
-    // console.log(`🔄 [SYNC] Iniciando. Folder: ${folderId}, Trash: ${isTrash}`);
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
@@ -273,8 +255,9 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
         
         const { data: dbFiles } = await dbQuery;
         
-        // PERÍODO DE GRAÇA
-        const GRACE_PERIOD_MS = 180000; // 3 minutos
+        // PERÍODO DE GRAÇA (3 minutos)
+        // Evita deletar arquivos recém-criados que o Google ainda não indexou na listagem
+        const GRACE_PERIOD_MS = 180000; 
 
         if (dbFiles) {
             const idsToDelete = dbFiles
@@ -285,16 +268,13 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
                     const lastUpdate = new Date(dbf.updated_at).getTime();
                     const age = Date.now() - lastUpdate;
                     
-                    // Log de diagnóstico para o Fantasma
-                    // console.log(`👻 [GHOST CHECK] File ${dbf.google_id} missing in Google. Age: ${age}ms. Grace: ${GRACE_PERIOD_MS}ms`);
-
-                    // Só deleta se for antigo o suficiente
+                    // Só deleta se não estiver no Google E for antigo o suficiente (> 3min)
                     return age > GRACE_PERIOD_MS;
                 })
                 .map(dbf => dbf.google_id);
 
             if (idsToDelete.length > 0) {
-                console.log(`🧹 [SYNC] Deletando ${idsToDelete.length} arquivos que não existem mais no Google (e passaram do período de graça).`);
+                // console.log(`🧹 [SYNC] Deletando ${idsToDelete.length} arquivos antigos.`);
                 await supabase.from('drive_cache').delete().eq('company_id', companyId).in('google_id', idsToDelete);
             }
         }
