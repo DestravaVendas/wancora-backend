@@ -3,7 +3,7 @@ import express from "express";
 import { 
     connectDrive, callbackDrive, listFiles, syncNow, sendFileToContact, 
     uploadFileToDrive, getQuota, createNewFolder, deleteItems, emptyTrashItems,
-    searchDrive, importDriveFiles, convertDocument
+    searchDrive, importDriveFiles, convertDocument, removeImportedFiles
 } from "../controllers/cloudController.js";
 import { requireAuth } from "../middleware/auth.js";
 import multer from 'multer';
@@ -27,7 +27,8 @@ router.post("/google/sync", syncNow);
 router.post("/google/quota", getQuota);
 router.post("/google/create-folder", createNewFolder);
 router.post("/google/delete", deleteItems);
-router.post("/google/empty-trash", emptyTrashItems); // NOVO
+router.post("/google/remove-import", removeImportedFiles); // NOVO
+router.post("/google/empty-trash", emptyTrashItems);
 router.post("/google/upload", upload.single('file'), uploadFileToDrive);
 router.post("/google/send-to-whatsapp", sendFileToContact);
 
