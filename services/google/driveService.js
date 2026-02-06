@@ -99,7 +99,7 @@ export const importFilesToCache = async (companyId, files, targetParentId = null
                 parent_id: dbParentId, 
                 is_folder: displayMime === 'application/vnd.google-apps.folder',
                 created_at: shortcut.createdTime || new Date(),
-                updated_at: new Date()
+                updated_at: new Date() // CRÍTICO: updated_at recente protege contra o Ghost Killer
             });
 
             successCount++;
@@ -254,22 +254,34 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
             }));
         }
         
-        // --- SYNC (CACHE + GHOST KILLER) ---
+        // --- SYNC (CACHE + GHOST KILLER INTELIGENTE) ---
         const liveIds = new Set(liveFiles.map(f => f.id));
         
-        let dbQuery = supabase.from('drive_cache').select('google_id').eq('company_id', companyId);
+        let dbQuery = supabase.from('drive_cache').select('google_id, updated_at').eq('company_id', companyId);
         if (actualParentId) dbQuery = dbQuery.eq('parent_id', actualParentId);
         else dbQuery = dbQuery.is('parent_id', null);
         
         const { data: dbFiles } = await dbQuery;
         
-        // Remove Fantasmas
+        // Remove Fantasmas com PERÍODO DE GRAÇA
+        // Se o arquivo foi criado/atualizado nos últimos 2 minutos (120000ms), 
+        // NÃO o delete, mesmo que o Google ainda não o liste.
+        const GRACE_PERIOD_MS = 120000; 
+
         if (dbFiles) {
             const idsToDelete = dbFiles
-                .filter(dbf => !liveIds.has(dbf.google_id))
+                .filter(dbf => {
+                    const isMissingInGoogle = !liveIds.has(dbf.google_id);
+                    const lastUpdate = new Date(dbf.updated_at).getTime();
+                    const isOldEnough = (Date.now() - lastUpdate) > GRACE_PERIOD_MS;
+                    
+                    // Só deleta se não estiver no Google E for antigo o suficiente (não é um upload recente)
+                    return isMissingInGoogle && isOldEnough;
+                })
                 .map(dbf => dbf.google_id);
 
             if (idsToDelete.length > 0) {
+                console.log(`🧹 [SYNC] Removendo ${idsToDelete.length} fantasmas antigos.`);
                 await supabase.from('drive_cache').delete().eq('company_id', companyId).in('google_id', idsToDelete);
             }
         }
