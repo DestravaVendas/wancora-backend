@@ -40,6 +40,7 @@ export const searchLiveFiles = async (companyId, query) => {
     const drive = google.drive({ version: 'v3', auth });
 
     const safeQuery = query.replace(/'/g, "\\'");
+    // Busca arquivos que NÃO estão na lixeira e que contêm o nome
     const q = `name contains '${safeQuery}' and trashed = false`;
     
     const res = await drive.files.list({
@@ -51,15 +52,13 @@ export const searchLiveFiles = async (companyId, query) => {
     return res.data.files || [];
 };
 
-// --- IMPORTAÇÃO (CRIAÇÃO DE ATALHOS + INSERT IMEDIATO) ---
+// --- IMPORTAÇÃO ( REFERÊNCIA VIRTUAL ) ---
+// Agora APENAS salva no banco. Não cria atalho no Google Drive.
 export const importFilesToCache = async (companyId, files, targetParentId = null) => {
     if (!files || files.length === 0) return 0;
 
-    const auth = await getAuthenticatedClient(companyId);
-    const drive = google.drive({ version: 'v3', auth });
-    
-    const googleParentId = (targetParentId === 'null' || !targetParentId) ? 'root' : targetParentId;
-    // IMPORTANTE: Se for root, dbParentId DEVE ser null para bater com a query de listagem
+    // Resolve o parent_id para o banco de dados
+    // Se targetParentId for 'null' string, null object ou undefined, vira NULL no banco (Raiz do Wancora)
     const dbParentId = (targetParentId === 'null' || !targetParentId) ? null : targetParentId;
 
     let successCount = 0;
@@ -67,47 +66,39 @@ export const importFilesToCache = async (companyId, files, targetParentId = null
 
     for (const file of files) {
         try {
-            // Cria o ATALHO no Google Drive
-            const res = await drive.files.create({
-                resource: {
-                    name: file.name,
-                    mimeType: 'application/vnd.google-apps.shortcut',
-                    parents: [googleParentId],
-                    shortcutDetails: {
-                        targetId: file.id 
-                    }
-                },
-                fields: 'id, name, mimeType, webViewLink, thumbnailLink, size, createdTime, shortcutDetails'
-            });
-
-            const shortcut = res.data;
-
-            // Determina o MIME type real para exibição
-            const displayMime = shortcut.shortcutDetails?.targetMimeType || shortcut.mimeType;
-
+            // Prepara o registro para o banco Wancora
+            // Usamos o ID real do arquivo do Google.
             const newRecord = {
                 company_id: companyId,
-                google_id: shortcut.id, // ID do ATALHO
-                name: shortcut.name,
-                mime_type: displayMime,
-                web_view_link: shortcut.webViewLink,
+                google_id: file.id, // ID Original
+                name: file.name,
+                mime_type: file.mimeType,
+                web_view_link: file.webViewLink,
                 thumbnail_link: file.thumbnailLink || null,
                 size: file.size ? parseInt(file.size) : 0,
-                parent_id: dbParentId, 
-                is_folder: displayMime === 'application/vnd.google-apps.folder',
-                created_at: shortcut.createdTime || new Date(),
-                updated_at: new Date() // Importante: updated_at é usado pelo Ghost Killer
+                parent_id: dbParentId, // Coloca na pasta atual do Wancora (Virtualmente)
+                is_folder: file.mimeType === 'application/vnd.google-apps.folder',
+                created_at: file.createdTime || new Date(),
+                updated_at: new Date() 
             };
 
             recordsToInsert.push(newRecord);
             successCount++;
         } catch (e) {
-            console.error(`Erro ao importar ${file.name}:`, e.message);
+            console.error(`Erro ao preparar importação de ${file.name}:`, e.message);
         }
     }
 
     if (recordsToInsert.length > 0) {
-        await supabase.from('drive_cache').upsert(recordsToInsert, { onConflict: 'company_id, google_id' });
+        // Upsert: Se já existir (mesmo ID na mesma empresa), atualiza a pasta (move virtualmente)
+        // Isso previne duplicatas de 5 cópias. O arquivo só pode estar em um lugar no Wancora por vez.
+        const { error } = await supabase.from('drive_cache').upsert(recordsToInsert, { 
+            onConflict: 'company_id, google_id' 
+        });
+
+        if (error) {
+            console.error("Erro ao salvar no banco:", error.message);
+        }
     }
 
     return successCount;
@@ -117,45 +108,44 @@ export const createFolder = async (companyId, name, parentId = null) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
-    let q = `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false`;
-    if (parentId) q += ` and '${parentId}' in parents`;
-    else q += ` and 'root' in parents`;
-
-    const existing = await drive.files.list({ q, fields: 'files(id, name, webViewLink, mimeType, createdTime)' });
+    // Se tiver parentId no Wancora, precisamos saber qual é o ID real no Google.
+    // Mas como estamos trabalhando com estrutura virtual, é mais seguro criar na Raiz do Google
+    // ou tentar achar a pasta pai se ela também estiver sincronizada.
+    // Simplificação: Cria na raiz do Google, mas organiza visualmente no Wancora.
+    // Para consistência total, o ideal é criar na raiz do Google Drive para não perder o arquivo.
     
-    if (existing.data.files.length > 0) {
-        const folder = existing.data.files[0];
-        await supabase.from('drive_cache').upsert({
-            company_id: companyId,
-            google_id: folder.id,
-            name: folder.name,
-            mime_type: 'application/vnd.google-apps.folder',
-            web_view_link: folder.webViewLink,
-            parent_id: parentId,
-            is_folder: true,
-            updated_at: new Date()
-        }, { onConflict: 'company_id, google_id' });
-        return folder;
-    }
-
     const fileMetadata = {
         name: name,
         mimeType: 'application/vnd.google-apps.folder',
-        parents: parentId ? [parentId] : []
+        // Se quiséssemos criar dentro de outra pasta no Google, precisaríamos do google_id do pai.
+        // Por segurança, criamos na raiz ou na pasta pai se fornecida e válida.
+        parents: parentId ? [parentId] : [] 
     };
 
-    const res = await drive.files.create({
-        resource: fileMetadata,
-        fields: 'id, name, webViewLink, mimeType, createdTime'
-    });
+    // Tenta criar
+    let res;
+    try {
+        res = await drive.files.create({
+            resource: fileMetadata,
+            fields: 'id, name, webViewLink, mimeType, createdTime'
+        });
+    } catch (e) {
+        // Se falhar (ex: parentId não existe no google), cria na raiz
+        delete fileMetadata.parents;
+        res = await drive.files.create({
+            resource: fileMetadata,
+            fields: 'id, name, webViewLink, mimeType, createdTime'
+        });
+    }
 
+    // Salva no Banco Wancora na pasta correta
     await supabase.from('drive_cache').insert({
         company_id: companyId,
         google_id: res.data.id,
         name: res.data.name,
         mime_type: res.data.mimeType,
         web_view_link: res.data.webViewLink,
-        parent_id: parentId,
+        parent_id: parentId, // Mantém a hierarquia visual do Wancora
         is_folder: true,
         created_at: res.data.createdTime || new Date(),
         updated_at: new Date()
@@ -203,109 +193,37 @@ export const emptyTrash = async (companyId) => {
 };
 
 export const syncDriveFiles = async (companyId, folderId = null, isTrash = false) => {
-    const auth = await getAuthenticatedClient(companyId);
-    const drive = google.drive({ version: 'v3', auth });
-
-    let q = "";
-    let actualParentId = folderId;
-
+    // Apenas retorna o que está no banco para evitar sobrescrever a estrutura virtual
+    // com a estrutura real do Google (que pode ser diferente).
+    // O Sync com a API do Google só deve ocorrer se explicitamente solicitado ou para atualizar metadados (tamanho/nome),
+    // mas NÃO para deletar arquivos que não estão na pasta exata do Google.
+    
     if (isTrash) {
-        const trashFolderId = await getOrCreateWancoraTrashFolder(drive);
-        q = `'${trashFolderId}' in parents and trashed = false`;
-    } else {
-        q = "trashed = false";
-        if (folderId) {
-            q += ` and '${folderId}' in parents`;
-        } else {
-             q += ` and 'root' in parents`; 
-        }
-    }
-
-    try {
-        const res = await drive.files.list({
+         // Para lixeira, sempre consultamos a API ao vivo
+         const auth = await getAuthenticatedClient(companyId);
+         const drive = google.drive({ version: 'v3', auth });
+         const trashFolderId = await getOrCreateWancoraTrashFolder(drive);
+         const q = `'${trashFolderId}' in parents and trashed = false`;
+         
+         const res = await drive.files.list({
             q: q,
-            fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, parents, createdTime, modifiedTime, trashed, shortcutDetails)',
+            fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, parents, createdTime, modifiedTime)',
             orderBy: 'folder,name',
-            pageSize: 1000 
+            pageSize: 100
         });
-
-        const liveFiles = res.data.files || [];
         
-        if (isTrash) {
-             return liveFiles.map(f => ({
-                id: f.id, 
-                google_id: f.id,
-                name: f.name,
-                mime_type: f.shortcutDetails?.targetMimeType || f.mimeType,
-                web_view_link: f.webViewLink,
-                thumbnail_link: f.thumbnailLink,
-                size: f.size ? parseInt(f.size) : 0,
-                is_folder: (f.shortcutDetails?.targetMimeType || f.mimeType) === 'application/vnd.google-apps.folder',
-                created_at: f.createdTime,
-                updated_at: f.modifiedTime
-            }));
-        }
-        
-        // --- SYNC (CACHE + GHOST KILLER INTELIGENTE) ---
-        const liveIds = new Set(liveFiles.map(f => f.id));
-        
-        let dbQuery = supabase.from('drive_cache').select('google_id, updated_at').eq('company_id', companyId);
-        if (actualParentId) dbQuery = dbQuery.eq('parent_id', actualParentId);
-        else dbQuery = dbQuery.is('parent_id', null);
-        
-        const { data: dbFiles } = await dbQuery;
-        
-        // PERÍODO DE GRAÇA (3 minutos)
-        // Evita deletar arquivos recém-criados que o Google ainda não indexou na listagem
-        const GRACE_PERIOD_MS = 180000; 
-
-        if (dbFiles) {
-            const idsToDelete = dbFiles
-                .filter(dbf => {
-                    const isMissingInGoogle = !liveIds.has(dbf.google_id);
-                    if (!isMissingInGoogle) return false;
-
-                    const lastUpdate = new Date(dbf.updated_at).getTime();
-                    const age = Date.now() - lastUpdate;
-                    
-                    // Só deleta se não estiver no Google E for antigo o suficiente (> 3min)
-                    return age > GRACE_PERIOD_MS;
-                })
-                .map(dbf => dbf.google_id);
-
-            if (idsToDelete.length > 0) {
-                // console.log(`🧹 [SYNC] Deletando ${idsToDelete.length} arquivos antigos.`);
-                await supabase.from('drive_cache').delete().eq('company_id', companyId).in('google_id', idsToDelete);
-            }
-        }
-
-        // Upsert Vivos
-        if (liveFiles.length > 0) {
-            const rows = liveFiles.map(f => {
-                const displayMime = f.shortcutDetails?.targetMimeType || f.mimeType;
-                return {
-                    company_id: companyId,
-                    google_id: f.id,
-                    name: f.name,
-                    mime_type: displayMime,
-                    web_view_link: f.webViewLink,
-                    thumbnail_link: f.thumbnailLink,
-                    size: f.size ? parseInt(f.size) : 0,
-                    parent_id: actualParentId,
-                    is_folder: displayMime === 'application/vnd.google-apps.folder',
-                    created_at: f.createdTime,
-                    updated_at: new Date()
-                };
-            });
-            await supabase.from('drive_cache').upsert(rows, { onConflict: 'company_id, google_id' });
-        }
-        
-        return liveFiles;
-
-    } catch (e) {
-        console.error("❌ [SYNC ERROR]", e);
-        return [];
+        return res.data.files || [];
     }
+
+    // Para pastas normais, confiamos no banco de dados (Cache Virtual)
+    // O "Sync" real (Ghost Killer) é perigoso aqui porque estamos misturando arquivos de várias pastas do Google
+    // em uma pasta virtual do Wancora.
+    
+    // Então, retornamos vazio aqui e deixamos o controller ler do banco.
+    // Se precisar atualizar metadados, faríamos um check individual, mas por agora, 
+    // removemos a lógica de deletar coisas do banco baseado na listagem do Google.
+    
+    return []; 
 };
 
 export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId = null) => {
@@ -316,6 +234,7 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
     stream.push(buffer);
     stream.push(null);
 
+    // Upload na raiz do Google ou na pasta específica se soubermos o ID
     const fileMetadata = {
         name: fileName,
         parents: folderId ? [folderId] : []
@@ -326,11 +245,22 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
         body: stream
     };
 
-    const res = await drive.files.create({
-        resource: fileMetadata,
-        media: media,
-        fields: 'id, name, webViewLink, mimeType, thumbnailLink, size, createdTime'
-    });
+    let res;
+    try {
+        res = await drive.files.create({
+            resource: fileMetadata,
+            media: media,
+            fields: 'id, name, webViewLink, mimeType, thumbnailLink, size, createdTime'
+        });
+    } catch (e) {
+        // Fallback para raiz
+        delete fileMetadata.parents;
+        res = await drive.files.create({
+            resource: fileMetadata,
+            media: media,
+            fields: 'id, name, webViewLink, mimeType, thumbnailLink, size, createdTime'
+        });
+    }
     
     await supabase.from('drive_cache').insert({
         company_id: companyId,
