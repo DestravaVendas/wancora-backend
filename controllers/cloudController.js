@@ -1,6 +1,6 @@
 
 import { generateAuthUrl, handleAuthCallback } from "../services/google/authService.js";
-import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteFiles, searchLiveFiles, importFilesToCache, convertDocxToHtml, emptyTrash, removeFilesFromCache } from "../services/google/driveService.js";
+import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteItems, searchLiveFiles, importFilesToCache, convertDocxToHtml, emptyTrash, removeFilesFromCache, getFileBuffer } from "../services/google/driveService.js";
 import { sendMessage } from "../services/baileys/sender.js";
 import { getSessionId } from "./whatsappController.js";
 import { createClient } from "@supabase/supabase-js";
@@ -112,6 +112,32 @@ export const convertDocument = async (req, res) => {
         res.json({ success: true, ...result });
     } catch (e) {
         console.error("Erro conversão:", e);
+        res.status(500).json({ error: e.message });
+    }
+};
+
+// NOVO: Baixa conteúdo para o Frontend (Excel/Sheet)
+export const downloadFileContent = async (req, res) => {
+    const { companyId, fileId } = req.body;
+    try {
+        // Reutiliza getFileBuffer que já trata conversão de Google Sheets para XLSX
+        const fileData = await getFileBuffer(companyId, fileId);
+        
+        if (fileData.isLargeFile) {
+            return res.status(400).json({ error: "Arquivo muito grande para edição online." });
+        }
+
+        // Retorna como base64 para facilitar o transporte via JSON
+        const base64 = fileData.buffer.toString('base64');
+        
+        res.json({ 
+            success: true, 
+            base64, 
+            filename: fileData.fileName,
+            mimeType: fileData.mimeType 
+        });
+    } catch (e) {
+        console.error("Erro download content:", e);
         res.status(500).json({ error: e.message });
     }
 };
