@@ -53,64 +53,78 @@ export const searchLiveFiles = async (companyId, query) => {
 
 // --- IMPORTAÇÃO (CRIAÇÃO DE ATALHOS + INSERT IMEDIATO) ---
 export const importFilesToCache = async (companyId, files, targetParentId = null) => {
+    console.log(`🔍 [DEBUG] Iniciando importFilesToCache. TargetParent: ${targetParentId}, Arquivos: ${files?.length}`);
+
     if (!files || files.length === 0) return 0;
 
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
     
-    // Se targetParentId for 'null' string ou undefined, usa root.
-    // Mas para o banco (drive_cache), se for root, o parent_id deve ser NULL.
     const googleParentId = (targetParentId === 'null' || !targetParentId) ? 'root' : targetParentId;
+    // IMPORTANTE: Se for root, dbParentId DEVE ser null para bater com a query de listagem
     const dbParentId = (targetParentId === 'null' || !targetParentId) ? null : targetParentId;
+
+    console.log(`🔍 [DEBUG] Parent ID resolvido -> Google: ${googleParentId}, DB: ${dbParentId}`);
 
     let successCount = 0;
     const recordsToInsert = [];
 
     for (const file of files) {
         try {
-            // Cria o ATALHO no Google Drive e PEGA OS DADOS DELE IMEDIATAMENTE
+            console.log(`🔍 [DEBUG] Criando atalho para: ${file.name} (${file.id})`);
+            
+            // Cria o ATALHO no Google Drive
             const res = await drive.files.create({
                 resource: {
                     name: file.name,
                     mimeType: 'application/vnd.google-apps.shortcut',
                     parents: [googleParentId],
                     shortcutDetails: {
-                        targetId: file.id // Aponta para o arquivo original
+                        targetId: file.id 
                     }
                 },
                 fields: 'id, name, mimeType, webViewLink, thumbnailLink, size, createdTime, shortcutDetails'
             });
 
             const shortcut = res.data;
+            console.log(`✅ [DEBUG] Atalho criado no Google. ID: ${shortcut.id}`);
 
-            // Determina o MIME type real para exibição (ícone correto)
-            // Se for atalho, tentamos usar o targetMimeType para a UI ficar bonita
+            // Determina o MIME type real para exibição
             const displayMime = shortcut.shortcutDetails?.targetMimeType || shortcut.mimeType;
 
-            // Prepara registro para o banco
-            recordsToInsert.push({
+            const newRecord = {
                 company_id: companyId,
-                google_id: shortcut.id, // Salva o ID do ATALHO, não do original (para unicidade)
+                google_id: shortcut.id, // ID do ATALHO
                 name: shortcut.name,
                 mime_type: displayMime,
                 web_view_link: shortcut.webViewLink,
-                thumbnail_link: file.thumbnailLink || null, // Tenta usar thumb do original se o atalho não tiver
+                thumbnail_link: file.thumbnailLink || null,
                 size: file.size ? parseInt(file.size) : 0,
                 parent_id: dbParentId, 
                 is_folder: displayMime === 'application/vnd.google-apps.folder',
-                created_at: shortcut.createdTime || new Date(),
-                updated_at: new Date() // CRÍTICO: updated_at recente protege contra o Ghost Killer
-            });
+                created_at: shortcut.createdTime || new Date().toISOString(),
+                updated_at: new Date().toISOString()
+            };
 
+            recordsToInsert.push(newRecord);
             successCount++;
         } catch (e) {
-            console.error(`Erro ao importar ${file.name}:`, e.message);
+            console.error(`❌ [DEBUG] Erro ao criar atalho para ${file.name}:`, e.message);
+            if (e.response) console.error('Response data:', e.response.data);
         }
     }
 
-    // SALVA NO BANCO IMEDIATAMENTE (Sem esperar Sync)
     if (recordsToInsert.length > 0) {
-        await supabase.from('drive_cache').upsert(recordsToInsert, { onConflict: 'company_id, google_id' });
+        console.log(`🔍 [DEBUG] Tentando inserir ${recordsToInsert.length} registros no Supabase...`);
+        const { error, data } = await supabase.from('drive_cache').upsert(recordsToInsert, { onConflict: 'company_id, google_id' }).select();
+        
+        if (error) {
+            console.error(`❌ [DEBUG] ERRO CRÍTICO AO SALVAR NO BANCO:`, error);
+        } else {
+            console.log(`✅ [DEBUG] Salvo no banco com sucesso. Registros retornados:`, data?.length);
+        }
+    } else {
+        console.warn(`⚠️ [DEBUG] Nada para salvar no banco.`);
     }
 
     return successCount;
@@ -120,7 +134,6 @@ export const createFolder = async (companyId, name, parentId = null) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
-    // Verifica se já existe para evitar duplicatas visuais
     let q = `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false`;
     if (parentId) q += ` and '${parentId}' in parents`;
     else q += ` and 'root' in parents`;
@@ -153,7 +166,6 @@ export const createFolder = async (companyId, name, parentId = null) => {
         fields: 'id, name, webViewLink, mimeType, createdTime'
     });
 
-    // Insert Imediato
     await supabase.from('drive_cache').insert({
         company_id: companyId,
         google_id: res.data.id,
@@ -189,7 +201,6 @@ export const deleteFiles = async (companyId, fileIds) => {
     return { success: true };
 };
 
-// --- ESVAZIAR LIXEIRA ---
 export const emptyTrash = async (companyId) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
@@ -208,8 +219,8 @@ export const emptyTrash = async (companyId) => {
     return { success: true };
 };
 
-// --- SYNC PRINCIPAL ---
 export const syncDriveFiles = async (companyId, folderId = null, isTrash = false) => {
+    // console.log(`🔄 [SYNC] Iniciando. Folder: ${folderId}, Trash: ${isTrash}`);
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
 
@@ -231,7 +242,6 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
     try {
         const res = await drive.files.list({
             q: q,
-            // Importante: Pedir shortcutDetails para resolver o tipo real
             fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, parents, createdTime, modifiedTime, trashed, shortcutDetails)',
             orderBy: 'folder,name',
             pageSize: 1000 
@@ -244,7 +254,7 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
                 id: f.id, 
                 google_id: f.id,
                 name: f.name,
-                mime_type: f.shortcutDetails?.targetMimeType || f.mimeType, // Resolve tipo real se for atalho
+                mime_type: f.shortcutDetails?.targetMimeType || f.mimeType,
                 web_view_link: f.webViewLink,
                 thumbnail_link: f.thumbnailLink,
                 size: f.size ? parseInt(f.size) : 0,
@@ -263,25 +273,28 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
         
         const { data: dbFiles } = await dbQuery;
         
-        // Remove Fantasmas com PERÍODO DE GRAÇA
-        // Se o arquivo foi criado/atualizado nos últimos 2 minutos (120000ms), 
-        // NÃO o delete, mesmo que o Google ainda não o liste.
-        const GRACE_PERIOD_MS = 120000; 
+        // PERÍODO DE GRAÇA
+        const GRACE_PERIOD_MS = 180000; // 3 minutos
 
         if (dbFiles) {
             const idsToDelete = dbFiles
                 .filter(dbf => {
                     const isMissingInGoogle = !liveIds.has(dbf.google_id);
+                    if (!isMissingInGoogle) return false;
+
                     const lastUpdate = new Date(dbf.updated_at).getTime();
-                    const isOldEnough = (Date.now() - lastUpdate) > GRACE_PERIOD_MS;
+                    const age = Date.now() - lastUpdate;
                     
-                    // Só deleta se não estiver no Google E for antigo o suficiente (não é um upload recente)
-                    return isMissingInGoogle && isOldEnough;
+                    // Log de diagnóstico para o Fantasma
+                    // console.log(`👻 [GHOST CHECK] File ${dbf.google_id} missing in Google. Age: ${age}ms. Grace: ${GRACE_PERIOD_MS}ms`);
+
+                    // Só deleta se for antigo o suficiente
+                    return age > GRACE_PERIOD_MS;
                 })
                 .map(dbf => dbf.google_id);
 
             if (idsToDelete.length > 0) {
-                console.log(`🧹 [SYNC] Removendo ${idsToDelete.length} fantasmas antigos.`);
+                console.log(`🧹 [SYNC] Deletando ${idsToDelete.length} arquivos que não existem mais no Google (e passaram do período de graça).`);
                 await supabase.from('drive_cache').delete().eq('company_id', companyId).in('google_id', idsToDelete);
             }
         }
@@ -289,9 +302,7 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
         // Upsert Vivos
         if (liveFiles.length > 0) {
             const rows = liveFiles.map(f => {
-                // Mapeia para o tipo real se for atalho, para ícone correto
                 const displayMime = f.shortcutDetails?.targetMimeType || f.mimeType;
-
                 return {
                     company_id: companyId,
                     google_id: f.id,
@@ -312,7 +323,7 @@ export const syncDriveFiles = async (companyId, folderId = null, isTrash = false
         return liveFiles;
 
     } catch (e) {
-        console.error("Erro syncDriveFiles:", e);
+        console.error("❌ [SYNC ERROR]", e);
         return [];
     }
 };
@@ -358,7 +369,7 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
     return res.data;
 };
 
-// ... (Resto das funções getFileStream, getFileBuffer, convertDocxToHtml mantidas iguais)
+// ... Resto das funções
 export const getFileStream = async (companyId, fileId) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
