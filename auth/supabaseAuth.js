@@ -33,9 +33,13 @@ export const useSupabaseAuthState = async (sessionId) => {
                 console.error(`[AUTH] Erro ao buscar credenciais para ${sessionId}:`, error.message);
                 return null;
             }
+
+            if (!data?.payload) return null;
             
-            // Aplica o fixBuffer imediatamente após o parse
-            return data?.payload ? fixBuffer(JSON.parse(data.payload)) : null;
+            // Trata se o payload já vier como Objeto (JSONB) ou String
+            const parsed = typeof data.payload === 'string' ? JSON.parse(data.payload) : data.payload;
+            
+            return fixBuffer(parsed);
         } catch (e) {
             console.error('[AUTH] Exceção crítica ao ler credenciais:', e);
             return null;
@@ -60,8 +64,9 @@ export const useSupabaseAuthState = async (sessionId) => {
 
                         const result = {};
                         data?.forEach(row => {
-                            // Vital: Converter string JSON -> Objeto com Buffers
-                            result[row.key_id] = fixBuffer(JSON.parse(row.payload));
+                            // Vital: Tratar JSONB vs String
+                            const parsed = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+                            result[row.key_id] = fixBuffer(parsed);
                         });
                         return result;
                     } catch (e) {
