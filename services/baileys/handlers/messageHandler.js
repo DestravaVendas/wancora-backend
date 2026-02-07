@@ -23,6 +23,21 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const unwrapped = unwrapMessage(msg);
         let jid = normalizeJid(unwrapped.key.remoteJid);
         
+        // --- FILTRAGEM TÉCNICA (AUDITORIA) ---
+        // Identifica o tipo real do conteúdo
+        const type = getContentType(unwrapped.message);
+        
+        // Ignora tipos que são eventos e não mensagens visuais
+        if (!type || 
+            type === 'protocolMessage' || 
+            type === 'senderKeyDistributionMessage' || 
+            type === 'messageContextInfo' ||
+            type === 'reactionMessage' ||  // Reações devem ir para handleReaction (se chegarem aqui)
+            type === 'pollUpdateMessage'   // Votos devem ir para handleMessageUpdate
+        ) {
+            return;
+        }
+
         const isGroup = jid.includes('@g.us');
         // Identifica quem mandou no grupo. Se DM, é o próprio JID ou undefined
         const participantJid = isGroup && unwrapped.key.participant ? normalizeJid(unwrapped.key.participant) : null;
@@ -30,8 +45,11 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const fromMe = unwrapped.key.fromMe;
         const pushName = forcedName || unwrapped.pushName;
         
-        const type = getContentType(unwrapped.message);
         const body = getBody(unwrapped.message);
+        
+        // Se body for null e não for mídia, ignora (evita balões vazios de tipos desconhecidos)
+        const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
+        if (!body && !isMedia && type !== 'stickerMessage') return;
 
         // LID RESOLVER
         if (jid.includes('@lid')) {
@@ -70,8 +88,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         // Mídia
         let mediaUrl = null;
-        const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
-
+        
         if (isMedia && (isRealtime || downloadMedia)) {
             mediaUrl = await handleMediaUpload(unwrapped, companyId);
         }
@@ -101,7 +118,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             media_url: mediaUrl,
             status: fromMe ? 'sent' : 'delivered',
             created_at: new Date( (unwrapped.messageTimestamp || Date.now() / 1000) * 1000 ),
-            participant: participantJid, // [NOVO] Salva quem mandou no grupo
+            participant: participantJid, 
             lead_id: isGroup ? null : undefined 
         };
         
@@ -112,7 +129,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
              if (lead) messageData.lead_id = lead.id;
         }
 
-        // Parsers Especiais
+        // Parsers Especiais (Salva JSON)
         if (type === 'pollCreationMessage' || type === 'pollCreationMessageV3') {
             const poll = unwrapped.message[type];
             messageData.message_type = 'poll';
