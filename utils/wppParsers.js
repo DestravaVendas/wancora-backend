@@ -55,7 +55,7 @@ export const unwrapMessage = (msg) => {
 
 // Extrai o texto legível de qualquer tipo de mensagem
 export const getBody = (msg) => {
-    if (!msg) return '';
+    if (!msg) return null; // Retorna null em vez de string vazia para facilitar filtragem
     
     // Texto Puro
     if (msg.conversation) return msg.conversation;
@@ -66,7 +66,7 @@ export const getBody = (msg) => {
     if (msg.videoMessage?.caption) return msg.videoMessage.caption;
     if (msg.documentMessage?.caption) return msg.documentMessage.caption;
     
-    // Enquetes
+    // Enquetes (Criação)
     if (msg.pollCreationMessageV3) return msg.pollCreationMessageV3.name;
     if (msg.pollCreationMessage) return msg.pollCreationMessage.name;
     
@@ -85,14 +85,20 @@ export const getBody = (msg) => {
     // Sticker
     if (msg.stickerMessage) return "Figurinha";
 
-    if (msg.protocolMessage) return ''; // Ignora mensagens de protocolo (ex: delete)
-    
-    return ''; 
+    // --- TIPOS TÉCNICOS QUE NÃO DEVEM VIRAR MENSAGEM ---
+    if (msg.protocolMessage) return null; // Delete, History Sync, etc
+    if (msg.reactionMessage) return null; // Reação não é texto
+    if (msg.pollUpdateMessage) return null; // Voto não é texto
+    if (msg.keepInChatMessage) return null; 
+    if (msg.pinInChatMessage) return null;
+
+    return null; 
 };
 
 export const getContentType = (message) => {
     if (!message) return null;
     const keys = Object.keys(message);
-    const key = keys.find(k => k === 'conversation' || k.endsWith('Message'));
+    // Ignora chaves de metadados
+    const key = keys.find(k => k !== 'messageContextInfo' && k !== 'senderKeyDistributionMessage' && (k === 'conversation' || k.endsWith('Message')));
     return key;
 };
