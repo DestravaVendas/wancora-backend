@@ -116,7 +116,6 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         try {
             // Tenta parsear caso esteja salvo como string
             if (typeof pollMsg.content === 'string') {
-                // Remove prefixos estranhos se houver
                 const cleanJson = pollMsg.content.trim();
                 pollContent = JSON.parse(cleanJson);
             } else {
@@ -127,8 +126,9 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error("Conteúdo da enquete corrompido ou formato inválido."); 
         }
 
+        console.log("🔍 [POLL DEBUG] Conteúdo RAW:", JSON.stringify(pollContent));
+
         // Lógica Robusta de Extração de Opções
-        // Suporta tanto o formato do Baileys { optionName: 'X' } quanto simplificado ['X']
         let optionsList = [];
         
         if (pollContent.pollCreationMessageV3) {
@@ -141,6 +141,8 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             optionsList = pollContent.values;
         }
 
+        console.log("🔍 [POLL DEBUG] Opções extraídas:", optionsList);
+
         const selectedOptionText = optionsList[optionId];
         
         if (!selectedOptionText) {
@@ -148,10 +150,11 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error(`Opção inválida: Index ${optionId} não existe na enquete.`);
         }
 
+        console.log(`🗳️ [POLL DEBUG] Votando em: "${selectedOptionText}"`);
+
         const chatJid = normalizeJid(remoteJid);
         
         // ENVIO DO VOTO
-        // Nota: A chave 'selectableCount' não é necessária no voto, apenas na criação.
         await session.sock.sendMessage(chatJid, {
             poll: {
                 vote: {
@@ -175,7 +178,7 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
 
         return { success: true };
     } catch (error) {
-        console.error(`[Controller] Erro ao votar:`, error.message);
+        console.error(`❌ [Controller] Erro ao votar:`, error.message);
         throw error;
     }
 };
