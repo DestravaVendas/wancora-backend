@@ -71,6 +71,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 const bestName = c.name || c.notify || c.verifiedName;
                 const isFromBook = !!(c.name && c.name.trim().length > 0);
 
+                // Armazena em memória para uso imediato nas mensagens abaixo
                 contactsMap.set(jid, { name: bestName, isFromBook: isFromBook });
 
                 const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
@@ -111,6 +112,13 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 await upsertContactsBulk(batch);
             }
             
+            // CORRIDA CONDICIONAL RESOLVIDA:
+            // Dá tempo para o banco indexar os nomes antes de criar Leads baseados nas mensagens
+            if (bulkPayload.length > 0) {
+                console.log('⏳ [SYNC] Estabilizando banco de dados (2s)...');
+                await sleep(2000);
+            }
+            
             // Background Fetch
             if (contactsToFetchPic.length > 0) {
                 fetchProfilePicsInBackground(sock, contactsToFetchPic, companyId);
@@ -140,6 +148,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 if (!chats[jid]) chats[jid] = [];
                 
                 // Name Injection (Recupera nome da agenda processada acima)
+                // Isso garante que o Lead seja criado com o nome correto MESMO se o banco estiver lento
                 const knownContact = contactsMap.get(jid);
                 if (knownContact && knownContact.isFromBook) {
                     clean._forcedName = knownContact.name;
