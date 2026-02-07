@@ -32,22 +32,19 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             type === 'protocolMessage' || 
             type === 'senderKeyDistributionMessage' || 
             type === 'messageContextInfo' ||
-            type === 'reactionMessage' ||  // Reações devem ir para handleReaction (se chegarem aqui)
-            type === 'pollUpdateMessage'   // Votos devem ir para handleMessageUpdate
+            type === 'reactionMessage' ||  
+            type === 'pollUpdateMessage'   
         ) {
             return;
         }
 
         const isGroup = jid.includes('@g.us');
-        // Identifica quem mandou no grupo. Se DM, é o próprio JID ou undefined
         const participantJid = isGroup && unwrapped.key.participant ? normalizeJid(unwrapped.key.participant) : null;
         
         const fromMe = unwrapped.key.fromMe;
         const pushName = forcedName || unwrapped.pushName;
         
         const body = getBody(unwrapped.message);
-        
-        // Se body for null e não for mídia, ignora (evita balões vazios de tipos desconhecidos)
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         if (!body && !isMedia && type !== 'stickerMessage') return;
 
@@ -57,38 +54,31 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             if (mapping?.phone_jid) jid = mapping.phone_jid; 
         }
 
-        // --- GHOST CHAT PREVENTION & GROUP MEMBER SYNC ---
-        // Se for grupo, salvamos o remetente como contato (para ter nome/foto), mas NÃO como Lead.
+        // --- GHOST CHAT PREVENTION ---
         if (isGroup && participantJid && !fromMe) {
-            // Atualiza push_name do participante no banco (sem criar lead)
             if (pushName) {
                await upsertContact(participantJid, companyId, null, null, false, null, false, null, { push_name: pushName });
             }
             if (isRealtime && fetchProfilePic) {
-                // Background refresh da foto do participante
                 refreshContactInfo(sock, participantJid, companyId, pushName).catch(() => {});
             }
         }
         
-        // --- LEAD GUARD (Apenas DM) ---
+        // --- LEAD GUARD ---
         if (!fromMe && !isGroup) {
             const { data: contact } = await supabase.from('contacts').select('is_ignored').eq('jid', jid).eq('company_id', companyId).maybeSingle();
             if (contact?.is_ignored) return;
 
             const myJid = normalizeJid(sock.user?.id);
             if (isRealtime || createLead) {
-                // Tenta criar o Lead. A função ensureLeadExists já tem proteção interna contra grupos.
                 await ensureLeadExists(jid, companyId, pushName, myJid);
-                
                 if (isRealtime || fetchProfilePic) {
                     refreshContactInfo(sock, jid, companyId, pushName).catch(err => console.error("Refresh Error", err));
                 }
             }
         }
 
-        // Mídia
         let mediaUrl = null;
-        
         if (isMedia && (isRealtime || downloadMedia)) {
             mediaUrl = await handleMediaUpload(unwrapped, companyId);
         }
@@ -106,7 +96,6 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
              } catch (err) {}
         }
 
-        // Payload da Mensagem
         const messageData = {
             company_id: companyId,
             session_id: sessionId,
@@ -122,14 +111,12 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             lead_id: isGroup ? null : undefined 
         };
         
-        // Se for DM, tenta vincular lead_id para exibir no Kanban/Logs
         if (!isGroup && !fromMe) {
              const purePhone = jid.split('@')[0].replace(/\D/g, '');
              const { data: lead } = await supabase.from('leads').select('id').eq('phone', purePhone).eq('company_id', companyId).maybeSingle();
              if (lead) messageData.lead_id = lead.id;
         }
 
-        // Parsers Especiais (Salva JSON)
         if (type === 'pollCreationMessage' || type === 'pollCreationMessageV3') {
             const poll = unwrapped.message[type];
             messageData.message_type = 'poll';
@@ -152,7 +139,6 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         await upsertMessage(messageData);
 
-        // Webhook
         if (isRealtime) {
             const { data: instance } = await supabase.from('instances').select('webhook_url, webhook_enabled, id').eq('session_id', sessionId).single();
             if (instance?.webhook_enabled && instance.webhook_url) {
@@ -166,7 +152,6 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
     }
 };
 
-// ... (handleMessageUpdate, handleReceiptUpdate, handleReaction mantidos iguais)
 export const handleMessageUpdate = async (updates, companyId) => {
     for (const update of updates) {
         if (update.pollUpdates) {
@@ -232,7 +217,7 @@ export const handleReaction = async (reactions, sock, companyId) => {
         const msgId = key.id;
         const participant = key.participant || key.remoteJid;
         const actor = normalizeJid(participant);
-        const emoji = r.text;
+        const emoji = r.text; // Pode ser string vazia para remoção
 
         if (!msgId || !companyId) continue;
 
@@ -245,9 +230,13 @@ export const handleReaction = async (reactions, sock, companyId) => {
 
             if (msg) {
                 let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
+                
+                // Remove reação anterior deste ator
                 currentReactions = currentReactions.filter(rx => rx.actor !== actor);
                 
-                if (emoji) {
+                // Se emoji não for vazio, adiciona a nova reação.
+                // Se for vazio, apenas removemos (já feito no filter acima).
+                if (emoji && emoji !== "") {
                     currentReactions.push({ text: emoji, actor: actor, ts: Date.now() });
                 }
                 
