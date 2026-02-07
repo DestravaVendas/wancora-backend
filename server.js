@@ -20,6 +20,17 @@ import automationRoutes from './routes/automation.routes.js';
 import managementRoutes from './routes/management.routes.js';
 import cloudRoutes from './routes/cloud.routes.js'; 
 
+// --- GESTÃO DE ERROS FATAIS (CRASH PREVENTION) ---
+// Impede que o servidor caia se uma sessão específica falhar na criptografia
+process.on('uncaughtException', (err) => {
+    console.error('🔥 [UNCAUGHT EXCEPTION] Erro crítico capturado:', err);
+    // Não encerra o processo para manter o serviço ativo para outros tenants
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('🔥 [UNHANDLED REJECTION] Promise rejeitada:', reason);
+});
+
 // 🔥 PATCH CRÍTICO: USER-AGENT SPOOFING (INTERCEPTOR) 🔥
 const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 axios.defaults.headers.common['User-Agent'] = userAgent;
@@ -111,7 +122,7 @@ const restoreSessions = async () => {
 const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, () => {
-    console.log(`🚀 Wancora Backend v5.4 (Cloud Module) rodando na porta ${PORT}`);
+    console.log(`🚀 Wancora Backend v5.4.1 (Stability Patch) rodando na porta ${PORT}`);
     console.log(`🔗 Endpoint: http://localhost:${PORT}/api/v1`);
     
     restoreSessions();     
