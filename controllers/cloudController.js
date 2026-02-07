@@ -1,6 +1,6 @@
 
 import { generateAuthUrl, handleAuthCallback } from "../services/google/authService.js";
-import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteFiles, searchLiveFiles, importFilesToCache, convertDocxToHtml, emptyTrash, removeFilesFromCache, getFileBuffer } from "../services/google/driveService.js";
+import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolder, deleteFiles, searchLiveFiles, listRemoteFolder, importFilesToCache, convertDocxToHtml, emptyTrash, removeFilesFromCache, getFileBuffer } from "../services/google/driveService.js";
 import { sendMessage } from "../services/baileys/sender.js";
 import { getSessionId } from "./whatsappController.js";
 import { createClient } from "@supabase/supabase-js";
@@ -87,6 +87,16 @@ export const searchDrive = async (req, res) => {
     if (!query) return res.status(400).json({ error: "Query vazia." });
     try {
         const files = await searchLiveFiles(companyId, query);
+        res.json({ files });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+};
+
+export const listRemoteFiles = async (req, res) => {
+    const { companyId, folderId } = req.body;
+    try {
+        const files = await listRemoteFolder(companyId, folderId);
         res.json({ files });
     } catch (e) {
         res.status(500).json({ error: e.message });
