@@ -114,21 +114,44 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
 
         let pollContent;
         try {
-            pollContent = typeof pollMsg.content === 'string' ? JSON.parse(pollMsg.content) : pollMsg.content;
-        } catch (e) { throw new Error("Conteúdo da enquete corrompido."); }
+            // Tenta parsear caso esteja salvo como string
+            if (typeof pollMsg.content === 'string') {
+                // Remove prefixos estranhos se houver
+                const cleanJson = pollMsg.content.trim();
+                pollContent = JSON.parse(cleanJson);
+            } else {
+                pollContent = pollMsg.content;
+            }
+        } catch (e) { 
+            console.error("Erro parse poll content:", pollMsg.content);
+            throw new Error("Conteúdo da enquete corrompido ou formato inválido."); 
+        }
 
+        // Lógica Robusta de Extração de Opções
+        // Suporta tanto o formato do Baileys { optionName: 'X' } quanto simplificado ['X']
         let optionsList = [];
-        if (Array.isArray(pollContent.options)) {
-            optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
+        
+        if (pollContent.pollCreationMessageV3) {
+            optionsList = pollContent.pollCreationMessageV3.options.map(o => o.optionName);
+        } else if (pollContent.pollCreationMessage) {
+            optionsList = pollContent.pollCreationMessage.options.map(o => o.optionName);
+        } else if (Array.isArray(pollContent.options)) {
+             optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
         } else if (pollContent.values) {
             optionsList = pollContent.values;
         }
 
         const selectedOptionText = optionsList[optionId];
-        if (selectedOptionText === undefined) throw new Error(`Opção inválida: Index ${optionId} não existe.`);
+        
+        if (!selectedOptionText) {
+            console.error("Opções disponíveis:", optionsList, "Index solicitado:", optionId);
+            throw new Error(`Opção inválida: Index ${optionId} não existe na enquete.`);
+        }
 
         const chatJid = normalizeJid(remoteJid);
         
+        // ENVIO DO VOTO
+        // Nota: A chave 'selectableCount' não é necessária no voto, apenas na criação.
         await session.sock.sendMessage(chatJid, {
             poll: {
                 vote: {
@@ -138,9 +161,13 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             }
         });
 
+        // Atualização Otimista no Banco (Para feedback imediato)
         const myJid = normalizeJid(session.sock.user?.id);
+        
         const { data: currentMsg } = await supabase.from('messages').select('poll_votes').eq('whatsapp_id', pollMsg.whatsapp_id).single();
         let votes = currentMsg?.poll_votes || [];
+        
+        // Remove voto anterior do mesmo usuário (se houver) e adiciona o novo
         votes = votes.filter(v => v.voterJid !== myJid);
         votes.push({ voterJid: myJid, ts: Date.now(), selectedOptions: [selectedOptionText] });
 
@@ -161,8 +188,11 @@ export const sendReaction = async (sessionId, companyId, remoteJid, msgId, react
         const { data: targetMsg } = await supabase.from('messages').select('whatsapp_id, from_me').eq('id', msgId).single();
         if (!targetMsg) throw new Error("Mensagem alvo não encontrada.");
 
+        // Se reaction for vazia, envia string vazia para remover
+        const text = reaction || "";
+
         const key = { remoteJid: normalizeJid(remoteJid), id: targetMsg.whatsapp_id, fromMe: targetMsg.from_me };
-        await session.sock.sendMessage(normalizeJid(remoteJid), { react: { text: reaction, key: key } });
+        await session.sock.sendMessage(normalizeJid(remoteJid), { react: { text: text, key: key } });
         return { success: true };
     } catch (error) {
         console.error(`[Controller] Erro ao reagir:`, error);
@@ -195,13 +225,34 @@ export const markChatAsRead = async (sessionId, companyId, remoteJid) => {
         const session = sessions.get(sessionId);
         if (!session?.sock) return; 
         const jid = normalizeJid(remoteJid);
+        
+        // Tenta se inscrever na presença para garantir status online
         await session.sock.presenceSubscribe(jid);
-        const { data: unreadMsgs } = await supabase.from('messages').select('whatsapp_id, from_me').eq('company_id', companyId).eq('remote_jid', jid).eq('from_me', false).neq('status', 'read').limit(20); 
+        
+        // Marca como lido as não lidas
+        const { data: unreadMsgs } = await supabase.from('messages')
+            .select('whatsapp_id, from_me')
+            .eq('company_id', companyId)
+            .eq('remote_jid', jid)
+            .eq('from_me', false)
+            .neq('status', 'read')
+            .limit(20); 
+            
         if (unreadMsgs && unreadMsgs.length > 0) {
             const keys = unreadMsgs.map(m => ({ remoteJid: jid, id: m.whatsapp_id, fromMe: false }));
             await session.sock.readMessages(keys);
-            await supabase.from('messages').update({ status: 'read', read_at: new Date() }).eq('company_id', companyId).eq('remote_jid', jid).in('whatsapp_id', unreadMsgs.map(m => m.whatsapp_id));
-            await supabase.from('contacts').update({ unread_count: 0 }).eq('company_id', companyId).eq('jid', jid);
+            
+            // Atualiza banco
+            await supabase.from('messages')
+                .update({ status: 'read', read_at: new Date() })
+                .eq('company_id', companyId)
+                .eq('remote_jid', jid)
+                .in('whatsapp_id', unreadMsgs.map(m => m.whatsapp_id));
+            
+            await supabase.from('contacts')
+                .update({ unread_count: 0 })
+                .eq('company_id', companyId)
+                .eq('jid', jid);
         }
         return { success: true };
     } catch (error) { return { success: false, error: error.message }; }
