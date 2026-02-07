@@ -3,7 +3,8 @@ import express from "express";
 import { 
     connectDrive, callbackDrive, listFiles, syncNow, sendFileToContact, 
     uploadFileToDrive, getQuota, createNewFolder, deleteItems, emptyTrashItems,
-    searchDrive, importDriveFiles, convertDocument, removeImportedFiles, downloadFileContent
+    searchDrive, importDriveFiles, convertDocument, removeImportedFiles, downloadFileContent,
+    listRemoteFiles
 } from "../controllers/cloudController.js";
 import { requireAuth } from "../middleware/auth.js";
 import multer from 'multer';
@@ -33,6 +34,7 @@ router.post("/google/upload", upload.single('file'), uploadFileToDrive);
 router.post("/google/send-to-whatsapp", sendFileToContact);
 
 router.post("/google/search-live", searchDrive);
+router.post("/google/list-remote", listRemoteFiles); // NOVA ROTA
 router.post("/google/import", importDriveFiles);
 router.post("/google/download-content", downloadFileContent); // NOVO: Baixar para edição (Sheet)
 router.post("/convert/docx", convertDocument);
