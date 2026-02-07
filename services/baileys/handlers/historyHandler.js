@@ -89,16 +89,16 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     contactData.push_name = bestName;
                 }
 
+                if (c.verifiedName) {
+                    contactData.verified_name = c.verifiedName;
+                    contactData.is_business = true;
+                }
+
                 if (c.imgUrl) {
                     contactData.profile_pic_url = c.imgUrl;
                     contactData.profile_pic_updated_at = new Date();
                 } else {
                     contactsToFetchPic.push({ jid, profile_pic_url: null });
-                }
-
-                if (c.verifiedName) {
-                    contactData.verified_name = c.verifiedName;
-                    contactData.is_business = true;
                 }
 
                 bulkPayload.push(contactData);
@@ -115,8 +115,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             // CORRIDA CONDICIONAL RESOLVIDA:
             // Dá tempo para o banco indexar os nomes antes de criar Leads baseados nas mensagens
             if (bulkPayload.length > 0) {
-                console.log('⏳ [SYNC] Estabilizando banco de dados (2s)...');
-                await sleep(2000);
+                console.log('⏳ [SYNC] Estabilizando banco de dados (3s)...');
+                await sleep(3000);
             }
             
             // Background Fetch
