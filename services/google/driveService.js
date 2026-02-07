@@ -52,6 +52,37 @@ export const searchLiveFiles = async (companyId, query) => {
     return res.data.files || [];
 };
 
+// --- LISTAGEM REMOTA (BROWSING) ---
+export const listRemoteFolder = async (companyId, folderId = 'root') => {
+    const auth = await getAuthenticatedClient(companyId);
+    const drive = google.drive({ version: 'v3', auth });
+
+    // Se folderId for nulo ou undefined, usa root
+    const targetId = folderId || 'root';
+
+    const q = `'${targetId}' in parents and trashed = false`;
+    
+    const res = await drive.files.list({
+        q: q,
+        fields: 'files(id, name, mimeType, webViewLink, thumbnailLink, size, createdTime)',
+        orderBy: 'folder,name',
+        pageSize: 100
+    });
+
+    // Mapeia para formato padrão
+    return (res.data.files || []).map(f => ({
+        id: f.id,
+        google_id: f.id,
+        name: f.name,
+        mimeType: f.mimeType,
+        mime_type: f.mimeType, // Compatibilidade
+        webViewLink: f.webViewLink,
+        thumbnailLink: f.thumbnailLink,
+        size: f.size ? parseInt(f.size) : 0,
+        is_folder: f.mimeType === 'application/vnd.google-apps.folder'
+    }));
+};
+
 // --- HELPER: Recursão para buscar filhos ---
 const fetchChildrenRecursively = async (drive, folderId, dbRecords, companyId) => {
     let pageToken = null;
@@ -202,10 +233,6 @@ export const deleteFiles = async (companyId, fileIds) => {
                 fileId: fileId,
                 requestBody: { trashed: true }
             });
-            // O delete cascade do banco cuida dos filhos se estiver bem configurado, 
-            // mas por segurança vamos deletar apenas o registro direto aqui,
-            // e confiar no sync ou na lógica de "orphans" para limpar o resto visualmente.
-            // Para simplificar: Removemos do banco.
             await supabase.from('drive_cache').delete().eq('google_id', fileId).eq('company_id', companyId);
         } catch (e) {
             console.error(`Erro ao deletar ${fileId}:`, e.message);
@@ -335,7 +362,6 @@ export const uploadFile = async (companyId, buffer, fileName, mimeType, folderId
     return res.data;
 };
 
-// ... Resto das funções (getFileStream, getFileBuffer, convertDocxToHtml) mantidas iguais
 export const getFileStream = async (companyId, fileId) => {
     const auth = await getAuthenticatedClient(companyId);
     const drive = google.drive({ version: 'v3', auth });
