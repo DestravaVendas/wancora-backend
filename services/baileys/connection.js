@@ -135,7 +135,7 @@ export const startSession = async (sessionId, companyId) => {
                     } else if (msg.message_type === 'image') {
                         messagePayload = { imageMessage: { caption: msg.content, url: msg.media_url } };
                     } else if (msg.message_type === 'poll') {
-                        // Reconstrói Poll
+                        // Reconstrói Poll (Vital para Bad MAC em votos)
                         try {
                             const pollContent = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
                             
@@ -143,9 +143,10 @@ export const startSession = async (sessionId, companyId) => {
                             const options = (pollContent.options || []).map(opt => ({ 
                                 optionName: typeof opt === 'string' ? opt : (opt.optionName || 'Opção') 
                             }));
-
+                            
+                            // Baileys moderno usa V3
                             messagePayload = {
-                                pollCreationMessage: {
+                                pollCreationMessageV3: {
                                     name: pollContent.name || 'Enquete',
                                     options: options,
                                     selectableOptionsCount: pollContent.selectableOptionsCount || 1
