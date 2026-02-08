@@ -6,15 +6,16 @@ import { requireAuth } from "../middleware/auth.js";
 
 const router = express.Router();
 
-// Aplica segurança nas rotas de disparo
-// Nota: Webhooks externos podem precisar de uma lógica diferente (API Key no Header), 
-// mas para chamadas do Frontend, requireAuth é o ideal.
+// --- ROTAS PÚBLICAS / SERVER-TO-SERVER ---
+// (Não exigem Token de Usuário, pois são chamadas pelo próprio sistema ou webhooks)
+
+// Confirmações de Agenda (Acionado pelo Next.js Server Action)
+router.post('/appointments/confirm', sendAppointmentConfirmation);
+
+// --- ROTAS PROTEGIDAS (DASHBOARD) ---
 router.use(requireAuth);
 
 // Campanhas em Massa
 router.post("/campaigns/send", createCampaign);
-
-// Confirmações de Agenda
-router.post('/appointments/confirm', sendAppointmentConfirmation);
 
 export default router;
