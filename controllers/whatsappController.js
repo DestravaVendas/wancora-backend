@@ -1,4 +1,3 @@
-
 import { createClient } from "@supabase/supabase-js";
 import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
 import { sendMessage as sendService } from '../services/baileys/sender.js';
@@ -112,6 +111,9 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
         const { data: pollMsg } = await supabase.from('messages').select('whatsapp_id, from_me, content').eq('id', pollId).single();
         if (!pollMsg) throw new Error("Enquete não encontrada no banco.");
 
+        // --- DIAGNÓSTICO DE ENQUETE (RAIO-X) ---
+        console.log(`🔍 [POLL DEBUG] Processando voto. MsgID: ${pollMsg.whatsapp_id}`);
+
         let pollContent;
         try {
             // Tenta parsear caso esteja salvo como string
@@ -126,27 +128,28 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
             throw new Error("Conteúdo da enquete corrompido ou formato inválido."); 
         }
 
-        console.log("🔍 [POLL DEBUG] Conteúdo RAW:", JSON.stringify(pollContent));
+        console.log(`🔍 [POLL DEBUG] Estrutura extraída:`, JSON.stringify(pollContent));
 
         // Lógica Robusta de Extração de Opções
         let optionsList = [];
         
         if (pollContent.pollCreationMessageV3) {
-            optionsList = pollContent.pollCreationMessageV3.options.map(o => o.optionName);
+            optionsList = pollContent.pollCreationMessageV3.options.map(o => o.optionName || o);
         } else if (pollContent.pollCreationMessage) {
-            optionsList = pollContent.pollCreationMessage.options.map(o => o.optionName);
+            optionsList = pollContent.pollCreationMessage.options.map(o => o.optionName || o);
         } else if (Array.isArray(pollContent.options)) {
+             // Tratamento híbrido: pode ser array de strings ou objetos
              optionsList = pollContent.options.map(opt => (typeof opt === 'object' && opt.optionName) ? opt.optionName : opt);
         } else if (pollContent.values) {
             optionsList = pollContent.values;
         }
 
-        console.log("🔍 [POLL DEBUG] Opções extraídas:", optionsList);
+        console.log(`🔍 [POLL DEBUG] Lista de Opções Final:`, optionsList);
 
         const selectedOptionText = optionsList[optionId];
         
         if (!selectedOptionText) {
-            console.error("Opções disponíveis:", optionsList, "Index solicitado:", optionId);
+            console.error("❌ [POLL ERROR] Index solicitado:", optionId, "não existe em", optionsList);
             throw new Error(`Opção inválida: Index ${optionId} não existe na enquete.`);
         }
 
@@ -154,15 +157,25 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
 
         const chatJid = normalizeJid(remoteJid);
         
-        // ENVIO DO VOTO
+        // CONSTRUÇÃO ESTRITA DA CHAVE (Tipagem é crucial para o Baileys)
+        const voteKey = {
+            remoteJid: chatJid,
+            id: pollMsg.whatsapp_id,
+            fromMe: Boolean(pollMsg.from_me) // Força booleano
+        };
+
+        // ENVIO DO VOTO (Payload Limpo)
+        // O Baileys precisa que a opção selecionada seja IDÊNTICA (case-sensitive, space-sensitive)
         await session.sock.sendMessage(chatJid, {
             poll: {
                 vote: {
-                    key: { remoteJid: chatJid, id: pollMsg.whatsapp_id, fromMe: pollMsg.from_me },
+                    key: voteKey,
                     selectedOptions: [selectedOptionText] 
                 }
             }
         });
+
+        console.log(`✅ [POLL DEBUG] Voto enviado ao socket.`);
 
         // Atualização Otimista no Banco (Para feedback imediato)
         const myJid = normalizeJid(session.sock.user?.id);
