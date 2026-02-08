@@ -29,6 +29,16 @@ export const normalizeJid = (jid) => {
         return userDomain;
     }
 
+    // FIX CRÍTICO: Se não tem @ e parece um número, adiciona o domínio padrão
+    // Isso impede o erro "jidDecode undefined" no Baileys
+    if (!jid.includes('@')) {
+        const cleanNumber = jid.replace(/\D/g, '');
+        // Validação mínima de comprimento (DDI + DDD + Num > 8 digitos)
+        if (cleanNumber.length > 5) { 
+            return `${cleanNumber}@s.whatsapp.net`;
+        }
+    }
+
     return jid; // Fallback se não bater padrões
 };
 
