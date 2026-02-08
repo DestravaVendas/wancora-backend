@@ -1,4 +1,3 @@
-
 import makeWASocket, { 
     DisconnectReason, 
     fetchLatestBaileysVersion,
@@ -114,7 +113,7 @@ export const startSession = async (sessionId, companyId) => {
             shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter') || jid.includes('status@broadcast'),
             
             // --- IMPLEMENTAÇÃO OBRIGATÓRIA DO MANUAL (getMessage) ---
-            // Recupera mensagens antigas caso o outro lado solicite reenvio (Criptografia)
+            // Recupera mensagens antigas caso o outro lado solicite reenvio (Criptografia / Bad MAC Fix)
             getMessage: async (key) => {
                 if (!key.id) return null;
                 try {
@@ -136,23 +135,28 @@ export const startSession = async (sessionId, companyId) => {
                         messagePayload = { imageMessage: { caption: msg.content, url: msg.media_url } };
                     } else if (msg.message_type === 'poll') {
                         // Reconstrói Poll (Vital para Bad MAC em votos)
+                        // A reconstrução deve ser PERFEITA para o hash bater
                         try {
+                            console.log(`🔄 [RETRY] Reconstruindo enquete para ${key.id}`);
                             const pollContent = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
                             
-                            // Extração de opções robusta
+                            // Extração e normalização de opções para o formato Proto
+                            // Se optionName não existir, usa a string direta (fallback)
                             const options = (pollContent.options || []).map(opt => ({ 
                                 optionName: typeof opt === 'string' ? opt : (opt.optionName || 'Opção') 
                             }));
                             
-                            // Baileys moderno usa V3
+                            // Baileys moderno usa pollCreationMessageV3 por padrão
+                            // Importante: selectableOptionsCount deve ser número
                             messagePayload = {
                                 pollCreationMessageV3: {
                                     name: pollContent.name || 'Enquete',
                                     options: options,
-                                    selectableOptionsCount: pollContent.selectableOptionsCount || 1
+                                    selectableOptionsCount: Number(pollContent.selectableOptionsCount) || 1
                                 }
                             };
                         } catch (e) {
+                            console.error("[CONNECTION] Falha ao reconstruir enquete para retry:", e);
                             messagePayload = { conversation: "[Enquete Corrompida]" };
                         }
                     } else {
@@ -162,6 +166,7 @@ export const startSession = async (sessionId, companyId) => {
 
                     return proto.Message.fromObject(messagePayload);
                 } catch (e) {
+                    console.error("[CONNECTION] Falha crítica no getMessage:", e);
                     return null;
                 }
             }
