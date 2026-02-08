@@ -4,12 +4,15 @@
 export const normalizeJid = (jid) => {
     if (!jid) return null;
     
+    // Converte para string se vier como número e remove espaços
+    const jidStr = String(jid).trim();
+
     // Se for broadcast de status
-    if (jid === 'status@broadcast') return jid;
+    if (jidStr === 'status@broadcast') return jidStr;
     
     // Separa o JID de sufixos de dispositivo (Ex: :12)
     // Formato padrão Baileys: 55119999@s.whatsapp.net:12
-    const parts = jid.split(':');
+    const parts = jidStr.split(':');
     const userDomain = parts[0]; // Pega tudo antes do :
     
     // Se já contém o domínio correto
@@ -31,15 +34,15 @@ export const normalizeJid = (jid) => {
 
     // FIX CRÍTICO: Se não tem @ e parece um número, adiciona o domínio padrão
     // Isso impede o erro "jidDecode undefined" no Baileys
-    if (!jid.includes('@')) {
-        const cleanNumber = jid.replace(/\D/g, '');
+    if (!jidStr.includes('@')) {
+        const cleanNumber = jidStr.replace(/\D/g, '');
         // Validação mínima de comprimento (DDI + DDD + Num > 8 digitos)
         if (cleanNumber.length > 5) { 
             return `${cleanNumber}@s.whatsapp.net`;
         }
     }
 
-    return jid; // Fallback se não bater padrões
+    return jidStr; // Fallback se não bater padrões
 };
 
 // Desenrola mensagens complexas (ViewOnce, Ephemeral, Edited, DocumentWithCaption)
