@@ -156,12 +156,11 @@ export const startSession = async (sessionId, companyId) => {
 
                 console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}. Msg: ${errorMsg}`);
 
-                // Se for erro de criptografia ou Bad MAC, DESTRÓI a sessão
                 const isCryptoError = errorMsg.includes('authenticate data') || errorMsg.includes('Signal') || errorMsg.includes('Bad MAC');
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 403 && !isCryptoError;
 
                 if (!shouldReconnect) {
-                    Logger.fatal('baileys', `Sessão corrompida ou logout (${isCryptoError ? 'Erro Criptografia' : 'Logout'}). Limpando dados.`, { sessionId }, companyId);
+                    Logger.fatal('baileys', `Sessão corrompida ou logout (${isCryptoError ? 'Erro Criptografia' : 'Logout'}).`, { sessionId, error: errorMsg, stack: error?.stack }, companyId);
                     await deleteSession(sessionId, companyId);
                     return; 
                 }
@@ -214,7 +213,7 @@ export const startSession = async (sessionId, companyId) => {
         return sock;
 
     } catch (error) {
-        Logger.fatal('baileys', `Falha crítica ao iniciar sessão`, { sessionId, error: error.message }, companyId);
+        Logger.fatal('baileys', `Falha crítica ao iniciar sessão`, { sessionId, error: error.message, stack: error.stack }, companyId);
         handleReconnect(sessionId, companyId);
     }
 };
@@ -223,7 +222,7 @@ const handleReconnect = (sessionId, companyId) => {
     const attempt = (retries.get(sessionId) || 0) + 1;
     
     if (attempt > 10) {
-        Logger.error('baileys', `Limite de tentativas de reconexão excedido para ${sessionId}.`, {}, companyId);
+        Logger.error('baileys', `Limite de tentativas de reconexão excedido.`, { sessionId }, companyId);
         retries.delete(sessionId);
         updateInstanceStatus(sessionId, companyId, { status: 'disconnected' });
         return;
