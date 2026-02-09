@@ -4,6 +4,7 @@ import { syncDriveFiles, uploadFile, getFileStream, getStorageQuota, createFolde
 import { sendMessage } from "../services/baileys/sender.js";
 import { getSessionId } from "./whatsappController.js";
 import { createClient } from "@supabase/supabase-js";
+import { Logger } from "../utils/logger.js"; // IMPORT LOGGER
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
@@ -15,7 +16,7 @@ export const connectDrive = async (req, res) => {
         const url = generateAuthUrl(companyId);
         res.json({ url });
     } catch (e) {
-        console.error("❌ [CLOUD] Erro ao gerar URL:", e);
+        Logger.error('cloud', 'Erro ao gerar URL de Auth', { error: e.message }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -25,12 +26,13 @@ export const callbackDrive = async (req, res) => {
     try {
         if (!code || !state) throw new Error(`Parâmetros inválidos do Google.`);
         const userInfo = await handleAuthCallback(code, state);
-        syncDriveFiles(state).catch(err => console.error("Initial Sync Error:", err));
+        syncDriveFiles(state).catch(err => Logger.error('cloud', 'Initial Sync Error', { error: err.message }, state));
         const host = req.get('host');
         let frontendBaseUrl = (host.includes('localhost') || host.includes('127.0.0.1')) ? 'http://localhost:3000' : (process.env.FRONTEND_URL || 'https://wancora-crm.netlify.app');
         if (frontendBaseUrl.endsWith('/')) frontendBaseUrl = frontendBaseUrl.slice(0, -1);
         res.redirect(`${frontendBaseUrl}/cloud?google=success&email=${encodeURIComponent(userInfo.email)}`);
     } catch (e) {
+        Logger.error('cloud', 'Callback Auth Failed', { error: e.message, query: req.query });
         res.status(500).send(`Erro na autenticação: ${e.message}`);
     }
 };
@@ -77,7 +79,7 @@ export const listFiles = async (req, res) => {
 
         res.json({ files: cached || [], source: 'hybrid' });
     } catch (e) {
-        console.error("Erro listFiles:", e);
+        Logger.error('cloud', 'Erro listFiles', { error: e.message }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -110,7 +112,7 @@ export const importDriveFiles = async (req, res) => {
         const count = await importFilesToCache(companyId, files, currentFolderId);
         res.json({ success: true, count });
     } catch (e) {
-        console.error("❌ [CLOUD] Erro na importação:", e);
+        Logger.error('cloud', 'Erro Import Files', { error: e.message }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -121,7 +123,7 @@ export const convertDocument = async (req, res) => {
         const result = await convertDocxToHtml(companyId, fileId);
         res.json({ success: true, ...result });
     } catch (e) {
-        console.error("Erro conversão:", e);
+        Logger.error('cloud', 'Erro Convert Docx', { error: e.message }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -146,7 +148,7 @@ export const downloadFileContent = async (req, res) => {
             mimeType: fileData.mimeType 
         });
     } catch (e) {
-        console.error("Erro download content:", e);
+        Logger.error('cloud', 'Erro Download Content', { error: e.message, fileId }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -167,7 +169,10 @@ export const uploadFileToDrive = async (req, res) => {
     try {
         const fileData = await uploadFile(companyId, file.buffer, name || file.originalname, file.mimetype, folderId === 'null' ? null : folderId);
         res.json({ success: true, file: fileData });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { 
+        Logger.error('cloud', 'Erro Upload', { error: e.message }, companyId);
+        res.status(500).json({ error: e.message }); 
+    }
 };
 
 export const getQuota = async (req, res) => {
@@ -246,5 +251,8 @@ export const sendFileToContact = async (req, res) => {
         await sendMessage(payload);
 
         res.json({ success: true, message: "Arquivo enviado para o WhatsApp." });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { 
+        Logger.error('cloud', 'Erro Send File to WA', { error: e.message }, companyId);
+        res.status(500).json({ error: e.message }); 
+    }
 };
