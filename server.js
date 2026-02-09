@@ -21,25 +21,37 @@ const originalConsoleError = console.error;
 const originalConsoleWarn = console.warn;
 
 console.error = (...args) => {
-    // 1. Mantém o comportamento original (Terminal)
+    // 1. Mantém o comportamento original (Terminal) para debug local
     originalConsoleError.apply(console, args);
     
-    // 2. Envia para o Supabase (Evita loop infinito se o erro for do próprio logger)
+    // 2. Transforma argumentos em string para análise
     const msg = args.map(a => (typeof a === 'object' ? (a.message || JSON.stringify(a)) : String(a))).join(' ');
     
-    // Filtra ruídos comuns que não são erros reais
-    if (msg.includes('rate limit') || msg.includes('socket disconnect')) return;
+    // --- FILTRO DE SEGURANÇA (ANTI-LOOP) ---
+    // Impede que erros do próprio Logger gerem novos logs, criando recursão infinita
+    if (
+        msg.includes('rate limit') || 
+        msg.includes('socket disconnect') ||
+        msg.includes('Falha ao escrever log') || // Loop Breaker 1
+        msg.includes('system_logs') ||           // Loop Breaker 2
+        msg.includes('violates check constraint')// Loop Breaker 3
+    ) return;
 
-    Logger.error('backend-console', 'Captured Console Error', { raw: msg, args });
+    // Envia para o Supabase com source 'backend' (Válido no SQL Check)
+    // O erro anterior usava 'backend-console' que violava a constraint do banco
+    Logger.error('backend', 'Captured Console Error', { raw: msg, args });
 };
 
 console.warn = (...args) => {
     originalConsoleWarn.apply(console, args);
     const msg = args.map(a => String(a)).join(' ');
-    // Filtra avisos irrelevantes do Node
-    if (msg.includes('ExperimentalWarning')) return;
     
-    Logger.warn('backend-console', 'Captured Console Warn', { raw: msg });
+    if (
+        msg.includes('ExperimentalWarning') || 
+        msg.includes('Falha ao escrever log')
+    ) return;
+    
+    Logger.warn('backend', 'Captured Console Warn', { raw: msg });
 };
 // --------------------------------------------------------
 
@@ -52,6 +64,9 @@ import cloudRoutes from './routes/cloud.routes.js';
 
 // --- GESTÃO DE ERROS FATAIS (CRASH PREVENTION) ---
 process.on('uncaughtException', (err) => {
+    // Usa originalConsoleError para garantir que saia no terminal mesmo se o Logger falhar
+    originalConsoleError('Uncaught Exception:', err);
+    
     Logger.fatal('backend', 'Uncaught Exception (Process Crash prevented)', {
         message: err.message,
         stack: err.stack
@@ -150,7 +165,7 @@ const restoreSessions = async () => {
 const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, () => {
-    console.log(`🚀 Wancora Backend v5.4.1 (Stability Patch) rodando na porta ${PORT}`);
+    console.log(`🚀 Wancora Backend v5.4.2 (Log Loop Fix) rodando na porta ${PORT}`);
     
     restoreSessions();     
     startSentinel();       
