@@ -16,7 +16,7 @@ export const connectDrive = async (req, res) => {
         const url = generateAuthUrl(companyId);
         res.json({ url });
     } catch (e) {
-        Logger.error('cloud', 'Erro ao gerar URL de Auth', { error: e.message }, companyId);
+        Logger.error('cloud', 'Erro ao gerar URL de Auth', { error: e.message, stack: e.stack }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -26,13 +26,13 @@ export const callbackDrive = async (req, res) => {
     try {
         if (!code || !state) throw new Error(`Parâmetros inválidos do Google.`);
         const userInfo = await handleAuthCallback(code, state);
-        syncDriveFiles(state).catch(err => Logger.error('cloud', 'Initial Sync Error', { error: err.message }, state));
+        syncDriveFiles(state).catch(err => Logger.error('cloud', 'Initial Sync Error', { error: err.message, stack: err.stack }, state));
         const host = req.get('host');
         let frontendBaseUrl = (host.includes('localhost') || host.includes('127.0.0.1')) ? 'http://localhost:3000' : (process.env.FRONTEND_URL || 'https://wancora-crm.netlify.app');
         if (frontendBaseUrl.endsWith('/')) frontendBaseUrl = frontendBaseUrl.slice(0, -1);
         res.redirect(`${frontendBaseUrl}/cloud?google=success&email=${encodeURIComponent(userInfo.email)}`);
     } catch (e) {
-        Logger.error('cloud', 'Callback Auth Failed', { error: e.message, query: req.query });
+        Logger.error('cloud', 'Callback Auth Failed', { error: e.message, query: req.query, stack: e.stack });
         res.status(500).send(`Erro na autenticação: ${e.message}`);
     }
 };
@@ -79,7 +79,7 @@ export const listFiles = async (req, res) => {
 
         res.json({ files: cached || [], source: 'hybrid' });
     } catch (e) {
-        Logger.error('cloud', 'Erro listFiles', { error: e.message }, companyId);
+        Logger.error('cloud', 'Erro listFiles', { error: e.message, stack: e.stack }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -91,6 +91,7 @@ export const searchDrive = async (req, res) => {
         const files = await searchLiveFiles(companyId, query);
         res.json({ files });
     } catch (e) {
+        Logger.error('cloud', 'Search Error', { error: e.message, query }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -101,6 +102,7 @@ export const listRemoteFiles = async (req, res) => {
         const files = await listRemoteFolder(companyId, folderId);
         res.json({ files });
     } catch (e) {
+        Logger.error('cloud', 'Remote List Error', { error: e.message, folderId }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -112,7 +114,7 @@ export const importDriveFiles = async (req, res) => {
         const count = await importFilesToCache(companyId, files, currentFolderId);
         res.json({ success: true, count });
     } catch (e) {
-        Logger.error('cloud', 'Erro Import Files', { error: e.message }, companyId);
+        Logger.error('cloud', 'Erro Import Files', { error: e.message, stack: e.stack }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -123,7 +125,7 @@ export const convertDocument = async (req, res) => {
         const result = await convertDocxToHtml(companyId, fileId);
         res.json({ success: true, ...result });
     } catch (e) {
-        Logger.error('cloud', 'Erro Convert Docx', { error: e.message }, companyId);
+        Logger.error('cloud', 'Erro Convert Docx', { error: e.message, fileId, stack: e.stack }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -148,7 +150,7 @@ export const downloadFileContent = async (req, res) => {
             mimeType: fileData.mimeType 
         });
     } catch (e) {
-        Logger.error('cloud', 'Erro Download Content', { error: e.message, fileId }, companyId);
+        Logger.error('cloud', 'Erro Download Content', { error: e.message, fileId, stack: e.stack }, companyId);
         res.status(500).json({ error: e.message });
     }
 };
@@ -170,7 +172,7 @@ export const uploadFileToDrive = async (req, res) => {
         const fileData = await uploadFile(companyId, file.buffer, name || file.originalname, file.mimetype, folderId === 'null' ? null : folderId);
         res.json({ success: true, file: fileData });
     } catch (e) { 
-        Logger.error('cloud', 'Erro Upload', { error: e.message }, companyId);
+        Logger.error('cloud', 'Erro Upload', { error: e.message, stack: e.stack }, companyId);
         res.status(500).json({ error: e.message }); 
     }
 };
@@ -252,7 +254,7 @@ export const sendFileToContact = async (req, res) => {
 
         res.json({ success: true, message: "Arquivo enviado para o WhatsApp." });
     } catch (e) { 
-        Logger.error('cloud', 'Erro Send File to WA', { error: e.message }, companyId);
+        Logger.error('cloud', 'Erro Send File to WA', { error: e.message, stack: e.stack }, companyId);
         res.status(500).json({ error: e.message }); 
     }
 };
