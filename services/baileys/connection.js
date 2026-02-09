@@ -1,3 +1,4 @@
+
 import makeWASocket, { 
     DisconnectReason, 
     fetchLatestBaileysVersion,
@@ -12,6 +13,7 @@ import { deleteSessionData, updateInstanceStatus, normalizeJid } from '../crm/sy
 import { createClient } from "@supabase/supabase-js";
 import getRedisClient from '../redisClient.js'; // Redis para cache de retry
 import pino from 'pino';
+import { Logger } from '../../utils/logger.js'; // NOVO IMPORT
 
 // Cliente para getMessage (Recuperação de falha de criptografia)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -40,7 +42,7 @@ const subscribeToRecentChats = async (sock, companyId) => {
             .limit(20);
 
         if (recent && recent.length > 0) {
-            console.log(`👀 [PRESENCE] Inscrevendo em ${recent.length} chats recentes...`);
+            // console.log(`👀 [PRESENCE] Inscrevendo em ${recent.length} chats recentes...`);
             for (const contact of recent) {
                 if (contact.jid.includes('@s.whatsapp.net')) {
                     await sock.presenceSubscribe(contact.jid);
@@ -50,7 +52,7 @@ const subscribeToRecentChats = async (sock, companyId) => {
             }
         }
     } catch (e) {
-        console.warn(`⚠️ [PRESENCE] Falha ao inscrever:`, e.message);
+        Logger.warn('baileys', `Falha ao inscrever presença`, { error: e.message }, companyId);
     }
 };
 
@@ -137,7 +139,6 @@ export const startSession = async (sessionId, companyId) => {
                         // Reconstrói Poll (Vital para Bad MAC em votos)
                         // A reconstrução deve ser PERFEITA para o hash bater
                         try {
-                            console.log(`🔄 [RETRY] Reconstruindo enquete para ${key.id}`);
                             const pollContent = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
                             
                             // Extração e normalização de opções para o formato Proto
@@ -156,7 +157,7 @@ export const startSession = async (sessionId, companyId) => {
                                 }
                             };
                         } catch (e) {
-                            console.error("[CONNECTION] Falha ao reconstruir enquete para retry:", e);
+                            Logger.error('baileys', 'Falha ao reconstruir enquete para retry', { error: e.message, key: key.id }, companyId);
                             messagePayload = { conversation: "[Enquete Corrompida]" };
                         }
                     } else {
@@ -166,7 +167,7 @@ export const startSession = async (sessionId, companyId) => {
 
                     return proto.Message.fromObject(messagePayload);
                 } catch (e) {
-                    console.error("[CONNECTION] Falha crítica no getMessage:", e);
+                    Logger.error('baileys', 'Falha crítica no getMessage', { error: e.message, key: key.id }, companyId);
                     return null;
                 }
             }
@@ -236,7 +237,7 @@ export const startSession = async (sessionId, companyId) => {
                 console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}. Retry: ${shouldReconnect}`);
 
                 if (!shouldReconnect) {
-                    console.warn(`🔒 [SECURITY] Sessão inválida ou logout. Limpando dados...`);
+                    Logger.warn('baileys', `Sessão inválida ou logout. Limpando dados.`, { sessionId }, companyId);
                     await deleteSession(sessionId, companyId);
                     return; 
                 }
@@ -252,7 +253,7 @@ export const startSession = async (sessionId, companyId) => {
         return sock;
 
     } catch (error) {
-        console.error(`🚨 [FATAL] Falha ao iniciar sessão ${sessionId}:`, error);
+        Logger.fatal('baileys', `Falha ao iniciar sessão`, { sessionId, error: error.message }, companyId);
         handleReconnect(sessionId, companyId);
     }
 };
@@ -261,7 +262,7 @@ const handleReconnect = (sessionId, companyId) => {
     const attempt = (retries.get(sessionId) || 0) + 1;
     
     if (attempt > 10) {
-        console.error(`💀 [DEATH] Sessão ${sessionId} falhou 10x. Desistindo.`);
+        Logger.error('baileys', `Sessão falhou 10x. Desistindo da reconexão automática.`, { sessionId }, companyId);
         retries.delete(sessionId);
         updateInstanceStatus(sessionId, companyId, { status: 'disconnected' });
         return;
