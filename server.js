@@ -15,6 +15,34 @@ import { startRetentionWorker } from './workers/retentionWorker.js';
 import { Logger } from './utils/logger.js'; // NOVO: Logger
 import { errorHandler } from './middleware/errorHandler.js'; // NOVO: Middleware
 
+// --- CONSOLE HIJACKING (Interceptador Global de Logs) ---
+// Isso captura logs de bibliotecas (Baileys, Express) e try/catchs silenciosos
+const originalConsoleError = console.error;
+const originalConsoleWarn = console.warn;
+
+console.error = (...args) => {
+    // 1. Mantém o comportamento original (Terminal)
+    originalConsoleError.apply(console, args);
+    
+    // 2. Envia para o Supabase (Evita loop infinito se o erro for do próprio logger)
+    const msg = args.map(a => (typeof a === 'object' ? (a.message || JSON.stringify(a)) : String(a))).join(' ');
+    
+    // Filtra ruídos comuns que não são erros reais
+    if (msg.includes('rate limit') || msg.includes('socket disconnect')) return;
+
+    Logger.error('backend-console', 'Captured Console Error', { raw: msg, args });
+};
+
+console.warn = (...args) => {
+    originalConsoleWarn.apply(console, args);
+    const msg = args.map(a => String(a)).join(' ');
+    // Filtra avisos irrelevantes do Node
+    if (msg.includes('ExperimentalWarning')) return;
+    
+    Logger.warn('backend-console', 'Captured Console Warn', { raw: msg });
+};
+// --------------------------------------------------------
+
 // Rotas Modulares
 import sessionRoutes from './routes/session.routes.js';
 import messageRoutes from './routes/message.routes.js';
