@@ -3,17 +3,22 @@ import { BufferJSON, initAuthCreds } from '@whiskeysockets/baileys';
 import { createClient } from '@supabase/supabase-js';
 
 // Cliente Supabase Service Role (Acesso total para ler/gravar sessões)
-// É vital usar a Service Key aqui, pois sessões não pertencem a um usuário logado no contexto HTTP do backend
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
 
-// 🛡️ CORREÇÃO CRÍTICA (FIX BUFFER)
-// O Baileys serializa Buffers como { type: 'Buffer', data: [...] }.
-// Ao ler do JSON do banco, precisamos converter de volta para Buffer nativo do Node.js,
-// caso contrário a criptografia falha silenciosamente.
+// 🛡️ CORREÇÃO CRÍTICA (FIX BUFFER & JSON PARSING)
+// Garante que qualquer dado lido do banco seja convertido corretamente para Buffer
+// se ele estiver no formato { type: 'Buffer', data: [...] }
 const fixBuffer = (data) => {
-    return JSON.parse(JSON.stringify(data), BufferJSON.reviver);
+    if (!data) return null;
+    try {
+        const str = typeof data === 'string' ? data : JSON.stringify(data);
+        return JSON.parse(str, BufferJSON.reviver);
+    } catch (e) {
+        console.error("[AUTH] Falha ao reviver Buffer:", e.message);
+        return data; // Retorna original em caso de falha (fallback)
+    }
 };
 
 export const useSupabaseAuthState = async (sessionId) => {
@@ -30,16 +35,13 @@ export const useSupabaseAuthState = async (sessionId) => {
                 .maybeSingle();
             
             if (error) {
-                console.error(`[AUTH] Erro ao buscar credenciais para ${sessionId}:`, error.message);
+                console.error(`[AUTH] Erro DB ao buscar credenciais ${sessionId}:`, error.message);
                 return null;
             }
 
             if (!data?.payload) return null;
             
-            // Trata se o payload já vier como Objeto (JSONB) ou String
-            const parsed = typeof data.payload === 'string' ? JSON.parse(data.payload) : data.payload;
-            
-            return fixBuffer(parsed);
+            return fixBuffer(data.payload);
         } catch (e) {
             console.error('[AUTH] Exceção crítica ao ler credenciais:', e);
             return null;
@@ -64,13 +66,11 @@ export const useSupabaseAuthState = async (sessionId) => {
 
                         const result = {};
                         data?.forEach(row => {
-                            // Vital: Tratar JSONB vs String
-                            const parsed = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
-                            result[row.key_id] = fixBuffer(parsed);
+                            result[row.key_id] = fixBuffer(row.payload);
                         });
                         return result;
                     } catch (e) {
-                        console.error(`[AUTH] Erro ao ler chaves ${type}:`, e);
+                        console.error(`[AUTH] Erro crítico ao ler chaves ${type}:`, e);
                         return {};
                     }
                 },
@@ -84,36 +84,37 @@ export const useSupabaseAuthState = async (sessionId) => {
                             const value = data[type][id];
                             
                             if (value) {
-                                // Se tem valor, prepara para salvar (Upsert)
+                                // Se tem valor, prepara para salvar
+                                // Serializa usando BufferJSON.replacer para garantir integridade do Buffer
+                                const stringified = JSON.stringify(value, BufferJSON.replacer);
+                                
                                 rowsToUpsert.push({
                                     session_id: sessionId,
                                     data_type: type,
                                     key_id: id,
-                                    // BufferJSON.replacer garante que Buffers virem arrays seguros para JSON
-                                    payload: JSON.stringify(value, BufferJSON.replacer),
+                                    payload: JSON.parse(stringified), // Salva como JSONB nativo no Postgres
                                     updated_at: new Date()
                                 });
                             } else {
-                                // Se é null/undefined, marca para deletar
                                 idsToDelete.push({ type, id });
                             }
                         }
                     }
 
-                    // 1. EXECUTA O UPSERT EM LOTE (Muito mais rápido e gera menos I/O no banco)
+                    // 1. EXECUTA O UPSERT EM LOTE
                     if (rowsToUpsert.length > 0) {
                         try {
                             const { error } = await supabase
                                 .from('baileys_auth_state')
                                 .upsert(rowsToUpsert, { onConflict: 'session_id, data_type, key_id' });
                             
-                            if (error) console.error('[AUTH DB] Erro ao salvar chaves:', error.message);
+                            if (error) console.error('[AUTH DB] Erro Upsert:', error.message);
                         } catch (e) {
-                            console.error('[AUTH NET] Erro de rede ao salvar:', e.message);
+                            console.error('[AUTH NET] Erro Upsert:', e.message);
                         }
                     }
 
-                    // 2. EXECUTA DELEÇÕES SE NECESSÁRIO
+                    // 2. EXECUTA DELEÇÕES
                     if (idsToDelete.length > 0) {
                         for (const item of idsToDelete) {
                             try {
@@ -123,26 +124,26 @@ export const useSupabaseAuthState = async (sessionId) => {
                                     .eq('session_id', sessionId)
                                     .eq('data_type', item.type)
                                     .eq('key_id', item.id);
-                            } catch (e) {
-                                console.error('[AUTH] Erro ao deletar chave:', e);
-                            }
+                            } catch (e) { /* ignore */ }
                         }
                     }
                 }
             }
         },
-        // Função para salvar especificamente o arquivo 'creds' (que muda com frequência)
         saveCreds: async () => {
             try {
+                // Serializa corretamente antes de salvar
+                const stringified = JSON.stringify(creds, BufferJSON.replacer);
+                
                 await supabase.from('baileys_auth_state').upsert({
                     session_id: sessionId,
                     data_type: 'creds',
                     key_id: 'creds',
-                    payload: JSON.stringify(creds, BufferJSON.replacer),
+                    payload: JSON.parse(stringified),
                     updated_at: new Date()
                 }, { onConflict: 'session_id,data_type,key_id' });
             } catch (e) {
-                console.error('[AUTH] Erro ao salvar creds.json:', e);
+                console.error('[AUTH] Erro ao salvar creds:', e);
             }
         }
     };
