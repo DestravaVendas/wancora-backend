@@ -1,6 +1,7 @@
 
 import { createClient } from "@supabase/supabase-js";
 import { normalizeJid } from "../../utils/wppParsers.js";
+import { Logger } from "../../utils/logger.js"; // Import Logger
 
 // Configurações do Cliente Supabase para evitar Timeouts
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -216,7 +217,10 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
     const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
     
-    if (purePhone.length < 8 || purePhone.length > 15) return null;
+    if (purePhone.length < 8 || purePhone.length > 15) {
+        Logger.warn('baileys', `Lead Ignorado (Número inválido): ${purePhone}`, { jid: cleanJid }, companyId);
+        return null;
+    }
     
     const lockKey = `${companyId}:${purePhone}`;
     if (leadLock.has(lockKey)) return null;
@@ -232,7 +236,10 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
                 .maybeSingle()
         );
 
-        if (contact?.is_ignored) return null; 
+        if (contact?.is_ignored) {
+            Logger.info('baileys', `Lead Ignorado (Marcado como ignorado): ${purePhone}`, {}, companyId);
+            return null; 
+        }
 
         let finalName = null;
         
@@ -264,6 +271,9 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             return existing.id;
         }
 
+        // LOG CRÍTICO: Criação de Lead
+        Logger.info('baileys', `Criando novo Lead: ${purePhone}`, { name: finalName || 'Sem Nome' }, companyId);
+
         // Se não achou nome, deixa null (Frontend formata)
         if (finalName && isGenericName(finalName, purePhone)) {
             finalName = null;
@@ -286,7 +296,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         return newLead?.id;
 
     } catch (e) {
-        console.error("Erro ao criar lead:", e.message);
+        Logger.error('baileys', `Erro ao criar lead ${purePhone}`, { error: e.message }, companyId);
         return null;
     } finally {
         setTimeout(() => leadLock.delete(lockKey), 2000);
