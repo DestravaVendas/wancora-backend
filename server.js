@@ -123,10 +123,20 @@ app.use('/api/v1/cloud', cloudRoutes);
 // Sentry Error Handler (Antes do nosso handler customizado)
 Sentry.setupExpressErrorHandler(app);
 
+// [FIX] Rota de Health Check da API (Monitoramento do Frontend / SystemHealth)
+app.get('/api/v1/health', (req, res) => {
+    res.status(200).json({ 
+        status: 'online', 
+        timestamp: new Date().toISOString(),
+        service: 'Wancora API',
+        version: '5.4.3'
+    });
+});
+
 // Handler Global de Erros (NOVO)
 app.use(errorHandler);
 
-// Health Check
+// Health Check de Infraestrutura (Render/AWS) - Mantido na raiz
 app.get('/', (req, res) => {
   res.status(200).send({ status: 'online', uptime: process.uptime(), service: 'Wancora Backend' });
 });
@@ -165,7 +175,7 @@ const restoreSessions = async () => {
 const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, () => {
-    console.log(`🚀 Wancora Backend v5.4.2 (Log Loop Fix) rodando na porta ${PORT}`);
+    console.log(`🚀 Wancora Backend v5.4.3 (Health Check Fix) rodando na porta ${PORT}`);
     
     restoreSessions();     
     startSentinel();       
