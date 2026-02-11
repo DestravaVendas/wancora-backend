@@ -6,7 +6,7 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const HISTORY_MSG_LIMIT = 20; // Aumentado levemente para melhor contexto
+const HISTORY_MSG_LIMIT = 20; // Limite para feedback visual rápido
 const HISTORY_MONTHS_LIMIT = 6;
 const processedHistoryChunks = new Set();
 
@@ -44,11 +44,12 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
     await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
 
     try {
+        // MAPA DE MEMÓRIA (Fonte da Verdade Rápida)
         const contactsMap = new Map();
         const contactsToFetchPic = [];
 
         // =========================================================================
-        // BARREIRA DE SINCRONIZAÇÃO: FASE 1 - CONTATOS (PRIORIDADE ABSOLUTA)
+        // FASE 1: INDEXAÇÃO DE CONTATOS (MEMORY-FIRST)
         // =========================================================================
         if (contacts && contacts.length > 0) {
             const BATCH_SIZE = 500;
@@ -58,6 +59,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 const jid = normalizeJid(c.id);
                 if (!jid) continue;
 
+                // Link LID (Identity) em background
                 if (c.lid) {
                      supabase.rpc('link_identities', {
                         p_lid: normalizeJid(c.lid),
@@ -68,10 +70,12 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 
                 if (jid.includes('@lid')) continue;
 
+                // Lógica de Prioridade de Nome
                 const bestName = c.name || c.notify || c.verifiedName;
                 const isFromBook = !!(c.name && c.name.trim().length > 0);
 
-                // Armazena em memória para uso imediato nas mensagens abaixo
+                // [CRÍTICO] Popula o mapa de memória IMEDIATAMENTE
+                // Isso permite que as mensagens usem este nome antes mesmo do banco terminar de salvar
                 contactsMap.set(jid, { name: bestName, isFromBook: isFromBook });
 
                 const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
@@ -82,16 +86,10 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     updated_at: new Date()
                 };
 
-                // Lógica de Hierarquia para Bulk
                 if (isFromBook) {
                     contactData.name = bestName;
                 } else if (bestName) {
                     contactData.push_name = bestName;
-                }
-
-                if (c.verifiedName) {
-                    contactData.verified_name = c.verifiedName;
-                    contactData.is_business = true;
                 }
 
                 if (c.imgUrl) {
@@ -101,32 +99,30 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     contactsToFetchPic.push({ jid, profile_pic_url: null });
                 }
 
+                if (c.verifiedName) {
+                    contactData.verified_name = c.verifiedName;
+                    contactData.is_business = true;
+                }
+
                 bulkPayload.push(contactData);
             }
 
-            console.log(`📦 [HISTORY] Contatos preparados: ${bulkPayload.length}`);
-
-            // UPSERT BLOCKING: O sistema espera isso terminar antes de processar mensagens
-            for (let i = 0; i < bulkPayload.length; i += BATCH_SIZE) {
-                const batch = bulkPayload.slice(i, i + BATCH_SIZE);
-                await upsertContactsBulk(batch);
-            }
-            
-            // CORRIDA CONDICIONAL RESOLVIDA:
-            // Dá tempo para o banco indexar os nomes antes de criar Leads baseados nas mensagens
+            // Dispara salvamento no banco (AWAIT para integridade, mas sem Sleep artificial)
             if (bulkPayload.length > 0) {
-                console.log('⏳ [SYNC] Estabilizando banco de dados (3s)...');
-                await sleep(3000);
+                for (let i = 0; i < bulkPayload.length; i += BATCH_SIZE) {
+                    const batch = bulkPayload.slice(i, i + BATCH_SIZE);
+                    await upsertContactsBulk(batch);
+                }
             }
             
-            // Background Fetch
+            // Background Fetch de Fotos
             if (contactsToFetchPic.length > 0) {
                 fetchProfilePicsInBackground(sock, contactsToFetchPic, companyId);
             }
         }
 
         // =========================================================================
-        // BARREIRA DE SINCRONIZAÇÃO: FASE 2 - MENSAGENS
+        // FASE 2: PROCESSAMENTO DE MENSAGENS (COM INJEÇÃO DE NOME)
         // =========================================================================
         if (messages && messages.length > 0) {
             
@@ -147,8 +143,10 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Name Injection (Recupera nome da agenda processada acima)
-                // Isso garante que o Lead seja criado com o nome correto MESMO se o banco estiver lento
+                // [CRÍTICO] INJEÇÃO DE NOME DA AGENDA
+                // Recupera o nome do contactsMap (Memória) que acabamos de criar.
+                // Isso garante que o Lead seja criado com o nome correto ("Mãe", "João Padaria") 
+                // mesmo se o banco de dados ainda estiver processando o upsert.
                 const knownContact = contactsMap.get(jid);
                 if (knownContact && knownContact.isFromBook) {
                     clean._forcedName = knownContact.name;
@@ -162,10 +160,10 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             const chatJids = Object.keys(chats);
 
             for (const jid of chatJids) {
-                // Ordena e pega as N últimas
+                // Ordena
                 chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0)); 
                 
-                // Atualiza last_message_at
+                // Atualiza last_message_at (Fire and Forget)
                 const latestMsg = chats[jid][0];
                 if (latestMsg && latestMsg.messageTimestamp) {
                     const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
@@ -183,11 +181,12 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                             createLead: true 
                         };
                         
+                        // Passamos msg._forcedName que vem direto da memória RAM (contactsMap)
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {}
                 }
-                // Pequeno delay para não travar CPU
-                await sleep(2); 
+                // Yield para não travar o Event Loop
+                await sleep(0); 
             }
         }
 
