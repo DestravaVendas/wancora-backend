@@ -2,10 +2,14 @@
 import { updateSyncStatus } from '../crm/sync.js';
 import { handlePresenceUpdate, handleContactsUpsert } from './handlers/contactHandler.js';
 import { handleReceiptUpdate, handleMessageUpdate, handleReaction } from './handlers/messageHandler.js';
-import { handleHistorySync } from './handlers/historyHandler.js';
+import { handleHistorySync, resetHistoryState } from './handlers/historyHandler.js'; // Import atualizado
 import { enqueueMessage } from './messageQueue.js'; 
 
 export const setupListeners = ({ sock, sessionId, companyId }) => {
+    
+    // [CRÍTICO] Reset de Estado de Histórico
+    // Garante que uma reconexão não use cache de chunks processados anteriormente
+    resetHistoryState(sessionId);
     
     let historyChunkCounter = 0;
 
