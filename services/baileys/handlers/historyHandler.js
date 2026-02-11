@@ -8,9 +8,20 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 const HISTORY_MSG_LIMIT = 20; // Limite para feedback visual rápido
 const HISTORY_MONTHS_LIMIT = 6;
+// Estado Global em Memória
 const processedHistoryChunks = new Set();
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Função para limpar cache de chunks de uma sessão específica (Fresh Start)
+export const resetHistoryState = (sessionId) => {
+    for (const key of processedHistoryChunks) {
+        if (key.startsWith(sessionId)) {
+            processedHistoryChunks.delete(key);
+        }
+    }
+    // console.log(`🧹 [HISTORY] Cache de chunks limpo para ${sessionId} (Zero Start)`);
+};
 
 const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
     // Roda em background, sem await crítico
@@ -36,6 +47,8 @@ const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
 export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
     
     const chunkKey = `${sessionId}-chunk-${chunkCounter}`;
+    
+    // Verificação de duplicidade de processamento em memória
     if (processedHistoryChunks.has(chunkKey)) return;
     processedHistoryChunks.add(chunkKey);
 
@@ -44,7 +57,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
     await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
 
     try {
-        // MAPA DE MEMÓRIA (Fonte da Verdade Rápida)
+        // MAPA DE MEMÓRIA (Fonte da Verdade Rápida para este Lote)
+        // Resetado a cada execução da função para garantir dados frescos
         const contactsMap = new Map();
         const contactsToFetchPic = [];
 
@@ -75,7 +89,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 const isFromBook = !!(c.name && c.name.trim().length > 0);
 
                 // [CRÍTICO] Popula o mapa de memória IMEDIATAMENTE
-                // Isso permite que as mensagens usem este nome antes mesmo do banco terminar de salvar
                 contactsMap.set(jid, { name: bestName, isFromBook: isFromBook });
 
                 const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
@@ -145,8 +158,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 
                 // [CRÍTICO] INJEÇÃO DE NOME DA AGENDA
                 // Recupera o nome do contactsMap (Memória) que acabamos de criar.
-                // Isso garante que o Lead seja criado com o nome correto ("Mãe", "João Padaria") 
-                // mesmo se o banco de dados ainda estiver processando o upsert.
                 const knownContact = contactsMap.get(jid);
                 if (knownContact && knownContact.isFromBook) {
                     clean._forcedName = knownContact.name;
@@ -196,7 +207,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         if (isLatest) {
             console.log(`✅ [HISTÓRICO] Sincronização 100% Concluída.`);
             await updateSyncStatus(sessionId, 'completed', 100);
-            processedHistoryChunks.clear();
+            // Limpeza final para garantir que próxima sincronização seja limpa também
+            resetHistoryState(sessionId);
         }
     }
 };
