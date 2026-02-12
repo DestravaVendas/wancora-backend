@@ -1,31 +1,24 @@
 
 import { createClient } from "@supabase/supabase-js";
 import { normalizeJid } from "../../utils/wppParsers.js";
-import { Logger } from "../../utils/logger.js"; // Import Logger
+import { Logger } from "../../utils/logger.js"; 
 
-// Configurações do Cliente Supabase para evitar Timeouts
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false },
     db: { schema: 'public' },
-    global: {
-        headers: { 'x-my-custom-header': 'wancora-backend' },
-    },
-    // Aumenta timeouts internos
-    options: {
-        timeout: 60000 
-    }
+    global: { headers: { 'x-my-custom-header': 'wancora-backend' } },
+    options: { timeout: 60000 }
 });
 
 const leadLock = new Set(); 
 
-// WRAPPER DE RETRY
 const safeSupabaseCall = async (operation, retries = 3) => {
     for (let i = 0; i < retries; i++) {
         try {
             return await operation();
         } catch (error) {
             const msg = error.message || '';
-            if (msg.includes('fetch failed') || msg.includes('socket') || msg.includes('timeout') || msg.includes('503') || msg.includes('502')) {
+            if (msg.includes('fetch failed') || msg.includes('socket') || msg.includes('timeout')) {
                 if (i === retries - 1) throw error; 
                 await new Promise(res => setTimeout(res, 1000 * Math.pow(2, i)));
                 continue;
@@ -37,19 +30,12 @@ const safeSupabaseCall = async (operation, retries = 3) => {
 
 export { normalizeJid };
 
-// Validador Estrito de Nomes (Anti-Spam)
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
     if (cleanName.length < 1) return true;
-    
-    // Se for só números ou símbolos: generic
     if (/^[\d\s\+\-\(\)]*$/.test(cleanName)) return true;
-
-    // Se for igual ao telefone: generic
     if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true;
-    
-    // Se não tiver pelo menos uma letra: generic
     return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName);
 };
 
@@ -66,11 +52,7 @@ export const updateInstanceStatus = async (sessionId, companyId, data) => {
 export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     try {
         await safeSupabaseCall(() => supabase.from('instances')
-            .update({ 
-                sync_status: status, 
-                sync_percent: percent, 
-                updated_at: new Date() 
-            })
+            .update({ sync_status: status, sync_percent: percent, updated_at: new Date() })
             .eq('session_id', sessionId)
         );
     } catch (e) {
@@ -78,46 +60,28 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
     }
 };
 
-// --- UPSERT BULK ---
 export const upsertContactsBulk = async (contactsArray) => {
     if (!contactsArray || contactsArray.length === 0) return;
     
-    // Normalização Prévia e Limpeza
     const validContacts = contactsArray
         .filter(c => c.jid && c.company_id)
         .map(c => {
             const cleanJid = normalizeJid(c.jid);
             const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
-            return {
-                ...c,
-                jid: cleanJid,
-                phone: purePhone
-            };
+            return { ...c, jid: cleanJid, phone: purePhone };
         });
 
     if (validContacts.length === 0) return;
 
     try {
         await safeSupabaseCall(async () => {
-            const { error } = await supabase
-                .from('contacts')
-                .upsert(validContacts, { onConflict: 'company_id, jid', ignoreDuplicates: false });
-            
-            if (error) {
-                console.error(`🚨 [DB FAIL] Erro Supabase Bulk Upsert: ${error.message}`);
-                throw error;
-            } else {
-                console.log(`✅ [DB SUCCESS] ${validContacts.length} contatos processados.`);
-            }
+            const { error } = await supabase.from('contacts').upsert(validContacts, { onConflict: 'company_id, jid', ignoreDuplicates: false });
+            if (error) throw error;
         });
     } catch (e) {
-        console.error(`❌ [SYNC] Falha no Bulk. Tentando individual...`);
         for (const c of validContacts) {
              try {
-                await upsertContact(c.jid, c.company_id, c.name, c.profile_pic_url, !!c.name, null, c.is_business, c.verified_name, {
-                    push_name: c.push_name,
-                    is_ignored: c.is_ignored
-                });
+                await upsertContact(c.jid, c.company_id, c.name, c.profile_pic_url, !!c.name, null, c.is_business, c.verified_name, { push_name: c.push_name, is_ignored: c.is_ignored });
              } catch (singleErr) {}
         }
     }
@@ -125,22 +89,12 @@ export const upsertContactsBulk = async (contactsArray) => {
 
 export const upsertContact = async (jid, companyId, incomingName = null, profilePicUrl = null, isFromBook = false, lid = null, isBusiness = false, verifiedName = null, extraData = {}) => {
     try {
-        if (!jid || !companyId) return;
-        if (jid.includes('status@broadcast')) return; 
-        if (jid.includes('@newsletter')) return;
+        if (!jid || !companyId || jid.includes('status@broadcast') || jid.includes('@newsletter')) return;
 
         const cleanJid = normalizeJid(jid);
-        if (!cleanJid) return;
-
         const purePhone = cleanJid.split('@')[0].replace(/\D/g, ''); 
         
-        const updateData = {
-            jid: cleanJid,
-            phone: purePhone, 
-            company_id: companyId,
-            updated_at: new Date(),
-            ...extraData
-        };
+        const updateData = { jid: cleanJid, phone: purePhone, company_id: companyId, updated_at: new Date(), ...extraData };
 
         if (isBusiness) updateData.is_business = true;
         if (verifiedName) updateData.verified_name = verifiedName;
@@ -149,78 +103,45 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         const hasValidName = nameClean.length > 0;
         const isGeneric = isGenericName(incomingName, purePhone);
 
-        // --- LÓGICA DE HIERARQUIA DE NOMES ---
-        // 1. Se veio da agenda (isFromBook) e é válido -> Força update do 'name' (Autoridade Máxima)
         if (isFromBook && hasValidName) {
             updateData.name = incomingName;
-        } 
-        // 2. Se não veio da agenda, apenas salvamos no push_name ou verified_name
-        //    O campo 'name' no banco DEVE ser preservado se já existir
-        else {
-             if (hasValidName && !isGeneric) {
-                 updateData.push_name = incomingName;
-             }
-             // NÃO setamos updateData.name aqui para não sobrescrever um nome de agenda existente com um pushname
+        } else {
+             if (hasValidName && !isGeneric) updateData.push_name = incomingName;
         }
         
-        if (verifiedName) {
-            updateData.verified_name = verifiedName;
-            updateData.is_business = true;
-        }
-
         if (profilePicUrl) {
             updateData.profile_pic_url = profilePicUrl;
             updateData.profile_pic_updated_at = new Date(); 
         }
 
         await safeSupabaseCall(async () => {
-            const { error } = await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
-            if (error) {
-                console.error(`❌ [CONTACT] Erro ao salvar ${cleanJid}:`, error.message);
-                throw error;
-            }
+            await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
         });
 
         if (lid) {
             const cleanLid = normalizeJid(lid);
             if (cleanLid !== cleanJid) {
-                supabase.rpc('link_identities', { 
-                    p_lid: cleanLid, 
-                    p_phone: cleanJid, 
-                    p_company_id: companyId 
-                }).then(() => {});
+                supabase.rpc('link_identities', { p_lid: cleanLid, p_phone: cleanJid, p_company_id: companyId }).then(() => {});
             }
         }
-
-    } catch (e) {
-        // Erro silencioso
-    }
+    } catch (e) {}
 };
 
-// --- GUARDIÃO DE LEADS (ANTI GRUPO) ---
 export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     if (!jid) return null;
     
     const cleanJid = normalizeJid(jid);
     if (!cleanJid) return null;
 
-    // --- BLOQUEIO TOTAL DE GRUPOS E CANAIS ---
-    if (cleanJid.includes('@g.us')) return null;
-    if (cleanJid.includes('@newsletter')) return null;
-    if (cleanJid.includes('status@broadcast')) return null; 
+    if (cleanJid.includes('@g.us') || cleanJid.includes('@newsletter') || cleanJid.includes('status@broadcast')) return null; 
     
-    // --- BLOQUEIO DE SELF ---
     if (myJid) {
         const cleanMyJid = normalizeJid(myJid);
         if (cleanMyJid && cleanJid === cleanMyJid) return null;
     }
 
     const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
-    
-    if (purePhone.length < 8 || purePhone.length > 15) {
-        Logger.warn('baileys', `Lead Ignorado (Número inválido): ${purePhone}`, { jid: cleanJid }, companyId);
-        return null;
-    }
+    if (purePhone.length < 8 || purePhone.length > 15) return null;
     
     const lockKey = `${companyId}:${purePhone}`;
     if (leadLock.has(lockKey)) return null;
@@ -229,28 +150,18 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         leadLock.add(lockKey);
 
         const { data: contact } = await safeSupabaseCall(() => 
-            supabase.from('contacts')
-                .select('is_ignored, name, push_name, verified_name')
-                .eq('jid', cleanJid)
-                .eq('company_id', companyId)
-                .maybeSingle()
+            supabase.from('contacts').select('is_ignored, name, push_name, verified_name').eq('jid', cleanJid).eq('company_id', companyId).maybeSingle()
         );
 
-        if (contact?.is_ignored) {
-            Logger.info('baileys', `Lead Ignorado (Marcado como ignorado): ${purePhone}`, {}, companyId);
-            return null; 
-        }
+        if (contact?.is_ignored) return null; 
 
         let finalName = null;
-        
-        // Prioridade de nomes para o Lead (Herdada do Contato)
         if (contact) {
             if (contact.name && !isGenericName(contact.name, purePhone)) finalName = contact.name; 
             else if (contact.verified_name && !isGenericName(contact.verified_name, purePhone)) finalName = contact.verified_name;
             else if (contact.push_name && !isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
         }
         
-        // Fallback: PushName da mensagem atual
         if (!finalName && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
         }
@@ -260,27 +171,24 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         );
 
         if (existing) {
-            // Melhora o nome se o atual for ruim (genérico) e o novo for bom
             const currentNameIsBad = !existing.name || isGenericName(existing.name, purePhone);
             const newNameIsGood = finalName && !isGenericName(finalName, purePhone);
 
             if (currentNameIsBad && newNameIsGood) {
-                console.log(`✨ [CRM] Melhorando nome do Lead ${purePhone}: "${existing.name}" -> "${finalName}"`);
                 await supabase.from('leads').update({ name: finalName }).eq('id', existing.id);
             }
             return existing.id;
         }
 
-        // LOG CRÍTICO: Criação de Lead
-        Logger.info('baileys', `Criando novo Lead: ${purePhone}`, { name: finalName || 'Sem Nome' }, companyId);
+        // MUDANÇA AQUI: Removido Logger.info e trocado por console.log para não poluir o painel admin
+        // O Monitor Admin deve focar em ERROS, não em sucesso de rotina.
+        console.log(`✨ [CRM] Criando novo Lead: ${purePhone} (${finalName || 'Sem Nome'})`);
 
-        // Se não achou nome, deixa null (Frontend formata)
         if (finalName && isGenericName(finalName, purePhone)) {
             finalName = null;
         }
 
-        const { data: stage } = await supabase.from('pipeline_stages')
-            .select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
+        const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
 
         const { data: newLead } = await safeSupabaseCall(() => 
             supabase.from('leads').insert({
@@ -306,15 +214,12 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 export const upsertMessage = async (msgData) => {
     try {
         if (msgData.remote_jid.includes('status@broadcast')) return;
-        
         const cleanRemoteJid = normalizeJid(msgData.remote_jid);
         const finalData = { ...msgData, remote_jid: cleanRemoteJid };
 
         await safeSupabaseCall(async () => {
-            const { error } = await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
-            if (error) throw error;
+            await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
         });
-        
     } catch (e) {
         console.error(`❌ [SYNC] Erro upsertMessage:`, e.message);
     }
@@ -327,12 +232,6 @@ export const updateCampaignStats = async (campaignId, status) => {
 };
 
 export const deleteSessionData = async (sessionId, companyId) => {
-    await supabase.from('instances')
-        .update({ status: 'disconnected', qrcode_url: null })
-        .eq('session_id', sessionId)
-        .eq('company_id', companyId);
-        
-    await supabase.from('baileys_auth_state')
-        .delete()
-        .eq('session_id', sessionId);
+    await supabase.from('instances').update({ status: 'disconnected', qrcode_url: null }).eq('session_id', sessionId).eq('company_id', companyId);
+    await supabase.from('baileys_auth_state').delete().eq('session_id', sessionId);
 };
