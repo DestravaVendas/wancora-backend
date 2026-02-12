@@ -1,7 +1,6 @@
 
 import { createClient } from "@supabase/supabase-js";
 import { sendMessage } from '../services/baileys/sender.js';
-import { normalizeJid } from '../utils/wppParsers.js';
 import { Logger } from '../utils/logger.js';
 import { sessions, startSession as startBaileysSession } from '../services/baileys/connection.js';
 
@@ -14,7 +13,10 @@ const formatPhoneForWhatsapp = (phone) => {
     if (!phone) return null;
     let clean = phone.replace(/\D/g, '');
     if (clean.length === 10 || clean.length === 11) {
-        clean = '55' + clean;
+        // Assume BR se não tiver DDI
+        if (!clean.startsWith('55')) {
+             clean = '55' + clean;
+        }
     }
     return clean;
 };
@@ -27,7 +29,7 @@ export const sendAppointmentConfirmation = async (req, res) => {
   let { sessionId } = req.body;
   
   try {
-    Logger.info('backend', `[AGENDA] Iniciando confirmação`, { appointmentId, companyId }, companyId);
+    Logger.info('backend', `[AGENDA] Iniciando processo de confirmação`, { appointmentId, companyId }, companyId);
 
     if (!appointmentId) {
         throw new Error('appointmentId é obrigatório.');
@@ -45,58 +47,59 @@ export const sendAppointmentConfirmation = async (req, res) => {
       .single();
 
     if (error || !app) {
-      Logger.error('backend', `[AGENDA] Agendamento não encontrado`, { error, appointmentId }, companyId);
+      Logger.error('backend', `[AGENDA] Agendamento não encontrado no banco`, { error, appointmentId }, companyId);
       return res.status(404).json({ error: 'Agendamento não encontrado.' });
     }
     
+    // DEBUG: Verifica se já foi enviado
     if (app.confirmation_sent) {
-        Logger.warn('backend', `[AGENDA] Confirmação já enviada anteriormente`, { appointmentId }, companyId);
-        return res.json({ message: "Já enviado." });
+        Logger.warn('backend', `[AGENDA] Confirmação ignorada: Já marcada como enviada`, { appointmentId }, companyId);
+        // Não retorna erro para o frontend não achar que falhou, apenas avisa que já foi
+        return res.json({ message: "Já enviado anteriormente." });
     }
 
-    // 2. Resolução Inteligente de Sessão (JIT Restore)
+    // 2. Resolução de Sessão
     if (!sessionId) {
+      // Busca qualquer sessão conectada da empresa
       const { data: instance } = await supabase
         .from('instances')
         .select('session_id, status')
         .eq('company_id', app.company_id)
         .eq('status', 'connected')
+        .order('updated_at', { ascending: false }) // Pega a mais recente
         .limit(1)
         .maybeSingle();
 
       if (instance) {
           sessionId = instance.session_id;
           
-          // CHECK DE MEMÓRIA (A "Sessão Zumbi")
+          // CHECK DE MEMÓRIA (Zombie Check)
           let memorySession = sessions.get(sessionId);
           
           if (!memorySession) {
-              Logger.warn('baileys', `[AGENDA] Sessão ${sessionId} ZUMBI detectada. Tentando ressuscitar...`, { appointmentId }, companyId);
+              Logger.warn('baileys', `[AGENDA] Sessão ${sessionId} consta como conectada no DB mas não está na memória. Tentando restaurar...`, { appointmentId }, companyId);
               
-              // Tenta reconectar na hora
               try {
                   await startBaileysSession(sessionId, app.company_id);
-                  // Espera 5 segundos para o socket subir
-                  await delay(5000);
+                  await delay(5000); // Espera 5s para conexão subir
                   
-                  // Verifica de novo
                   memorySession = sessions.get(sessionId);
                   if (!memorySession) {
-                       throw new Error("Falha na auto-recuperação da sessão.");
+                       throw new Error("Falha na auto-recuperação da sessão Zumbi.");
                   }
-                  Logger.info('baileys', `[AGENDA] Sessão ressuscitada com sucesso!`, { sessionId }, companyId);
+                  Logger.info('baileys', `[AGENDA] Sessão restaurada com sucesso!`, { sessionId }, companyId);
               } catch (restoreError) {
-                   Logger.fatal('baileys', `[AGENDA] Falha fatal ao restaurar sessão para envio.`, { error: restoreError.message }, companyId);
-                   return res.status(503).json({ error: 'Erro crítico: Instância Zumbi. Reinício falhou.' });
+                   Logger.fatal('baileys', `[AGENDA] Falha fatal ao restaurar sessão.`, { error: restoreError.message }, companyId);
+                   return res.status(503).json({ error: 'Erro crítico: WhatsApp desconectado no servidor.' });
               }
           }
       } else {
-          Logger.error('backend', `[AGENDA] Nenhuma instância conectada encontrada para empresa.`, { companyId }, companyId);
+          Logger.error('backend', `[AGENDA] Nenhuma instância conectada disponível para envio.`, { companyId }, companyId);
           return res.status(503).json({ error: 'Nenhuma conexão WhatsApp disponível.' });
       }
     }
 
-    // 3. Buscar Regras de Notificação
+    // 3. Buscar Regras
     const { data: rules } = await supabase
         .from('availability_rules')
         .select('notification_config')
@@ -106,8 +109,8 @@ export const sendAppointmentConfirmation = async (req, res) => {
         .maybeSingle();
 
     if (!rules?.notification_config) {
-        Logger.info('backend', `[AGENDA] Sem regras de notificação configuradas.`, { companyId }, companyId);
-        return res.json({ message: "Sem regras configuradas." });
+        Logger.warn('backend', `[AGENDA] Sem regras de notificação configuradas para esta empresa.`, { companyId }, companyId);
+        return res.json({ message: "Sem configuração de notificação." });
     }
 
     const config = rules.notification_config;
@@ -136,6 +139,8 @@ export const sendAppointmentConfirmation = async (req, res) => {
             const adminPhone = formatPhoneForWhatsapp(config.admin_phone);
             const adminJid = `${adminPhone}@s.whatsapp.net`;
             
+            Logger.info('backend', `[AGENDA] Preparando envio para Admin`, { to: adminJid }, companyId);
+
             tasks.push(
                 sendMessage({ 
                     sessionId, 
@@ -146,10 +151,15 @@ export const sendAppointmentConfirmation = async (req, res) => {
                 })
                 .catch(e => {
                     Logger.error('backend', `[AGENDA] Falha envio Admin`, { to: adminJid, error: e.message }, companyId);
-                    throw e;
+                    // Não lança erro para não impedir o envio ao lead
+                    return { error: e.message }; 
                 })
             );
+        } else {
+            Logger.info('backend', `[AGENDA] Admin configurado mas sem trigger 'on_booking' ativo.`, {}, companyId);
         }
+    } else {
+        Logger.info('backend', `[AGENDA] Telefone Admin não configurado.`, {}, companyId);
     }
 
     // B. Notificar Lead
@@ -161,6 +171,8 @@ export const sendAppointmentConfirmation = async (req, res) => {
             const leadPhone = formatPhoneForWhatsapp(app.leads.phone);
             const leadJid = `${leadPhone}@s.whatsapp.net`;
             
+            Logger.info('backend', `[AGENDA] Preparando envio para Lead`, { to: leadJid }, companyId);
+
             tasks.push(
                 sendMessage({ 
                     sessionId, 
@@ -171,31 +183,38 @@ export const sendAppointmentConfirmation = async (req, res) => {
                 })
                 .catch(e => {
                     Logger.error('backend', `[AGENDA] Falha envio Lead`, { to: leadJid, error: e.message }, companyId);
-                    throw e;
+                    return { error: e.message };
                 })
             );
+        } else {
+             Logger.info('backend', `[AGENDA] Lead existe mas sem trigger 'on_booking' ativo.`, {}, companyId);
         }
+    } else {
+         Logger.warn('backend', `[AGENDA] Lead sem telefone ou config de notificação ausente.`, { lead: app.leads }, companyId);
     }
 
     // 4. Executar Envios
     if (tasks.length > 0) {
-        const results = await Promise.allSettled(tasks);
-        const rejected = results.filter(r => r.status === 'rejected');
+        const results = await Promise.all(tasks);
+        // Verifica se algum falhou
+        const failures = results.filter(r => r && r.error);
         
-        if (rejected.length > 0) {
-             throw new Error(`Falha em ${rejected.length} envios.`);
+        if (failures.length === tasks.length) {
+             throw new Error(`Todas as tentativas de envio falharam. Ex: ${failures[0].error}`);
         }
 
+        // Marca como enviado se pelo menos um funcionou
         await supabase.from('appointments').update({ confirmation_sent: true }).eq('id', appointmentId);
-        Logger.info('backend', `[AGENDA] Confirmações enviadas com sucesso.`, { appointmentId }, companyId);
+        Logger.info('backend', `[AGENDA] Processo finalizado. ${results.length - failures.length} enviados com sucesso.`, { appointmentId }, companyId);
+        
+        return res.status(200).json({ success: true, sent: results.length - failures.length });
     } else {
-        Logger.info('backend', `[AGENDA] Nenhuma notificação configurada para envio.`, { config }, companyId);
+        Logger.info('backend', `[AGENDA] Nenhuma tarefa de envio foi gerada (Verifique triggers ativos).`, { config }, companyId);
+        return res.json({ message: "Nenhum envio necessário com a config atual." });
     }
 
-    return res.status(200).json({ success: true });
-
   } catch (error) {
-    Logger.fatal('backend', `[AGENDA] Erro Fatal no Controller`, { error: error.message }, companyId);
+    Logger.fatal('backend', `[AGENDA] Erro Fatal no Controller`, { error: error.message, stack: error.stack }, companyId);
     return res.status(500).json({ error: error.message });
   }
 };
