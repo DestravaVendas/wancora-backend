@@ -6,6 +6,7 @@ import { refreshContactInfo } from './contactHandler.js';
 import { dispatchWebhook } from '../../integrations/webhook.js';
 import { transcribeAudio } from '../../ai/transcriber.js'; 
 import { createClient } from '@supabase/supabase-js';
+import { Logger } from '../../utils/logger.js'; 
 import axios from 'axios';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -23,8 +24,6 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const unwrapped = unwrapMessage(msg);
         let jid = normalizeJid(unwrapped.key.remoteJid);
         
-        // --- FILTRAGEM TÉCNICA (AUDITORIA) ---
-        // Identifica o tipo real do conteúdo
         const type = getContentType(unwrapped.message);
         
         // Ignora tipos que são eventos e não mensagens visuais
@@ -46,6 +45,8 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         
         const body = getBody(unwrapped.message);
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
+        
+        // Permite sticker passar mesmo sem body
         if (!body && !isMedia && type !== 'stickerMessage') return;
 
         // LID RESOLVER
@@ -54,7 +55,18 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             if (mapping?.phone_jid) jid = mapping.phone_jid; 
         }
 
-        // --- GHOST CHAT PREVENTION ---
+        // --- CORREÇÃO CRÍTICA: GARANTIA DE CONTATO ---
+        // Antes de processar lead ou mensagem, garantimos que o JID existe na tabela 'contacts'.
+        // Isso resolve o problema de "chats fantasmas" ou invisíveis para números novos.
+        if (!fromMe && !isGroup) {
+            await upsertContact(jid, companyId, pushName, null, false, null, false, null, { 
+                push_name: pushName,
+                last_message_at: new Date() // Já atualiza o timestamp para subir no chat
+            });
+        }
+        // ----------------------------------------------
+
+        // --- GHOST CHAT PREVENTION (Groups) ---
         if (isGroup && participantJid && !fromMe) {
             if (pushName) {
                await upsertContact(participantJid, companyId, null, null, false, null, false, null, { push_name: pushName });
@@ -67,13 +79,17 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         // --- LEAD GUARD ---
         if (!fromMe && !isGroup) {
             const { data: contact } = await supabase.from('contacts').select('is_ignored').eq('jid', jid).eq('company_id', companyId).maybeSingle();
-            if (contact?.is_ignored) return;
+            if (contact?.is_ignored) {
+                 // Logger.info('baileys', `[IGNORE] Msg de ${jid} ignorada (Blacklist).`, {}, companyId);
+                 return;
+            }
 
             const myJid = normalizeJid(sock.user?.id);
             if (isRealtime || createLead) {
                 await ensureLeadExists(jid, companyId, pushName, myJid);
+                // Refresh full info (foto, business) em background
                 if (isRealtime || fetchProfilePic) {
-                    refreshContactInfo(sock, jid, companyId, pushName).catch(err => console.error("Refresh Error", err));
+                    refreshContactInfo(sock, jid, companyId, pushName).catch(() => {});
                 }
             }
         }
@@ -85,15 +101,17 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         // Transcrição
         if (isRealtime && mediaUrl && type === 'audioMessage') {
-             try {
-                 const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
-                 const buffer = Buffer.from(response.data);
-                 transcribeAudio(buffer, 'audio/ogg', companyId).then(async (text) => {
+             // Fire and forget transcription
+             (async () => {
+                 try {
+                     const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
+                     const buffer = Buffer.from(response.data);
+                     const text = await transcribeAudio(buffer, 'audio/ogg', companyId);
                      if (text) {
                          await supabase.from('messages').update({ transcription: text }).eq('whatsapp_id', unwrapped.key.id).eq('company_id', companyId);
                      }
-                 });
-             } catch (err) {}
+                 } catch (err) {}
+             })();
         }
 
         const messageData = {
@@ -117,6 +135,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
              if (lead) messageData.lead_id = lead.id;
         }
 
+        // Tratamento de Tipos Especiais
         if (type === 'pollCreationMessage' || type === 'pollCreationMessageV3') {
             const poll = unwrapped.message[type];
             messageData.message_type = 'poll';
@@ -148,7 +167,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
 
     } catch (e) {
-        console.error(`❌ [HANDLER] Erro msg ${msg.key?.id}:`, e.message);
+        Logger.error('baileys', `[HANDLER] Erro ao processar msg ${msg.key?.id}`, { error: e.message }, companyId);
     }
 };
 
@@ -217,7 +236,7 @@ export const handleReaction = async (reactions, sock, companyId) => {
         const msgId = key.id;
         const participant = key.participant || key.remoteJid;
         const actor = normalizeJid(participant);
-        const emoji = r.text; // Pode ser string vazia para remoção
+        const emoji = r.text; 
 
         if (!msgId || !companyId) continue;
 
@@ -231,11 +250,8 @@ export const handleReaction = async (reactions, sock, companyId) => {
             if (msg) {
                 let currentReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
                 
-                // Remove reação anterior deste ator
                 currentReactions = currentReactions.filter(rx => rx.actor !== actor);
                 
-                // Se emoji não for vazio, adiciona a nova reação.
-                // Se for vazio, apenas removemos (já feito no filter acima).
                 if (emoji && emoji !== "") {
                     currentReactions.push({ text: emoji, actor: actor, ts: Date.now() });
                 }
