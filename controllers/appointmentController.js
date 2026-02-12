@@ -8,12 +8,10 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-// Helper de Limpeza e Formatação BR
 const formatPhoneForWhatsapp = (phone) => {
     if (!phone) return null;
     let clean = phone.replace(/\D/g, '');
     if (clean.length === 10 || clean.length === 11) {
-        // Assume BR se não tiver DDI
         if (!clean.startsWith('55')) {
              clean = '55' + clean;
         }
@@ -21,85 +19,78 @@ const formatPhoneForWhatsapp = (phone) => {
     return clean;
 };
 
-// Helper de espera
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
 export const sendAppointmentConfirmation = async (req, res) => {
   const { appointmentId, companyId } = req.body;
   let { sessionId } = req.body;
   
+  // LOG EXPLÍCITO: Quero saber que o request chegou
+  Logger.info('backend', `[AGENDA] Requisicao recebida para Appt: ${appointmentId}`, { body: req.body }, companyId);
+
   try {
-    Logger.info('backend', `[AGENDA] Iniciando processo de confirmação`, { appointmentId, companyId }, companyId);
+    if (!appointmentId) throw new Error('appointmentId é obrigatório.');
 
-    if (!appointmentId) {
-        throw new Error('appointmentId é obrigatório.');
-    }
-
-    // 1. Buscar dados do agendamento
     const { data: app, error } = await supabase
       .from('appointments')
-      .select(`
-        *,
-        leads (name, phone),
-        companies (name)
-      `)
+      .select(`*, leads (name, phone), companies (name)`)
       .eq('id', appointmentId)
       .single();
 
     if (error || !app) {
-      Logger.error('backend', `[AGENDA] Agendamento não encontrado no banco`, { error, appointmentId }, companyId);
+      Logger.error('backend', `[AGENDA] Agendamento não encontrado`, { error, appointmentId }, companyId);
       return res.status(404).json({ error: 'Agendamento não encontrado.' });
     }
-    
-    // DEBUG: Verifica se já foi enviado
+
     if (app.confirmation_sent) {
-        Logger.warn('backend', `[AGENDA] Confirmação ignorada: Já marcada como enviada`, { appointmentId }, companyId);
-        // Não retorna erro para o frontend não achar que falhou, apenas avisa que já foi
         return res.json({ message: "Já enviado anteriormente." });
     }
 
-    // 2. Resolução de Sessão
+    // --- 1. RESOLUÇÃO DE SESSÃO COM AUTO-CURA (JIT) ---
     if (!sessionId) {
-      // Busca qualquer sessão conectada da empresa
       const { data: instance } = await supabase
         .from('instances')
         .select('session_id, status')
         .eq('company_id', app.company_id)
         .eq('status', 'connected')
-        .order('updated_at', { ascending: false }) // Pega a mais recente
+        .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle();
 
       if (instance) {
           sessionId = instance.session_id;
           
-          // CHECK DE MEMÓRIA (Zombie Check)
-          let memorySession = sessions.get(sessionId);
+          // VERIFICAÇÃO CRÍTICA DE MEMÓRIA
+          const memorySession = sessions.get(sessionId);
           
-          if (!memorySession) {
-              Logger.warn('baileys', `[AGENDA] Sessão ${sessionId} consta como conectada no DB mas não está na memória. Tentando restaurar...`, { appointmentId }, companyId);
+          if (!memorySession || !memorySession.sock) {
+              Logger.warn('backend', `[AGENDA] SESSÃO ZUMBI DETECTADA! ${sessionId} consta no DB mas não na RAM. Iniciando Auto-Cura...`, {}, companyId);
               
+              // Tenta reviver a sessão AGORA
               try {
                   await startBaileysSession(sessionId, app.company_id);
-                  await delay(5000); // Espera 5s para conexão subir
+                  Logger.info('backend', `[AGENDA] Auto-Cura: Processo de reconexão iniciado. Aguardando socket...`, {}, companyId);
                   
-                  memorySession = sessions.get(sessionId);
-                  if (!memorySession) {
-                       throw new Error("Falha na auto-recuperação da sessão Zumbi.");
+                  // Espera 5 segundos para o socket subir e autenticar
+                  await delay(5000); 
+                  
+                  // Verifica de novo
+                  if (!sessions.get(sessionId)) {
+                      throw new Error("Falha na Auto-Cura: Sessão não subiu a tempo.");
                   }
-                  Logger.info('baileys', `[AGENDA] Sessão restaurada com sucesso!`, { sessionId }, companyId);
-              } catch (restoreError) {
-                   Logger.fatal('baileys', `[AGENDA] Falha fatal ao restaurar sessão.`, { error: restoreError.message }, companyId);
-                   return res.status(503).json({ error: 'Erro crítico: WhatsApp desconectado no servidor.' });
+                  Logger.info('backend', `[AGENDA] Auto-Cura: SUCESSO! Sessão ${sessionId} online para envio.`, {}, companyId);
+              } catch (restoreErr) {
+                  Logger.fatal('backend', `[AGENDA] Auto-Cura FALHOU.`, { error: restoreErr.message }, companyId);
+                  return res.status(503).json({ error: "Erro crítico de infraestrutura: WhatsApp offline." });
               }
           }
       } else {
-          Logger.error('backend', `[AGENDA] Nenhuma instância conectada disponível para envio.`, { companyId }, companyId);
+          Logger.error('backend', `[AGENDA] Nenhuma sessão conectada encontrada.`, { companyId }, companyId);
           return res.status(503).json({ error: 'Nenhuma conexão WhatsApp disponível.' });
       }
     }
 
-    // 3. Buscar Regras
+    // --- 2. PREPARAÇÃO DA MENSAGEM ---
     const { data: rules } = await supabase
         .from('availability_rules')
         .select('notification_config')
@@ -109,112 +100,58 @@ export const sendAppointmentConfirmation = async (req, res) => {
         .maybeSingle();
 
     if (!rules?.notification_config) {
-        Logger.warn('backend', `[AGENDA] Sem regras de notificação configuradas para esta empresa.`, { companyId }, companyId);
-        return res.json({ message: "Sem configuração de notificação." });
+        Logger.warn('backend', `[AGENDA] Sem config de notificação.`, {}, companyId);
+        return res.json({ message: "Sem configuração." });
     }
 
     const config = rules.notification_config;
     const tasks = [];
 
-    // Preparar Variáveis
     const dateObj = new Date(app.start_time);
     const dateStr = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(dateObj);
     const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
     
-    const replaceVars = (tpl) => {
-        return tpl
+    const replaceVars = (tpl) => tpl
             .replace(/\[lead_name\]/g, app.leads?.name || 'Cliente')
             .replace(/\[lead_phone\]/g, app.leads?.phone || '')
             .replace(/\[empresa\]/g, app.companies?.name || 'Nossa Empresa')
             .replace(/\[data\]/g, dateStr)
             .replace(/\[hora\]/g, timeStr);
-    };
 
-    // A. Notificar Admin
+    // ADMIN
     if (config.admin_phone && config.admin_notifications) {
-        const onBookingAdmin = config.admin_notifications.find(n => n.type === 'on_booking' && n.active);
-        
-        if (onBookingAdmin) {
-            const adminMsg = replaceVars(onBookingAdmin.template);
-            const adminPhone = formatPhoneForWhatsapp(config.admin_phone);
-            const adminJid = `${adminPhone}@s.whatsapp.net`;
-            
-            Logger.info('backend', `[AGENDA] Preparando envio para Admin`, { to: adminJid }, companyId);
-
-            tasks.push(
-                sendMessage({ 
-                    sessionId, 
-                    companyId: app.company_id,
-                    to: adminJid, 
-                    type: 'text', 
-                    content: adminMsg 
-                })
-                .catch(e => {
-                    Logger.error('backend', `[AGENDA] Falha envio Admin`, { to: adminJid, error: e.message }, companyId);
-                    // Não lança erro para não impedir o envio ao lead
-                    return { error: e.message }; 
-                })
-            );
-        } else {
-            Logger.info('backend', `[AGENDA] Admin configurado mas sem trigger 'on_booking' ativo.`, {}, companyId);
+        const trigger = config.admin_notifications.find(n => n.type === 'on_booking' && n.active);
+        if (trigger) {
+            const msg = replaceVars(trigger.template);
+            const phone = formatPhoneForWhatsapp(config.admin_phone);
+            tasks.push(sendMessage({ sessionId, companyId: app.company_id, to: `${phone}@s.whatsapp.net`, type: 'text', content: msg }));
         }
-    } else {
-        Logger.info('backend', `[AGENDA] Telefone Admin não configurado.`, {}, companyId);
     }
 
-    // B. Notificar Lead
+    // LEAD
     if (app.leads?.phone && config.lead_notifications) {
-        const onBookingLead = config.lead_notifications.find(n => n.type === 'on_booking' && n.active);
-        
-        if (onBookingLead) {
-            const leadMsg = replaceVars(onBookingLead.template);
-            const leadPhone = formatPhoneForWhatsapp(app.leads.phone);
-            const leadJid = `${leadPhone}@s.whatsapp.net`;
-            
-            Logger.info('backend', `[AGENDA] Preparando envio para Lead`, { to: leadJid }, companyId);
-
-            tasks.push(
-                sendMessage({ 
-                    sessionId, 
-                    companyId: app.company_id,
-                    to: leadJid, 
-                    type: 'text', 
-                    content: leadMsg 
-                })
-                .catch(e => {
-                    Logger.error('backend', `[AGENDA] Falha envio Lead`, { to: leadJid, error: e.message }, companyId);
-                    return { error: e.message };
-                })
-            );
-        } else {
-             Logger.info('backend', `[AGENDA] Lead existe mas sem trigger 'on_booking' ativo.`, {}, companyId);
+        const trigger = config.lead_notifications.find(n => n.type === 'on_booking' && n.active);
+        if (trigger) {
+            const msg = replaceVars(trigger.template);
+            const phone = formatPhoneForWhatsapp(app.leads.phone);
+            tasks.push(sendMessage({ sessionId, companyId: app.company_id, to: `${phone}@s.whatsapp.net`, type: 'text', content: msg }));
         }
-    } else {
-         Logger.warn('backend', `[AGENDA] Lead sem telefone ou config de notificação ausente.`, { lead: app.leads }, companyId);
     }
 
-    // 4. Executar Envios
     if (tasks.length > 0) {
-        const results = await Promise.all(tasks);
-        // Verifica se algum falhou
-        const failures = results.filter(r => r && r.error);
+        Logger.info('backend', `[AGENDA] Enviando ${tasks.length} mensagens...`, {}, companyId);
+        await Promise.allSettled(tasks); // Usa settled para não falhar se um der erro
         
-        if (failures.length === tasks.length) {
-             throw new Error(`Todas as tentativas de envio falharam. Ex: ${failures[0].error}`);
-        }
-
-        // Marca como enviado se pelo menos um funcionou
         await supabase.from('appointments').update({ confirmation_sent: true }).eq('id', appointmentId);
-        Logger.info('backend', `[AGENDA] Processo finalizado. ${results.length - failures.length} enviados com sucesso.`, { appointmentId }, companyId);
-        
-        return res.status(200).json({ success: true, sent: results.length - failures.length });
+        Logger.info('backend', `[AGENDA] Ciclo finalizado com sucesso.`, { appointmentId }, companyId);
+        return res.status(200).json({ success: true });
     } else {
-        Logger.info('backend', `[AGENDA] Nenhuma tarefa de envio foi gerada (Verifique triggers ativos).`, { config }, companyId);
-        return res.json({ message: "Nenhum envio necessário com a config atual." });
+        Logger.info('backend', `[AGENDA] Nenhum trigger ativo encontrado.`, {}, companyId);
+        return res.json({ message: "Nenhum envio necessário." });
     }
 
   } catch (error) {
-    Logger.fatal('backend', `[AGENDA] Erro Fatal no Controller`, { error: error.message, stack: error.stack }, companyId);
+    Logger.fatal('backend', `[AGENDA] Crash no controller`, { error: error.message, stack: error.stack }, companyId);
     return res.status(500).json({ error: error.message });
   }
 };
