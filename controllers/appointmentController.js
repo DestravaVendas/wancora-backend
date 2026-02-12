@@ -21,11 +21,33 @@ const formatPhoneForWhatsapp = (phone) => {
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
+// Helper: Aguarda o socket estar pronto para envio
+// Retorna a sessão válida ou lança erro
+const waitForSocket = async (sessionId, companyId, maxRetries = 10) => {
+    for (let i = 0; i < maxRetries; i++) {
+        const session = sessions.get(sessionId);
+        
+        // Verifica se existe, se tem socket e se o websocket está ABERTO (readyState 1)
+        if (session && session.sock && session.sock.ws && session.sock.ws.readyState === 1) {
+            return session;
+        }
+
+        // Se a sessão não existe na memória, tenta iniciar (JIT)
+        if (!session && i === 0) {
+            Logger.warn('backend', `[AGENDA] Sessão ${sessionId} não encontrada na RAM. Tentando restaurar...`, {}, companyId);
+            startBaileysSession(sessionId, companyId).catch(() => {});
+        }
+        
+        Logger.info('backend', `[AGENDA] Aguardando conexão estável... (${i + 1}/${maxRetries})`, {}, companyId);
+        await delay(2000); // Espera 2s
+    }
+    throw new Error("Timeout: WhatsApp não conectou a tempo para envio.");
+};
+
 export const sendAppointmentConfirmation = async (req, res) => {
   const { appointmentId, companyId } = req.body;
   let { sessionId } = req.body;
   
-  // LOG EXPLÍCITO: Quero saber que o request chegou
   Logger.info('backend', `[AGENDA] Requisicao recebida para Appt: ${appointmentId}`, { body: req.body }, companyId);
 
   try {
@@ -46,51 +68,41 @@ export const sendAppointmentConfirmation = async (req, res) => {
         return res.json({ message: "Já enviado anteriormente." });
     }
 
-    // --- 1. RESOLUÇÃO DE SESSÃO COM AUTO-CURA (JIT) ---
+    // --- 1. RESOLUÇÃO DE SESSÃO ---
     if (!sessionId) {
       const { data: instance } = await supabase
         .from('instances')
-        .select('session_id, status')
+        .select('session_id')
         .eq('company_id', app.company_id)
-        .eq('status', 'connected')
+        .eq('status', 'connected') // Prefere conectados
         .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle();
 
       if (instance) {
           sessionId = instance.session_id;
-          
-          // VERIFICAÇÃO CRÍTICA DE MEMÓRIA
-          const memorySession = sessions.get(sessionId);
-          
-          if (!memorySession || !memorySession.sock) {
-              Logger.warn('backend', `[AGENDA] SESSÃO ZUMBI DETECTADA! ${sessionId} consta no DB mas não na RAM. Iniciando Auto-Cura...`, {}, companyId);
-              
-              // Tenta reviver a sessão AGORA
-              try {
-                  await startBaileysSession(sessionId, app.company_id);
-                  Logger.info('backend', `[AGENDA] Auto-Cura: Processo de reconexão iniciado. Aguardando socket...`, {}, companyId);
-                  
-                  // Espera 5 segundos para o socket subir e autenticar
-                  await delay(5000); 
-                  
-                  // Verifica de novo
-                  if (!sessions.get(sessionId)) {
-                      throw new Error("Falha na Auto-Cura: Sessão não subiu a tempo.");
-                  }
-                  Logger.info('backend', `[AGENDA] Auto-Cura: SUCESSO! Sessão ${sessionId} online para envio.`, {}, companyId);
-              } catch (restoreErr) {
-                  Logger.fatal('backend', `[AGENDA] Auto-Cura FALHOU.`, { error: restoreErr.message }, companyId);
-                  return res.status(503).json({ error: "Erro crítico de infraestrutura: WhatsApp offline." });
-              }
-          }
       } else {
-          Logger.error('backend', `[AGENDA] Nenhuma sessão conectada encontrada.`, { companyId }, companyId);
-          return res.status(503).json({ error: 'Nenhuma conexão WhatsApp disponível.' });
+          // Tenta pegar qualquer sessão (mesmo desconectada, para tentar acordar)
+          const { data: anyInstance } = await supabase.from('instances').select('session_id').eq('company_id', app.company_id).limit(1).maybeSingle();
+          sessionId = anyInstance?.session_id;
       }
     }
 
-    // --- 2. PREPARAÇÃO DA MENSAGEM ---
+    if (!sessionId) {
+         Logger.error('backend', `[AGENDA] Nenhuma instância encontrada para empresa.`, { companyId }, companyId);
+         return res.status(503).json({ error: 'Nenhuma conexão WhatsApp disponível.' });
+    }
+
+    // --- 2. ESPERA ATIVA PELO SOCKET (Fix Conflito Stream) ---
+    // Em vez de falhar imediatamente, esperamos a conexão estabilizar
+    try {
+        await waitForSocket(sessionId, app.company_id);
+    } catch (socketError) {
+        Logger.fatal('backend', `[AGENDA] Falha ao obter socket estável.`, { error: socketError.message }, companyId);
+        return res.status(503).json({ error: "WhatsApp instável. Tente novamente em instantes." });
+    }
+
+    // --- 3. PREPARAÇÃO DA MENSAGEM ---
     const { data: rules } = await supabase
         .from('availability_rules')
         .select('notification_config')
@@ -140,7 +152,7 @@ export const sendAppointmentConfirmation = async (req, res) => {
 
     if (tasks.length > 0) {
         Logger.info('backend', `[AGENDA] Enviando ${tasks.length} mensagens...`, {}, companyId);
-        await Promise.allSettled(tasks); // Usa settled para não falhar se um der erro
+        await Promise.allSettled(tasks);
         
         await supabase.from('appointments').update({ confirmation_sent: true }).eq('id', appointmentId);
         Logger.info('backend', `[AGENDA] Ciclo finalizado com sucesso.`, { appointmentId }, companyId);
