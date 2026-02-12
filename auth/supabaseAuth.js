@@ -9,15 +9,34 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 // 🛡️ CORREÇÃO CRÍTICA (FIX BUFFER & JSON PARSING)
 // Garante que qualquer dado lido do banco seja convertido corretamente para Buffer
-// se ele estiver no formato { type: 'Buffer', data: [...] }
 const fixBuffer = (data) => {
     if (!data) return null;
     try {
-        const str = typeof data === 'string' ? data : JSON.stringify(data);
-        return JSON.parse(str, BufferJSON.reviver);
+        // Se já é objeto, tenta reviver
+        if (typeof data === 'object') {
+            // Verifica se é um Buffer disfarçado de objeto (formato do Baileys antigo)
+            if (data.type === 'Buffer' && Array.isArray(data.data)) {
+                return Buffer.from(data.data);
+            }
+            // Se já for Buffer real, retorna
+            if (Buffer.isBuffer(data)) return data;
+            
+            // Tenta passar pelo reviver do Baileys convertendo pra string e voltando
+            const str = JSON.stringify(data);
+            return JSON.parse(str, BufferJSON.reviver);
+        }
+        
+        // Se for string, parseia com reviver
+        if (typeof data === 'string') {
+            return JSON.parse(data, BufferJSON.reviver);
+        }
+        
+        return data;
     } catch (e) {
-        console.error("[AUTH] Falha ao reviver Buffer:", e.message);
-        return data; // Retorna original em caso de falha (fallback)
+        // Se falhar a conversão, o dado está corrompido. Retornar null força o Baileys a regenerar a chave.
+        // Isso é melhor que travar o processo.
+        console.warn("[AUTH] Buffer corrompido detectado, regenerando chave...");
+        return null;
     }
 };
 
@@ -34,16 +53,12 @@ export const useSupabaseAuthState = async (sessionId) => {
                 .eq('key_id', 'creds')
                 .maybeSingle();
             
-            if (error) {
-                console.error(`[AUTH] Erro DB ao buscar credenciais ${sessionId}:`, error.message);
-                return null;
-            }
-
+            if (error) throw error;
             if (!data?.payload) return null;
             
             return fixBuffer(data.payload);
         } catch (e) {
-            console.error('[AUTH] Exceção crítica ao ler credenciais:', e);
+            console.error(`[AUTH] Falha ao ler credenciais de ${sessionId}:`, e.message);
             return null;
         }
     };
@@ -66,7 +81,10 @@ export const useSupabaseAuthState = async (sessionId) => {
 
                         const result = {};
                         data?.forEach(row => {
-                            result[row.key_id] = fixBuffer(row.payload);
+                            const val = fixBuffer(row.payload);
+                            if (val) {
+                                result[row.key_id] = val;
+                            }
                         });
                         return result;
                     } catch (e) {
@@ -74,7 +92,7 @@ export const useSupabaseAuthState = async (sessionId) => {
                         return {};
                     }
                 },
-                // Escrita de chaves (Atomic Upsert)
+                // Escrita de chaves (Atomic Upsert com Delay para evitar Rate Limit do Banco)
                 set: async (data) => {
                     const rowsToUpsert = [];
                     const idsToDelete = [];
