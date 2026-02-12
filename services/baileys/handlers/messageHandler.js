@@ -6,7 +6,7 @@ import { refreshContactInfo } from './contactHandler.js';
 import { dispatchWebhook } from '../../integrations/webhook.js';
 import { transcribeAudio } from '../../ai/transcriber.js'; 
 import { createClient } from '@supabase/supabase-js';
-import { Logger } from '../../utils/logger.js'; 
+import { Logger } from '../../../utils/logger.js'; 
 import axios from 'axios';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
