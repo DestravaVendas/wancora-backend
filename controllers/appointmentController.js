@@ -106,6 +106,7 @@ export const sendAppointmentConfirmation = async (req, res) => {
         .maybeSingle();
 
     if (!rules?.notification_config) {
+        Logger.info('backend', `[AGENDA] Sem regras de notificação configuradas.`, { companyId }, companyId);
         return res.json({ message: "Sem regras configuradas." });
     }
 
@@ -187,7 +188,9 @@ export const sendAppointmentConfirmation = async (req, res) => {
 
         await supabase.from('appointments').update({ confirmation_sent: true }).eq('id', appointmentId);
         Logger.info('backend', `[AGENDA] Confirmações enviadas com sucesso.`, { appointmentId }, companyId);
-    } 
+    } else {
+        Logger.info('backend', `[AGENDA] Nenhuma notificação configurada para envio.`, { config }, companyId);
+    }
 
     return res.status(200).json({ success: true });
 
