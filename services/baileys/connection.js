@@ -59,7 +59,23 @@ const checkIsBusiness = async (sock) => {
     }
 };
 
+// Encerra forçadamente uma sessão em memória
+const killSession = (sessionId) => {
+    if (sessions.has(sessionId)) {
+        const session = sessions.get(sessionId);
+        try {
+            session.sock.end(undefined); // Fecha socket
+            session.sock.ws.close(); // Fecha WS
+        } catch (e) {}
+        sessions.delete(sessionId);
+        console.log(`💀 [CONNECTION] Sessão ${sessionId} morta na memória.`);
+    }
+};
+
 export const startSession = async (sessionId, companyId) => {
+    // 1. Matar qualquer processo zumbi antes de iniciar
+    killSession(sessionId);
+
     try {
         const { state, saveCreds } = await useSupabaseAuthState(sessionId);
         const { version } = await fetchLatestBaileysVersion();
@@ -92,7 +108,7 @@ export const startSession = async (sessionId, companyId) => {
             markOnlineOnConnect: true,
             generateHighQualityLinkPreview: true,
             defaultQueryTimeoutMs: 60000,
-            retryRequestDelayMs: 2500,
+            retryRequestDelayMs: 5000, // Aumentado para dar tempo ao sistema
             keepAliveIntervalMs: 30000, 
             shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter') || jid.includes('status@broadcast'),
             
@@ -115,7 +131,8 @@ export const startSession = async (sessionId, companyId) => {
                     } else if (msg.message_type === 'image') {
                         messagePayload = { imageMessage: { caption: msg.content, url: msg.media_url } };
                     } else if (msg.message_type === 'poll') {
-                        try {
+                        // ... Lógica de poll (simplificada aqui para brevidade do patch) ...
+                         try {
                             const pollContent = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
                             const options = (pollContent.options || []).map(opt => ({ 
                                 optionName: typeof opt === 'string' ? opt : (opt.optionName || 'Opção') 
@@ -127,9 +144,7 @@ export const startSession = async (sessionId, companyId) => {
                                     selectableOptionsCount: Number(pollContent.selectableOptionsCount) || 1
                                 }
                             };
-                        } catch (e) {
-                            messagePayload = { conversation: "[Enquete Corrompida]" };
-                        }
+                        } catch (e) {}
                     } else {
                         messagePayload = { conversation: msg.content || '' };
                     }
@@ -148,7 +163,7 @@ export const startSession = async (sessionId, companyId) => {
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
-            // DETECÇÃO DE ERRO CRÍTICO (Crypto Failure / Bad MAC)
+            // DETECÇÃO DE ERRO CRÍTICO (Crypto Failure / Bad MAC / Conflict)
             if (connection === 'close') {
                 const error = lastDisconnect?.error;
                 const statusCode = error?.output?.statusCode;
@@ -157,17 +172,27 @@ export const startSession = async (sessionId, companyId) => {
                 console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}. Msg: ${errorMsg}`);
 
                 const isCryptoError = errorMsg.includes('authenticate data') || errorMsg.includes('Signal') || errorMsg.includes('Bad MAC');
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 403 && !isCryptoError;
+                // Conflict (408, 440, 515)
+                const isConflict = errorMsg.includes('Stream Errored (conflict)') || statusCode === 440 || statusCode === 515;
+                const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 403;
 
-                if (!shouldReconnect) {
-                    Logger.fatal('baileys', `Sessão corrompida ou logout (${isCryptoError ? 'Erro Criptografia' : 'Logout'}).`, { sessionId, error: errorMsg, stack: error?.stack }, companyId);
+                // Se for logout ou erro de cripto IRRECUPERÁVEL, deleta a sessão
+                if (isLoggedOut || (isCryptoError && !isConflict)) {
+                    Logger.fatal('baileys', `Sessão encerrada permanentemente (${isCryptoError ? 'Erro Criptografia' : 'Logout'}).`, { sessionId, error: errorMsg }, companyId);
                     await deleteSession(sessionId, companyId);
                     return; 
                 }
 
-                if (statusCode === 440) return; // Conflito, não reconecta
+                // Se for conflito, adiciona delay grande E garante limpeza de memória
+                if (isConflict) {
+                     console.warn(`⚠️ [CONFLICT] Conflito de stream detectado para ${sessionId}. Reiniciando com backoff.`);
+                     killSession(sessionId); // Garante morte do socket atual
+                     handleReconnect(sessionId, companyId, 5000); // 5s de espera
+                     return;
+                }
 
-                handleReconnect(sessionId, companyId);
+                // Reconexão Padrão
+                handleReconnect(sessionId, companyId, 0);
             }
 
             if (qr) {
@@ -214,34 +239,31 @@ export const startSession = async (sessionId, companyId) => {
 
     } catch (error) {
         Logger.fatal('baileys', `Falha crítica ao iniciar sessão`, { sessionId, error: error.message, stack: error.stack }, companyId);
-        handleReconnect(sessionId, companyId);
+        handleReconnect(sessionId, companyId, 5000);
     }
 };
 
-const handleReconnect = (sessionId, companyId) => {
+const handleReconnect = (sessionId, companyId, extraDelay = 0) => {
     const attempt = (retries.get(sessionId) || 0) + 1;
     
-    if (attempt > 10) {
-        Logger.error('baileys', `Limite de tentativas de reconexão excedido.`, { sessionId }, companyId);
+    // Limite de 20 tentativas para evitar loop infinito eterno em casos de erro de infra
+    if (attempt > 20) {
+        Logger.error('baileys', `Limite de tentativas de reconexão excedido. Parando.`, { sessionId }, companyId);
         retries.delete(sessionId);
         updateInstanceStatus(sessionId, companyId, { status: 'disconnected' });
         return;
     }
 
     retries.set(sessionId, attempt);
-    const delayMs = Math.min(Math.pow(2, attempt) * 1000, 60000);
+    // Exponential Backoff: 2s, 4s, 8s, 16s... até 60s
+    const delayMs = Math.min(Math.pow(2, attempt) * 1000, 60000) + extraDelay;
+    
+    console.log(`♻️ [RETRY] Reconectando ${sessionId} em ${delayMs}ms (Tentativa ${attempt})...`);
     setTimeout(() => startSession(sessionId, companyId), delayMs);
 };
 
 export const deleteSession = async (sessionId, companyId) => {
-    const session = sessions.get(sessionId);
-    if (session) {
-        try {
-            session.sock.ev.removeAllListeners("connection.update");
-            session.sock.end(undefined);
-        } catch(e) {}
-        sessions.delete(sessionId);
-    }
+    killSession(sessionId);
     retries.delete(sessionId); 
     await deleteSessionData(sessionId, companyId);
 };
