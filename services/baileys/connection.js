@@ -59,22 +59,41 @@ const checkIsBusiness = async (sock) => {
     }
 };
 
-// Encerra forçadamente uma sessão em memória
+// Encerra forçadamente uma sessão em memória (Hard Kill)
 const killSession = (sessionId) => {
     if (sessions.has(sessionId)) {
+        console.log(`💀 [CONNECTION] Matando sessão ${sessionId} (Hard Kill)...`);
         const session = sessions.get(sessionId);
         try {
-            session.sock.end(undefined); // Fecha socket
-            session.sock.ws.close(); // Fecha WS
-        } catch (e) {}
+            // Tenta fechar graciosamente primeiro
+            session.sock.ev.removeAllListeners('connection.update'); // Remove listeners para evitar loops
+            session.sock.end(undefined); 
+            
+            // Força destruição do socket TCP se existir
+            if (session.sock.ws) {
+                session.sock.ws.terminate(); // Terminate é mais agressivo que close
+                session.sock.ws.removeAllListeners();
+            }
+        } catch (e) {
+            console.error(`Erro ao matar sessão: ${e.message}`);
+        }
         sessions.delete(sessionId);
-        console.log(`💀 [CONNECTION] Sessão ${sessionId} morta na memória.`);
     }
 };
 
 export const startSession = async (sessionId, companyId) => {
+    // 0. Verifica se já existe e está saudável
+    const existing = sessions.get(sessionId);
+    if (existing && existing.sock?.ws?.isOpen) {
+        console.log(`⚡ [CONNECTION] Sessão ${sessionId} já está online. Ignorando restart.`);
+        return existing.sock;
+    }
+
     // 1. Matar qualquer processo zumbi antes de iniciar
     killSession(sessionId);
+
+    // Pequeno delay para garantir que o socket antigo fechou portas
+    await new Promise(r => setTimeout(r, 1000));
 
     try {
         const { state, saveCreds } = await useSupabaseAuthState(sessionId);
@@ -187,10 +206,11 @@ export const startSession = async (sessionId, companyId) => {
                      // Gera um delay aleatório entre 15s e 30s
                      const jitter = Math.floor(Math.random() * (30000 - 15000 + 1) + 15000);
                      
-                     console.warn(`⚠️ [CONFLICT] Conflito de stream detectado para ${sessionId}. Reiniciando com Jitter de ${jitter}ms.`);
-                     Logger.warn('baileys', `Conflito de Stream. Aguardando ${jitter}ms.`, { sessionId }, companyId);
+                     Logger.warn('baileys', `Conflito de Stream (440). Jitter: ${jitter}ms.`, { sessionId }, companyId);
                      
+                     // Mata a sessão atual antes de agendar a próxima
                      killSession(sessionId); 
+                     
                      handleReconnect(sessionId, companyId, jitter); 
                      return;
                 }
@@ -250,7 +270,6 @@ export const startSession = async (sessionId, companyId) => {
 const handleReconnect = (sessionId, companyId, extraDelay = 0) => {
     const attempt = (retries.get(sessionId) || 0) + 1;
     
-    // Limite de 20 tentativas para evitar loop infinito eterno em casos de erro de infra
     if (attempt > 20) {
         Logger.error('baileys', `Limite de tentativas de reconexão excedido. Parando.`, { sessionId }, companyId);
         retries.delete(sessionId);
@@ -259,8 +278,6 @@ const handleReconnect = (sessionId, companyId, extraDelay = 0) => {
     }
 
     retries.set(sessionId, attempt);
-    // Exponential Backoff: 2s, 4s, 8s, 16s... até 60s
-    // Se tiver extraDelay (Jitter de conflito), soma ele
     const delayMs = Math.min(Math.pow(2, attempt) * 1000, 60000) + extraDelay;
     
     console.log(`♻️ [RETRY] Reconectando ${sessionId} em ${delayMs}ms (Tentativa ${attempt})...`);
