@@ -149,6 +149,11 @@ app.get('/health', (req, res) => {
  * 🔄 AUTO-RECONNECT
  */
 const restoreSessions = async () => {
+    // [FIX] Delay inicial de 10s para permitir que containers antigos morram (Graceful Shutdown)
+    // Isso evita o erro 440 (Conflict) durante deploys
+    console.log("⏳ [BOOT] Aguardando 10s para estabilização de containers...");
+    await new Promise(r => setTimeout(r, 10000));
+
     Logger.info('backend', 'Booting system: Restoring sessions...');
     try {
         const { data: instances, error } = await supabase
@@ -175,7 +180,7 @@ const restoreSessions = async () => {
 const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, () => {
-    console.log(`🚀 Wancora Backend v5.4.3 (Health Check Fix) rodando na porta ${PORT}`);
+    console.log(`🚀 Wancora Backend v5.4.4 (Stability Patch) rodando na porta ${PORT}`);
     
     restoreSessions();     
     startSentinel();       
