@@ -108,7 +108,7 @@ export const startSession = async (sessionId, companyId) => {
             markOnlineOnConnect: true,
             generateHighQualityLinkPreview: true,
             defaultQueryTimeoutMs: 60000,
-            retryRequestDelayMs: 5000, // Aumentado para dar tempo ao sistema
+            retryRequestDelayMs: 5000, 
             keepAliveIntervalMs: 30000, 
             shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter') || jid.includes('status@broadcast'),
             
@@ -131,7 +131,6 @@ export const startSession = async (sessionId, companyId) => {
                     } else if (msg.message_type === 'image') {
                         messagePayload = { imageMessage: { caption: msg.content, url: msg.media_url } };
                     } else if (msg.message_type === 'poll') {
-                        // ... Lógica de poll (simplificada aqui para brevidade do patch) ...
                          try {
                             const pollContent = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
                             const options = (pollContent.options || []).map(opt => ({ 
@@ -183,11 +182,16 @@ export const startSession = async (sessionId, companyId) => {
                     return; 
                 }
 
-                // Se for conflito, adiciona delay grande E garante limpeza de memória
+                // Se for conflito, adiciona delay grande E ALEATÓRIO (Jitter) para quebrar o ciclo
                 if (isConflict) {
-                     console.warn(`⚠️ [CONFLICT] Conflito de stream detectado para ${sessionId}. Reiniciando com backoff.`);
-                     killSession(sessionId); // Garante morte do socket atual
-                     handleReconnect(sessionId, companyId, 5000); // 5s de espera
+                     // Gera um delay aleatório entre 15s e 30s
+                     const jitter = Math.floor(Math.random() * (30000 - 15000 + 1) + 15000);
+                     
+                     console.warn(`⚠️ [CONFLICT] Conflito de stream detectado para ${sessionId}. Reiniciando com Jitter de ${jitter}ms.`);
+                     Logger.warn('baileys', `Conflito de Stream. Aguardando ${jitter}ms.`, { sessionId }, companyId);
+                     
+                     killSession(sessionId); 
+                     handleReconnect(sessionId, companyId, jitter); 
                      return;
                 }
 
@@ -256,6 +260,7 @@ const handleReconnect = (sessionId, companyId, extraDelay = 0) => {
 
     retries.set(sessionId, attempt);
     // Exponential Backoff: 2s, 4s, 8s, 16s... até 60s
+    // Se tiver extraDelay (Jitter de conflito), soma ele
     const delayMs = Math.min(Math.pow(2, attempt) * 1000, 60000) + extraDelay;
     
     console.log(`♻️ [RETRY] Reconectando ${sessionId} em ${delayMs}ms (Tentativa ${attempt})...`);
