@@ -14,6 +14,7 @@ import { createClient } from "@supabase/supabase-js";
 import getRedisClient from '../redisClient.js'; 
 import pino from 'pino';
 import { Logger } from '../../utils/logger.js'; 
+import { resetHistoryState } from './handlers/historyHandler.js'; // Import Necessário
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -73,6 +74,8 @@ const killSession = (sessionId) => {
             console.error(`Erro ao matar sessão: ${e.message}`);
         }
         sessions.delete(sessionId);
+        // Garante limpeza de estado de histórico para nova conexão limpa
+        resetHistoryState(sessionId);
     }
 };
 
@@ -178,6 +181,9 @@ export const startSession = async (sessionId, companyId) => {
                 const errorMsg = error?.message || '';
 
                 console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}. Msg: ${errorMsg}`);
+
+                // LIMPEZA DE CACHE DE HISTÓRICO AO CAIR
+                resetHistoryState(sessionId);
 
                 const isCryptoError = errorMsg.includes('authenticate data') || errorMsg.includes('Signal') || errorMsg.includes('Bad MAC');
                 const isConflict = errorMsg.includes('Stream Errored (conflict)') || statusCode === 440 || statusCode === 515;
