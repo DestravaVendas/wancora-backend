@@ -22,7 +22,6 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 export const sessions = new Map();
 const retries = new Map();
 
-// Logs apenas de erros fatais para reduzir ruído
 const logger = pino({ level: 'fatal' });
 
 const subscribeToRecentChats = async (sock, companyId) => {
@@ -59,19 +58,15 @@ const checkIsBusiness = async (sock) => {
     }
 };
 
-// Encerra forçadamente uma sessão em memória (Hard Kill)
 const killSession = (sessionId) => {
     if (sessions.has(sessionId)) {
         console.log(`💀 [CONNECTION] Matando sessão ${sessionId} (Hard Kill)...`);
         const session = sessions.get(sessionId);
         try {
-            // Tenta fechar graciosamente primeiro
-            session.sock.ev.removeAllListeners('connection.update'); // Remove listeners para evitar loops
+            session.sock.ev.removeAllListeners('connection.update'); 
             session.sock.end(undefined); 
-            
-            // Força destruição do socket TCP se existir
             if (session.sock.ws) {
-                session.sock.ws.terminate(); // Terminate é mais agressivo que close
+                session.sock.ws.terminate(); 
                 session.sock.ws.removeAllListeners();
             }
         } catch (e) {
@@ -82,17 +77,13 @@ const killSession = (sessionId) => {
 };
 
 export const startSession = async (sessionId, companyId) => {
-    // 0. Verifica se já existe e está saudável
     const existing = sessions.get(sessionId);
     if (existing && existing.sock?.ws?.isOpen) {
         console.log(`⚡ [CONNECTION] Sessão ${sessionId} já está online. Ignorando restart.`);
         return existing.sock;
     }
 
-    // 1. Matar qualquer processo zumbi antes de iniciar
     killSession(sessionId);
-
-    // Pequeno delay para garantir que o socket antigo fechou portas
     await new Promise(r => setTimeout(r, 1000));
 
     try {
@@ -124,10 +115,10 @@ export const startSession = async (sessionId, companyId) => {
             } : undefined,
             browser: Browsers.ubuntu("Chrome"), 
             syncFullHistory: true, 
-            markOnlineOnConnect: true,
+            markOnlineOnConnect: false, // Mudado para false para evitar flood antes do sync
             generateHighQualityLinkPreview: true,
-            defaultQueryTimeoutMs: 60000,
-            retryRequestDelayMs: 5000, 
+            defaultQueryTimeoutMs: 90000, // Aumentado para 90s
+            retryRequestDelayMs: 2500,    // Reduzido para tentar mais rápido em caso de falha
             keepAliveIntervalMs: 30000, 
             shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter') || jid.includes('status@broadcast'),
             
@@ -181,7 +172,6 @@ export const startSession = async (sessionId, companyId) => {
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
-            // DETECÇÃO DE ERRO CRÍTICO (Crypto Failure / Bad MAC / Conflict)
             if (connection === 'close') {
                 const error = lastDisconnect?.error;
                 const statusCode = error?.output?.statusCode;
@@ -190,32 +180,23 @@ export const startSession = async (sessionId, companyId) => {
                 console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}. Msg: ${errorMsg}`);
 
                 const isCryptoError = errorMsg.includes('authenticate data') || errorMsg.includes('Signal') || errorMsg.includes('Bad MAC');
-                // Conflict (408, 440, 515)
                 const isConflict = errorMsg.includes('Stream Errored (conflict)') || statusCode === 440 || statusCode === 515;
                 const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 403;
 
-                // Se for logout ou erro de cripto IRRECUPERÁVEL, deleta a sessão
                 if (isLoggedOut || (isCryptoError && !isConflict)) {
-                    Logger.fatal('baileys', `Sessão encerrada permanentemente (${isCryptoError ? 'Erro Criptografia' : 'Logout'}).`, { sessionId, error: errorMsg }, companyId);
+                    Logger.fatal('baileys', `Sessão encerrada permanentemente.`, { sessionId, error: errorMsg }, companyId);
                     await deleteSession(sessionId, companyId);
                     return; 
                 }
 
-                // Se for conflito, adiciona delay grande E ALEATÓRIO (Jitter) para quebrar o ciclo
                 if (isConflict) {
-                     // Gera um delay aleatório entre 15s e 30s
                      const jitter = Math.floor(Math.random() * (30000 - 15000 + 1) + 15000);
-                     
                      Logger.warn('baileys', `Conflito de Stream (440). Jitter: ${jitter}ms.`, { sessionId }, companyId);
-                     
-                     // Mata a sessão atual antes de agendar a próxima
                      killSession(sessionId); 
-                     
                      handleReconnect(sessionId, companyId, jitter); 
                      return;
                 }
 
-                // Reconexão Padrão
                 handleReconnect(sessionId, companyId, 0);
             }
 
@@ -253,7 +234,8 @@ export const startSession = async (sessionId, companyId) => {
                 }
 
                 await updateInstanceStatus(sessionId, companyId, updatePayload);
-                setTimeout(() => subscribeToRecentChats(sock, companyId), 5000);
+                // Inicia presença um pouco depois para não colidir com sync
+                setTimeout(() => subscribeToRecentChats(sock, companyId), 8000);
             }
         });
 
