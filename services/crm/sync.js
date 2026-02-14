@@ -155,6 +155,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
         if (contact?.is_ignored) return null; 
 
+        // LÓGICA DE NOME: Prioridade Agenda > Verified > Push > Novo Push
         let finalName = null;
         if (contact) {
             if (contact.name && !isGenericName(contact.name, purePhone)) finalName = contact.name; 
@@ -162,8 +163,11 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             else if (contact.push_name && !isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
         }
         
-        if (!finalName && pushName && !isGenericName(pushName, purePhone)) {
+        // Se ainda não temos nome, ou se o nome atual é genérico, tentamos o pushName novo
+        if ((!finalName || isGenericName(finalName, purePhone)) && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
+            // IMPORTANTE: Se descobrimos um nome novo melhor que o atual, atualizamos o contato!
+            await supabase.from('contacts').update({ push_name: pushName }).eq('jid', cleanJid).eq('company_id', companyId);
         }
 
         const { data: existing } = await safeSupabaseCall(() => 
@@ -171,6 +175,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         );
 
         if (existing) {
+            // Auto-Healing: Se o lead existente tem nome ruim e agora temos um bom, atualiza
             const currentNameIsBad = !existing.name || isGenericName(existing.name, purePhone);
             const newNameIsGood = finalName && !isGenericName(finalName, purePhone);
 
@@ -180,9 +185,8 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             return existing.id;
         }
 
-        // MUDANÇA AQUI: Removido Logger.info e trocado por console.log para não poluir o painel admin
-        // O Monitor Admin deve focar em ERROS, não em sucesso de rotina.
-        console.log(`✨ [CRM] Criando novo Lead: ${purePhone} (${finalName || 'Sem Nome'})`);
+        // Log removido conforme solicitado
+        // console.log(`✨ [CRM] Criando novo Lead: ${purePhone} (${finalName || 'Sem Nome'})`);
 
         if (finalName && isGenericName(finalName, purePhone)) {
             finalName = null;
