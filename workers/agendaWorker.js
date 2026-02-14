@@ -20,12 +20,13 @@ const processReminders = async () => {
         if (redis) {
             const acquired = await redis.set(LOCK_KEY, 'LOCKED', 'EX', LOCK_TTL, 'NX');
             if (!acquired) {
-                console.warn('🔒 [Agenda Worker] Execução anterior ainda ativa.');
+                // Silencioso: Worker anterior ainda rodando
                 return;
             }
         }
 
-        console.log('⏰ [Agenda Worker] Ciclo iniciado...');
+        // Log removido conforme solicitado: console.log('⏰ [Agenda Worker] Ciclo iniciado...');
+        
         const now = new Date();
         const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
