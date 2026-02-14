@@ -2,41 +2,39 @@
 import { BufferJSON, initAuthCreds } from '@whiskeysockets/baileys';
 import { createClient } from '@supabase/supabase-js';
 
-// Cliente Supabase Service Role (Acesso total para ler/gravar sessões)
+// Cliente Supabase Service Role
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
 
-// 🛡️ CORREÇÃO CRÍTICA (FIX BUFFER & JSON PARSING)
-// Garante que qualquer dado lido do banco seja convertido corretamente para Buffer
+// 🛡️ REVISÃO DE SERIALIZAÇÃO
+// Transforma dados do banco (JSONB) de volta para Buffer compatível com Baileys
 const fixBuffer = (data) => {
     if (!data) return null;
     try {
-        // Se já é objeto, tenta reviver
+        // Se já for Buffer, retorna
+        if (Buffer.isBuffer(data)) return data;
+
+        // Se for string JSON
+        if (typeof data === 'string') {
+            return JSON.parse(data, BufferJSON.reviver);
+        }
+
+        // Se for Objeto JSONB do Postgres (o caso mais comum de erro)
         if (typeof data === 'object') {
-            // Verifica se é um Buffer disfarçado de objeto (formato do Baileys antigo)
+            // Verifica assinatura do BufferJSON { type: 'Buffer', data: [...] }
             if (data.type === 'Buffer' && Array.isArray(data.data)) {
                 return Buffer.from(data.data);
             }
-            // Se já for Buffer real, retorna
-            if (Buffer.isBuffer(data)) return data;
-            
-            // Tenta passar pelo reviver do Baileys convertendo pra string e voltando
+            // Tenta reviver recursivamente (caso tenha buffers aninhados)
             const str = JSON.stringify(data);
             return JSON.parse(str, BufferJSON.reviver);
         }
         
-        // Se for string, parseia com reviver
-        if (typeof data === 'string') {
-            return JSON.parse(data, BufferJSON.reviver);
-        }
-        
         return data;
     } catch (e) {
-        // Se falhar a conversão, o dado está corrompido. Retornar null força o Baileys a regenerar a chave.
-        // Isso é melhor que travar o processo.
-        console.warn("[AUTH] Buffer corrompido detectado, regenerando chave...");
-        return null;
+        console.warn("[AUTH] Falha ao recuperar chave (Buffer Corrupto). Regenerando...", e.message);
+        return null; // Retornar null força o Baileys a recriar a chave
     }
 };
 
@@ -58,7 +56,7 @@ export const useSupabaseAuthState = async (sessionId) => {
             
             return fixBuffer(data.payload);
         } catch (e) {
-            console.error(`[AUTH] Falha ao ler credenciais de ${sessionId}:`, e.message);
+            console.error(`[AUTH] Falha leitura creds ${sessionId}:`, e.message);
             return null;
         }
     };
@@ -69,7 +67,6 @@ export const useSupabaseAuthState = async (sessionId) => {
         state: {
             creds,
             keys: {
-                // Leitura de chaves (Pre-keys, Sessions, SenderKeys, etc.)
                 get: async (type, ids) => {
                     try {
                         const { data } = await supabase
@@ -81,6 +78,7 @@ export const useSupabaseAuthState = async (sessionId) => {
 
                         const result = {};
                         data?.forEach(row => {
+                            // IMPORTANTE: Aplica o fixBuffer em cada chave recuperada
                             const val = fixBuffer(row.payload);
                             if (val) {
                                 result[row.key_id] = val;
@@ -88,11 +86,10 @@ export const useSupabaseAuthState = async (sessionId) => {
                         });
                         return result;
                     } catch (e) {
-                        console.error(`[AUTH] Erro crítico ao ler chaves ${type}:`, e);
+                        console.error(`[AUTH] Erro leitura keys ${type}:`, e.message);
                         return {};
                     }
                 },
-                // Escrita de chaves (Atomic Upsert com Delay para evitar Rate Limit do Banco)
                 set: async (data) => {
                     const rowsToUpsert = [];
                     const idsToDelete = [];
@@ -102,15 +99,14 @@ export const useSupabaseAuthState = async (sessionId) => {
                             const value = data[type][id];
                             
                             if (value) {
-                                // Se tem valor, prepara para salvar
-                                // Serializa usando BufferJSON.replacer para garantir integridade do Buffer
+                                // Serializa garantindo que Buffers virem { type: 'Buffer', data: [...] }
                                 const stringified = JSON.stringify(value, BufferJSON.replacer);
                                 
                                 rowsToUpsert.push({
                                     session_id: sessionId,
                                     data_type: type,
                                     key_id: id,
-                                    payload: JSON.parse(stringified), // Salva como JSONB nativo no Postgres
+                                    payload: JSON.parse(stringified), // Salva como JSON puro no banco
                                     updated_at: new Date()
                                 });
                             } else {
@@ -119,20 +115,19 @@ export const useSupabaseAuthState = async (sessionId) => {
                         }
                     }
 
-                    // 1. EXECUTA O UPSERT EM LOTE
                     if (rowsToUpsert.length > 0) {
                         try {
+                            // Upsert em lote para performance
                             const { error } = await supabase
                                 .from('baileys_auth_state')
                                 .upsert(rowsToUpsert, { onConflict: 'session_id, data_type, key_id' });
                             
                             if (error) console.error('[AUTH DB] Erro Upsert:', error.message);
                         } catch (e) {
-                            console.error('[AUTH NET] Erro Upsert:', e.message);
+                            console.error('[AUTH NET] Erro:', e.message);
                         }
                     }
 
-                    // 2. EXECUTA DELEÇÕES
                     if (idsToDelete.length > 0) {
                         for (const item of idsToDelete) {
                             try {
@@ -142,7 +137,7 @@ export const useSupabaseAuthState = async (sessionId) => {
                                     .eq('session_id', sessionId)
                                     .eq('data_type', item.type)
                                     .eq('key_id', item.id);
-                            } catch (e) { /* ignore */ }
+                            } catch (e) {}
                         }
                     }
                 }
@@ -150,9 +145,7 @@ export const useSupabaseAuthState = async (sessionId) => {
         },
         saveCreds: async () => {
             try {
-                // Serializa corretamente antes de salvar
                 const stringified = JSON.stringify(creds, BufferJSON.replacer);
-                
                 await supabase.from('baileys_auth_state').upsert({
                     session_id: sessionId,
                     data_type: 'creds',
@@ -161,7 +154,7 @@ export const useSupabaseAuthState = async (sessionId) => {
                     updated_at: new Date()
                 }, { onConflict: 'session_id,data_type,key_id' });
             } catch (e) {
-                console.error('[AUTH] Erro ao salvar creds:', e);
+                console.error('[AUTH] Erro saveCreds:', e.message);
             }
         }
     };
