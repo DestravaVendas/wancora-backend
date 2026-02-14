@@ -6,27 +6,23 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const HISTORY_MSG_LIMIT = 20; // Limite para feedback visual rápido
+const HISTORY_MSG_LIMIT = 25; // Aumentado levemente
 const HISTORY_MONTHS_LIMIT = 6;
-// Estado Global em Memória
 const processedHistoryChunks = new Set();
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Função para limpar cache de chunks de uma sessão específica (Fresh Start)
 export const resetHistoryState = (sessionId) => {
     for (const key of processedHistoryChunks) {
         if (key.startsWith(sessionId)) {
             processedHistoryChunks.delete(key);
         }
     }
-    // console.log(`🧹 [HISTORY] Cache de chunks limpo para ${sessionId} (Zero Start)`);
 };
 
 const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
-    // Roda em background, sem await crítico
-    const CONCURRENCY = 10;
-    const DELAY = 300;
+    const CONCURRENCY = 5; // Reduzido para evitar rate-limit do WhatsApp
+    const DELAY = 500;
     
     (async () => {
         for (let i = 0; i < contacts.length; i += CONCURRENCY) {
@@ -47,8 +43,6 @@ const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
 export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
     
     const chunkKey = `${sessionId}-chunk-${chunkCounter}`;
-    
-    // Verificação de duplicidade de processamento em memória
     if (processedHistoryChunks.has(chunkKey)) return;
     processedHistoryChunks.add(chunkKey);
 
@@ -57,23 +51,23 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
     await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress);
 
     try {
-        // MAPA DE MEMÓRIA (Fonte da Verdade Rápida para este Lote)
-        // Resetado a cada execução da função para garantir dados frescos
         const contactsMap = new Map();
         const contactsToFetchPic = [];
 
-        // =========================================================================
-        // FASE 1: INDEXAÇÃO DE CONTATOS (MEMORY-FIRST)
-        // =========================================================================
+        // 1. CONTATOS (Prioridade Máxima e Bloqueante)
         if (contacts && contacts.length > 0) {
-            const BATCH_SIZE = 500;
             const bulkPayload = [];
 
             for (const c of contacts) {
                 const jid = normalizeJid(c.id);
-                if (!jid) continue;
+                if (!jid || jid.includes('@lid')) continue;
 
-                // Link LID (Identity) em background
+                // Salva na memória para uso rápido nas mensagens
+                const bestName = c.name || c.notify || c.verifiedName;
+                const isFromBook = !!(c.name && c.name.trim().length > 0);
+                contactsMap.set(jid, { name: bestName, isFromBook: isFromBook });
+
+                // Link Identity em Background
                 if (c.lid) {
                      supabase.rpc('link_identities', {
                         p_lid: normalizeJid(c.lid),
@@ -81,16 +75,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         p_company_id: companyId
                     }).then(() => {});
                 }
-                
-                if (jid.includes('@lid')) continue;
 
-                // Lógica de Prioridade de Nome
-                const bestName = c.name || c.notify || c.verifiedName;
-                const isFromBook = !!(c.name && c.name.trim().length > 0);
-
-                // [CRÍTICO] Popula o mapa de memória IMEDIATAMENTE
-                contactsMap.set(jid, { name: bestName, isFromBook: isFromBook });
-
+                // Prepara Payload DB
                 const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
                 const contactData = {
                     jid: jid,
@@ -99,11 +85,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     updated_at: new Date()
                 };
 
-                if (isFromBook) {
-                    contactData.name = bestName;
-                } else if (bestName) {
-                    contactData.push_name = bestName;
-                }
+                if (isFromBook) contactData.name = bestName;
+                else if (bestName) contactData.push_name = bestName;
 
                 if (c.imgUrl) {
                     contactData.profile_pic_url = c.imgUrl;
@@ -120,44 +103,48 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 bulkPayload.push(contactData);
             }
 
-            // Dispara salvamento no banco (AWAIT para integridade, mas sem Sleep artificial)
+            // Upsert Bloqueante (Garante integridade FK)
             if (bulkPayload.length > 0) {
+                const BATCH_SIZE = 500;
                 for (let i = 0; i < bulkPayload.length; i += BATCH_SIZE) {
-                    const batch = bulkPayload.slice(i, i + BATCH_SIZE);
-                    await upsertContactsBulk(batch);
+                    await upsertContactsBulk(bulkPayload.slice(i, i + BATCH_SIZE));
                 }
             }
             
-            // Background Fetch de Fotos
+            // Fotos em paralelo
             if (contactsToFetchPic.length > 0) {
                 fetchProfilePicsInBackground(sock, contactsToFetchPic, companyId);
             }
         }
 
-        // =========================================================================
-        // FASE 2: PROCESSAMENTO DE MENSAGENS (COM INJEÇÃO DE NOME)
-        // =========================================================================
+        // 2. MENSAGENS (Processamento com Filtro e Try/Catch Isolado)
         if (messages && messages.length > 0) {
             
             const cutoffDate = new Date();
             cutoffDate.setMonth(cutoffDate.getMonth() - HISTORY_MONTHS_LIMIT);
             const cutoffTimestamp = Math.floor(cutoffDate.getTime() / 1000);
 
+            // Agrupa por Chat para pegar apenas as últimas
             const chats = {}; 
+            
             messages.forEach(msg => {
-                const clean = unwrapMessage(msg);
+                // Tenta desembrulhar com segurança
+                let clean;
+                try {
+                    clean = unwrapMessage(msg);
+                } catch(e) { return; } // Pula mensagem corrompida
+
                 if (!clean.key?.remoteJid) return;
                 
                 const msgTs = Number(clean.messageTimestamp);
                 if (msgTs < cutoffTimestamp) return;
 
                 const jid = normalizeJid(clean.key.remoteJid);
-                if (jid === 'status@broadcast') return;
+                if (!jid || jid === 'status@broadcast') return;
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // [CRÍTICO] INJEÇÃO DE NOME DA AGENDA
-                // Recupera o nome do contactsMap (Memória) que acabamos de criar.
+                // Injeta nome conhecido da memória (sem ir no banco)
                 const knownContact = contactsMap.get(jid);
                 if (knownContact && knownContact.isFromBook) {
                     clean._forcedName = knownContact.name;
@@ -171,33 +158,35 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             const chatJids = Object.keys(chats);
 
             for (const jid of chatJids) {
-                // Ordena
+                // Ordena por data
                 chats[jid].sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0)); 
                 
-                // Atualiza last_message_at (Fire and Forget)
-                const latestMsg = chats[jid][0];
+                // Pega apenas as N últimas
+                const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT).reverse(); 
+                
+                // Atualiza data da conversa (Fire and Forget)
+                const latestMsg = topMessages[topMessages.length - 1];
                 if (latestMsg && latestMsg.messageTimestamp) {
                     const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
                     supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
                 }
 
-                // Insere mensagens recentes
-                const topMessages = chats[jid].slice(0, HISTORY_MSG_LIMIT).reverse(); 
-                
                 for (const msg of topMessages) {
                     try {
                         const options = { 
                             downloadMedia: false, 
-                            fetchProfilePic: true, 
+                            fetchProfilePic: false, // Já foi feito no loop de contatos
                             createLead: true 
                         };
                         
-                        // Passamos msg._forcedName que vem direto da memória RAM (contactsMap)
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
-                    } catch (msgError) {}
+                    } catch (msgError) {
+                        // Log leve para não poluir
+                        // console.warn(`[SYNC] Falha ao processar msg histórica ${msg.key?.id} (Ignorada).`);
+                    }
                 }
-                // Yield para não travar o Event Loop
-                await sleep(0); 
+                // Pequeno respiro para o Event Loop
+                await sleep(5); 
             }
         }
 
@@ -207,7 +196,6 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         if (isLatest) {
             console.log(`✅ [HISTÓRICO] Sincronização 100% Concluída.`);
             await updateSyncStatus(sessionId, 'completed', 100);
-            // Limpeza final para garantir que próxima sincronização seja limpa também
             resetHistoryState(sessionId);
         }
     }
