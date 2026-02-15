@@ -33,31 +33,47 @@ export const sendAppointmentConfirmation = async (req, res) => {
     }
 
     // 1. DELAY DE CONSISTÊNCIA
-    await sleep(3000); // Aumentado para 3s para garantir propagação do DB
+    // Espera 3s para garantir que a transação do banco (insert appointment) propagou
+    await sleep(3000);
 
-    // 2. BUSCA CONFIGURAÇÃO
-    const { data: rule } = await supabase
-        .from('availability_rules')
-        .select('notification_config')
-        .eq('company_id', companyId)
-        .eq('is_active', true)
-        .limit(1)
-        .maybeSingle();
+    // 2. BUSCA CONFIGURAÇÃO DA REGRA
+    // Precisamos saber qual regra gerou isso para pegar os templates
+    const { data: app } = await supabase
+      .from('appointments')
+      .select(`*, leads (name, phone), companies (name)`)
+      .eq('id', appointmentId)
+      .single();
 
-    const config = rule?.notification_config;
+    if (!app) {
+        console.error(`[${TRACE_ID}] ❌ Agendamento não encontrado no banco.`);
+        return res.json({ status: 'appointment_not_found' });
+    }
+
+    if (app.confirmation_sent) {
+        console.log(`[${TRACE_ID}] ℹ️ Confirmação já enviada anteriormente.`);
+        return res.json({ status: 'already_sent' });
+    }
+
+    // Busca a regra de disponibilidade (que contem o config de notificação)
+    // Nota: O appointment não tem FK direta pra rule, mas podemos inferir ou pegar a regra geral do usuário/empresa
+    // Para simplificar, pegamos a primeira regra ativa que tenha config, ou buscamos pelo user_id se tiver
+    let query = supabase.from('availability_rules').select('notification_config').eq('company_id', companyId).eq('is_active', true);
+    if (app.user_id) query = query.eq('user_id', app.user_id);
+    
+    const { data: rules } = await query.limit(1);
+    const config = rules?.[0]?.notification_config;
     
     if (!config) {
         console.warn(`[${TRACE_ID}] ⚠️ Nenhuma regra de notificação ativa encontrada.`);
         return res.json({ status: 'no_config' });
     }
 
-    // 3. SELEÇÃO DE SESSÃO COM AUTO-HEAL
+    // 3. SELEÇÃO DE SESSÃO COM AUTO-HEAL E SMART ROUTING
     let activeSessionId = null;
-    let session = null;
-
-    // A. Tenta sessão específica configurada
+    
+    // A. Tenta sessão específica configurada no JSON
     if (config.sending_session_id) {
-        session = sessions.get(config.sending_session_id);
+        const session = sessions.get(config.sending_session_id);
         if (session?.sock) {
             activeSessionId = config.sending_session_id;
             console.log(`[${TRACE_ID}] ✅ Usando sessão configurada: ${activeSessionId}`);
@@ -68,7 +84,6 @@ export const sendAppointmentConfirmation = async (req, res) => {
 
     // B. Fallback Inteligente (Busca qualquer conectada)
     if (!activeSessionId) {
-        // Busca o que o banco DIZ que está conectado
         const { data: dbInstances } = await supabase
             .from('instances')
             .select('session_id')
@@ -85,48 +100,15 @@ export const sendAppointmentConfirmation = async (req, res) => {
                     break;
                 }
             }
-
-            // C. AUTO-HEAL DE EMERGÊNCIA
-            // Se o banco diz que tem sessões conectadas, mas a RAM está vazia, o servidor pode ter reiniciado sem restaurar.
-            // Vamos tentar acordar a primeira sessão encontrada.
-            if (!activeSessionId) {
-                const emergencyId = dbInstances[0].session_id;
-                console.warn(`[${TRACE_ID}] 🚨 EMERGÊNCIA: Banco diz que ${emergencyId} está online, mas RAM não. Tentando reviver...`);
-                try {
-                    // Tenta iniciar sessão (sem await longo para não travar request, mas torcendo pra dar tempo)
-                    // Nota: startSession é async, mas sock.ev.on('open') demora. 
-                    // O ideal aqui é apenas logar o erro e disparar o start para a PRÓXIMA vez funcionar.
-                    startSession(emergencyId, companyId).catch(err => console.error("Erro Auto-Heal:", err));
-                    
-                    // Retorna erro 'retry' para quem sabe um worker tentar depois?
-                    // Por enquanto, falha graceful.
-                    return res.json({ status: 'session_reviving', message: 'Sessão estava adormecida. Acordando...' });
-                } catch (e) {
-                    console.error(`[${TRACE_ID}] Falha no Auto-Heal:`, e);
-                }
-            }
         }
     }
 
     if (!activeSessionId) {
-        await Logger.error('backend', `[AGENDA] Nenhuma sessão disponível (RAM vazia).`, { appointmentId, availableInRam: [...sessions.keys()] }, companyId);
-        return res.json({ status: 'sessions_offline_everywhere' });
+        await Logger.error('backend', `[AGENDA] Nenhuma sessão disponível para envio.`, { appointmentId }, companyId);
+        return res.json({ status: 'sessions_offline' });
     }
 
-    // 4. Busca Dados do Agendamento
-    const { data: app } = await supabase
-      .from('appointments')
-      .select(`*, leads (name, phone), companies (name)`)
-      .eq('id', appointmentId)
-      .single();
-
-    if (!app) return res.json({ status: 'appointment_not_found' });
-    if (app.confirmation_sent) {
-        console.log(`[${TRACE_ID}] ℹ️ Já enviado anteriormente.`);
-        return res.json({ status: 'already_sent' });
-    }
-
-    // 5. Envio das Mensagens
+    // 5. Preparação das Mensagens
     const dateObj = new Date(app.start_time);
     const dateStr = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(dateObj);
     const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
@@ -143,13 +125,13 @@ export const sendAppointmentConfirmation = async (req, res) => {
 
     const tasks = [];
 
-    // -> ADMIN
+    // -> ADMIN NOTIFICATION
     if (config.admin_phone && config.admin_notifications) {
         const trigger = config.admin_notifications.find(n => n.type === 'on_booking' && n.active);
         if (trigger) {
             const phone = cleanPhone(config.admin_phone);
             if (phone) {
-                console.log(`[${TRACE_ID}] 📤 Enviando para Admin (${phone})...`);
+                console.log(`[${TRACE_ID}] 📤 Preparando envio Admin (${phone})...`);
                 tasks.push(
                     sendMessage({ 
                         sessionId: activeSessionId, 
@@ -166,13 +148,13 @@ export const sendAppointmentConfirmation = async (req, res) => {
         }
     }
 
-    // -> LEAD
+    // -> LEAD NOTIFICATION
     if (app.leads?.phone && config.lead_notifications) {
         const trigger = config.lead_notifications.find(n => n.type === 'on_booking' && n.active);
         if (trigger) {
             const phone = cleanPhone(app.leads.phone);
             if (phone) {
-                console.log(`[${TRACE_ID}] 📤 Enviando para Lead (${phone})...`);
+                console.log(`[${TRACE_ID}] 📤 Preparando envio Lead (${phone})...`);
                 tasks.push(
                     sendMessage({ 
                         sessionId: activeSessionId, 
@@ -189,23 +171,19 @@ export const sendAppointmentConfirmation = async (req, res) => {
         }
     }
 
-    // 6. Conclusão
+    // 6. Disparo
     if (tasks.length > 0) {
         await Promise.all(tasks);
         await supabase.from('appointments').update({ confirmation_sent: true }).eq('id', appointmentId);
         
-        console.log(`[${TRACE_ID}] ✨ Sucesso! ${tasks.length} mensagens enviadas.`);
-        await Logger.info('backend', `[AGENDA] Notificações enviadas com sucesso.`, { appointmentId, count: tasks.length }, companyId);
-        
+        console.log(`[${TRACE_ID}] ✨ Sucesso! Mensagens entregues.`);
         return res.json({ success: true, sent: tasks.length });
     }
 
-    console.log(`[${TRACE_ID}] ⚠️ Nenhuma ação configurada ou telefones inválidos.`);
     return res.json({ status: 'no_actions_needed' });
 
   } catch (error) {
-    console.error(`[${appointmentId}] ❌ FATAL CRASH:`, error);
-    Logger.error('backend', `[AGENDA] Erro Crítico Controller`, { error: error.message, stack: error.stack }, companyId);
-    return res.status(200).json({ error: error.message });
+    console.error(`[APP-ERROR] ❌`, error);
+    return res.status(500).json({ error: error.message });
   }
 };
