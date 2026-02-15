@@ -34,9 +34,9 @@ const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
     if (cleanName.length < 1) return true;
-    if (/^[\d\s\+\-\(\)]*$/.test(cleanName)) return true;
-    if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true;
-    return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName);
+    if (/^[\d\s\+\-\(\)]*$/.test(cleanName)) return true; // Só números/símbolos
+    if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true; // Nome igual telefone
+    return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName); // Sem letras
 };
 
 export const updateInstanceStatus = async (sessionId, companyId, data) => {
@@ -163,10 +163,10 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             else if (contact.push_name && !isGenericName(contact.push_name, purePhone)) finalName = contact.push_name;
         }
         
-        // Se ainda não temos nome, ou se o nome atual é genérico, tentamos o pushName novo
+        // Auto-Healing: Se o nome atual é ruim e temos um pushName novo bom, usa ele
         if ((!finalName || isGenericName(finalName, purePhone)) && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
-            // IMPORTANTE: Se descobrimos um nome novo melhor que o atual, atualizamos o contato!
+            // Persiste o novo nome descoberto no contato
             await supabase.from('contacts').update({ push_name: pushName }).eq('jid', cleanJid).eq('company_id', companyId);
         }
 
@@ -175,7 +175,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         );
 
         if (existing) {
-            // Auto-Healing: Se o lead existente tem nome ruim e agora temos um bom, atualiza
+            // Auto-Healing Lead: Atualiza lead se o nome dele for genérico e agora temos um bom
             const currentNameIsBad = !existing.name || isGenericName(existing.name, purePhone);
             const newNameIsGood = finalName && !isGenericName(finalName, purePhone);
 
@@ -185,9 +185,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
             return existing.id;
         }
 
-        // Log removido conforme solicitado
-        // console.log(`✨ [CRM] Criando novo Lead: ${purePhone} (${finalName || 'Sem Nome'})`);
-
+        // Se ainda for nulo ou genérico, manda NULL (Frontend formata)
         if (finalName && isGenericName(finalName, purePhone)) {
             finalName = null;
         }
