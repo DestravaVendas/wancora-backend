@@ -8,12 +8,17 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-const cleanPhone = (phone) => {
+// Helper robusto para telefones BR
+const formatPhoneForWhatsapp = (phone) => {
     if (!phone) return null;
     let p = phone.replace(/\D/g, '');
-    if ((p.length === 10 || p.length === 11) && !p.startsWith('55')) {
+    
+    // Se não tiver DDI, assume 55 (Brasil) se tiver tamanho compatível
+    if (p.length >= 10 && p.length <= 11 && !p.startsWith('55')) {
         p = '55' + p;
     }
+    
+    // Retorna o número limpo. O sufixo @s.whatsapp.net é adicionado no sender ou controller.
     return p;
 };
 
@@ -36,8 +41,7 @@ export const sendAppointmentConfirmation = async (req, res) => {
     // Espera 3s para garantir que a transação do banco (insert appointment) propagou
     await sleep(3000);
 
-    // 2. BUSCA CONFIGURAÇÃO DA REGRA
-    // Precisamos saber qual regra gerou isso para pegar os templates
+    // 2. BUSCA CONFIGURAÇÃO
     const { data: app } = await supabase
       .from('appointments')
       .select(`*, leads (name, phone), companies (name)`)
@@ -49,19 +53,28 @@ export const sendAppointmentConfirmation = async (req, res) => {
         return res.json({ status: 'appointment_not_found' });
     }
 
+    // Verifica flag de envio do agendamento específico (Se existir)
+    if (app.send_notifications === false) {
+        console.log(`[${TRACE_ID}] ℹ️ Notificações desativadas para este evento.`);
+        return res.json({ status: 'disabled_for_event' });
+    }
+
     if (app.confirmation_sent) {
         console.log(`[${TRACE_ID}] ℹ️ Confirmação já enviada anteriormente.`);
         return res.json({ status: 'already_sent' });
     }
 
-    // Busca a regra de disponibilidade (que contem o config de notificação)
-    // Nota: O appointment não tem FK direta pra rule, mas podemos inferir ou pegar a regra geral do usuário/empresa
-    // Para simplificar, pegamos a primeira regra ativa que tenha config, ou buscamos pelo user_id se tiver
-    let query = supabase.from('availability_rules').select('notification_config').eq('company_id', companyId).eq('is_active', true);
-    if (app.user_id) query = query.eq('user_id', app.user_id);
+    // Busca regra global ou usa customizada do evento
+    let config = app.custom_notification_config;
     
-    const { data: rules } = await query.limit(1);
-    const config = rules?.[0]?.notification_config;
+    if (!config) {
+        // Busca a regra de disponibilidade (que contem o config de notificação)
+        let query = supabase.from('availability_rules').select('notification_config').eq('company_id', companyId).eq('is_active', true);
+        if (app.user_id) query = query.eq('user_id', app.user_id);
+        
+        const { data: rules } = await query.limit(1);
+        config = rules?.[0]?.notification_config;
+    }
     
     if (!config) {
         console.warn(`[${TRACE_ID}] ⚠️ Nenhuma regra de notificação ativa encontrada.`);
@@ -129,7 +142,7 @@ export const sendAppointmentConfirmation = async (req, res) => {
     if (config.admin_phone && config.admin_notifications) {
         const trigger = config.admin_notifications.find(n => n.type === 'on_booking' && n.active);
         if (trigger) {
-            const phone = cleanPhone(config.admin_phone);
+            const phone = formatPhoneForWhatsapp(config.admin_phone);
             if (phone) {
                 console.log(`[${TRACE_ID}] 📤 Preparando envio Admin (${phone})...`);
                 tasks.push(
@@ -152,7 +165,7 @@ export const sendAppointmentConfirmation = async (req, res) => {
     if (app.leads?.phone && config.lead_notifications) {
         const trigger = config.lead_notifications.find(n => n.type === 'on_booking' && n.active);
         if (trigger) {
-            const phone = cleanPhone(app.leads.phone);
+            const phone = formatPhoneForWhatsapp(app.leads.phone);
             if (phone) {
                 console.log(`[${TRACE_ID}] 📤 Preparando envio Lead (${phone})...`);
                 tasks.push(
