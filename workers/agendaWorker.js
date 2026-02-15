@@ -34,7 +34,6 @@ const processReminders = async () => {
         // 1. REDE DE SEGURANÇA: Confirmações Imediatas (ON_BOOKING)
         // ============================================================
         // Busca agendamentos criados recentemente (última 1h) que NÃO tiveram confirmação enviada
-        // Isso cobre falhas de API ou timeouts no momento do agendamento
         const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
         
         const { data: missedConfirmations } = await supabase
@@ -50,13 +49,13 @@ const processReminders = async () => {
             .neq('status', 'cancelled');
 
         if (missedConfirmations && missedConfirmations.length > 0) {
+            // Apenas loga se realmente encontrar algo, para não poluir
             console.log(`🚨 [Agenda Worker] Recuperando ${missedConfirmations.length} confirmações falhas.`);
             
             for (const app of missedConfirmations) {
                 const config = app.availability_rules?.notification_config;
                 if (!config || !app.leads?.phone) continue;
 
-                // Tenta encontrar e disparar o trigger 'on_booking'
                 const sessionId = await getSessionId(app.company_id);
                 if (!sessionId) continue;
 
@@ -65,7 +64,7 @@ const processReminders = async () => {
                 const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
                 const replaceVars = (t) => t.replace('[lead_name]', app.leads.name).replace('[data]', dateStr).replace('[hora]', timeStr).replace('[empresa]', app.companies?.name || '');
 
-                // Envia para o Lead (Prioridade)
+                // Envia para o Lead
                 const leadTrigger = config.lead_notifications?.find(n => n.type === 'on_booking' && n.active);
                 if (leadTrigger) {
                      const leadPhone = cleanPhone(app.leads.phone);
@@ -79,7 +78,7 @@ const processReminders = async () => {
                     await sendMessage({ sessionId, to: `${adminPhone}@s.whatsapp.net`, type: 'text', content: replaceVars(adminTrigger.template) }).catch(() => {});
                 }
 
-                // Marca como enviado para não repetir
+                // Marca como enviado para não repetir o loop
                 await supabase.from('appointments').update({ confirmation_sent: true }).eq('id', app.id);
             }
         }
