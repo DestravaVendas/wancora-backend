@@ -14,7 +14,7 @@ import { createClient } from "@supabase/supabase-js";
 import getRedisClient from '../redisClient.js'; 
 import pino from 'pino';
 import { Logger } from '../../utils/logger.js'; 
-import { resetHistoryState } from './handlers/historyHandler.js'; // Import Necessário
+import { resetHistoryState } from './handlers/historyHandler.js'; // Import Vital
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -64,17 +64,33 @@ const killSession = (sessionId) => {
         console.log(`💀 [CONNECTION] Matando sessão ${sessionId} (Hard Kill)...`);
         const session = sessions.get(sessionId);
         try {
-            session.sock.ev.removeAllListeners('connection.update'); 
-            session.sock.end(undefined); 
+            // Remove listeners do Baileys
+            if (session.sock && session.sock.ev) {
+                session.sock.ev.removeAllListeners('connection.update');
+                session.sock.ev.removeAllListeners('creds.update');
+                session.sock.ev.removeAllListeners('messages.upsert');
+            }
+            
+            // Encerra socket de forma segura
+            session.sock.end(undefined);
+            
+            // Limpeza de WebSocket de baixo nível (Defensiva)
             if (session.sock.ws) {
-                session.sock.ws.terminate(); 
-                session.sock.ws.removeAllListeners();
+                if (typeof session.sock.ws.removeAllListeners === 'function') {
+                    session.sock.ws.removeAllListeners();
+                }
+                
+                if (typeof session.sock.ws.terminate === 'function') {
+                    session.sock.ws.terminate();
+                } else if (typeof session.sock.ws.close === 'function') {
+                    session.sock.ws.close();
+                }
             }
         } catch (e) {
             console.error(`Erro ao matar sessão: ${e.message}`);
         }
         sessions.delete(sessionId);
-        // Garante limpeza de estado de histórico para nova conexão limpa
+        // Limpa cache de histórico para evitar dados parciais na reconexão
         resetHistoryState(sessionId);
     }
 };
@@ -118,10 +134,10 @@ export const startSession = async (sessionId, companyId) => {
             } : undefined,
             browser: Browsers.ubuntu("Chrome"), 
             syncFullHistory: true, 
-            markOnlineOnConnect: false, // Mudado para false para evitar flood antes do sync
+            markOnlineOnConnect: false, // Otimização: Evita flood de presença antes do sync
             generateHighQualityLinkPreview: true,
-            defaultQueryTimeoutMs: 90000, // Aumentado para 90s
-            retryRequestDelayMs: 2500,    // Reduzido para tentar mais rápido em caso de falha
+            defaultQueryTimeoutMs: 90000, 
+            retryRequestDelayMs: 2500,
             keepAliveIntervalMs: 30000, 
             shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter') || jid.includes('status@broadcast'),
             
@@ -182,7 +198,6 @@ export const startSession = async (sessionId, companyId) => {
 
                 console.log(`❌ [DESCONECTADO] ${sessionId}. Code: ${statusCode}. Msg: ${errorMsg}`);
 
-                // LIMPEZA DE CACHE DE HISTÓRICO AO CAIR
                 resetHistoryState(sessionId);
 
                 const isCryptoError = errorMsg.includes('authenticate data') || errorMsg.includes('Signal') || errorMsg.includes('Bad MAC');
@@ -234,13 +249,13 @@ export const startSession = async (sessionId, companyId) => {
                     is_business_account: isBiz
                 };
 
+                // Se já estava completo, mantém. Se não, reseta para importar.
                 if (prev?.sync_status !== 'completed') {
                     updatePayload.sync_status = 'importing_contacts';
                     updatePayload.sync_percent = 5;
                 }
 
                 await updateInstanceStatus(sessionId, companyId, updatePayload);
-                // Inicia presença um pouco depois para não colidir com sync
                 setTimeout(() => subscribeToRecentChats(sock, companyId), 8000);
             }
         });
