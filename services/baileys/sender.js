@@ -66,9 +66,25 @@ export const sendMessage = async ({
     if (!session || !session.sock) throw new Error(`Sessão ${sessionId} não encontrada.`);
 
     const sock = session.sock;
-    const jid = normalizeJid(to);
+    let jid = normalizeJid(to);
 
     try {
+        // [FIX BRASIL] Validação de existência para corrigir 9º dígito
+        // Se o número for brasileiro e pessoal, perguntamos ao WhatsApp qual o JID correto.
+        // Isso resolve falhas de envio para números com/sem o 9 extra de forma definitiva.
+        if (jid.startsWith('55') && jid.includes('@s.whatsapp.net')) {
+            try {
+                // onWhatsApp retorna array. Pegamos o primeiro.
+                const [result] = await sock.onWhatsApp(jid);
+                if (result && result.exists) {
+                    jid = result.jid; // Usa o JID canônico retornado pelo servidor
+                }
+            } catch (e) {
+                // Falha silenciosa (timeout/network). Segue com o JID original.
+                // Não bloqueia o envio, apenas perde a correção automática.
+            }
+        }
+
         // [NOVO] Lógica de Drive Streaming
         // Se vier um driveFileId, baixamos o arquivo e sobrescrevemos os parâmetros de envio
         if (driveFileId && companyId) {
