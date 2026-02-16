@@ -32,12 +32,18 @@ const resolveSession = async (companyId, preferredSessionId) => {
 };
 
 // Helper de Replace de Variáveis
-const formatMessage = (template, app, recipientName, recipientPhone) => {
+// FIX: Agora aceita 'rule' para pegar defaults configurados no Frontend
+const formatMessage = (template, app, rule, recipientName, recipientPhone) => {
     if (!template) return "";
     
     const dateObj = new Date(app.start_time);
     const dateStr = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(dateObj);
     const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
+
+    // Prioridade: Dado do Evento > Dado da Configuração Global > Fallback
+    const location = app.event_location_details || rule?.event_location_details || app.category || 'Online';
+    const link = app.meet_link || rule?.meeting_url || '';
+    const companyName = app.companies?.name || '';
 
     return template
         .replace(/\[nome_do_lead\]/g, recipientName || 'Cliente')
@@ -45,9 +51,10 @@ const formatMessage = (template, app, recipientName, recipientPhone) => {
         .replace(/\[lead_phone\]/g, recipientPhone || '')
         .replace(/\[data\]/g, dateStr)
         .replace(/\[hora\]/g, timeStr)
-        .replace(/\[local\]/g, app.event_location_details || app.category || 'Online') // Fix: Usa detalhe do local se houver
-        .replace(/\[link_reuniao\]/g, app.meet_link || '')
-        .replace(/\[empresa\]/g, app.companies?.name || '');
+        .replace(/\[local\]/g, location) 
+        .replace(/\[link_reuniao\]/g, link)
+        .replace(/\[link\]/g, link) 
+        .replace(/\[empresa\]/g, companyName);
 };
 
 const processReminders = async () => {
@@ -80,7 +87,7 @@ const processReminders = async () => {
                 *,
                 leads (id, name, phone),
                 companies (name),
-                availability_rules (notification_config)
+                availability_rules (notification_config, meeting_url, event_location_details)
             `)
             .eq('confirmation_sent', false) // CRÍTICO: Ainda não enviado
             .gte('created_at', lookbackWindow.toISOString()) 
@@ -92,19 +99,24 @@ const processReminders = async () => {
             for (const app of newBookings) {
                 // A. Resolver Configuração (Prioridade: Custom > Regra de Disponibilidade)
                 let config = app.custom_notification_config;
+                let ruleData = app.availability_rules; // Pega dados da regra (Link/Local padrão)
                 
-                if (!config && app.availability_rules?.notification_config) {
-                    config = app.availability_rules.notification_config;
+                if (!config && ruleData?.notification_config) {
+                    config = ruleData.notification_config;
                 }
                 
                 // Fallback: Busca regra padrão ativa da empresa se não achou no join
                 if (!config) {
                      const { data: rules } = await supabase.from('availability_rules')
-                        .select('notification_config')
+                        .select('notification_config, meeting_url, event_location_details')
                         .eq('company_id', app.company_id)
                         .eq('is_active', true)
                         .limit(1);
-                     config = rules?.[0]?.notification_config;
+                     
+                     if (rules && rules.length > 0) {
+                        config = rules[0].notification_config;
+                        ruleData = rules[0];
+                     }
                 }
 
                 // Se não tiver config ou notificações desativadas no evento, marca como enviado para sair da fila
@@ -146,7 +158,7 @@ const processReminders = async () => {
                      for (const r of recipients) {
                          const phone = cleanPhone(r.phone);
                          if(phone) {
-                             const msg = formatMessage(leadTrigger.template, app, r.name, r.phone);
+                             const msg = formatMessage(leadTrigger.template, app, ruleData, r.name, r.phone);
                              await sendMessage({ 
                                  sessionId, 
                                  to: `${phone}@s.whatsapp.net`, 
@@ -164,7 +176,7 @@ const processReminders = async () => {
                     const adminPhone = cleanPhone(config.admin_phone);
                     if (adminPhone) {
                         const mainLeadName = app.leads?.name || recipients[0]?.name || 'Cliente';
-                        const msg = formatMessage(adminTrigger.template, app, mainLeadName, app.leads?.phone || '');
+                        const msg = formatMessage(adminTrigger.template, app, ruleData, mainLeadName, app.leads?.phone || '');
                         
                         await sendMessage({ 
                             sessionId, 
@@ -191,7 +203,7 @@ const processReminders = async () => {
                 *,
                 leads (id, name, phone),
                 companies (name),
-                availability_rules (notification_config)
+                availability_rules (notification_config, meeting_url, event_location_details)
             `)
             .eq('status', 'confirmed')
             .eq('reminder_sent', false)
@@ -202,10 +214,23 @@ const processReminders = async () => {
         if (reminders && reminders.length > 0) {
             for (const app of reminders) {
                 // Lógica de Config similar ao fluxo acima
-                let config = app.custom_notification_config || app.availability_rules?.notification_config;
+                let config = app.custom_notification_config;
+                let ruleData = app.availability_rules;
+
+                if (!config && ruleData?.notification_config) {
+                    config = ruleData.notification_config;
+                }
+
                 if(!config) {
-                     const { data: rules } = await supabase.from('availability_rules').select('notification_config').eq('company_id', app.company_id).limit(1);
-                     config = rules?.[0]?.notification_config;
+                     const { data: rules } = await supabase.from('availability_rules')
+                        .select('notification_config, meeting_url, event_location_details')
+                        .eq('company_id', app.company_id)
+                        .limit(1);
+                     
+                     if (rules && rules.length > 0) {
+                         config = rules[0].notification_config;
+                         ruleData = rules[0];
+                     }
                 }
 
                 const recipients = [];
@@ -248,7 +273,7 @@ const processReminders = async () => {
                             const leadPhone = cleanPhone(r.phone);
                             if (!leadPhone) continue;
 
-                            const msg = formatMessage(rule.template, app, r.name, r.phone);
+                            const msg = formatMessage(rule.template, app, ruleData, r.name, r.phone);
                             
                             try {
                                 await sendMessage({
