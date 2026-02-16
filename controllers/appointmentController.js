@@ -2,7 +2,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { sendMessage } from '../services/baileys/sender.js';
 import { Logger } from '../utils/logger.js';
-import { sessions, startSession } from '../services/baileys/connection.js';
+import { sessions } from '../services/baileys/connection.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -126,17 +126,42 @@ export const sendAppointmentConfirmation = async (req, res) => {
     const dateStr = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(dateObj);
     const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
     
-    const replaceVars = (tpl) => {
+    // Função helper atualizada para aceitar overrides de nome/telefone (para convidados)
+    const replaceVars = (tpl, targetName, targetPhone) => {
         if (!tpl) return "";
+        const name = targetName || app.leads?.name || 'Cliente';
+        const phone = targetPhone || app.leads?.phone || '';
+        
         return tpl
-            .replace(/\[lead_name\]/g, app.leads?.name || 'Cliente')
-            .replace(/\[lead_phone\]/g, app.leads?.phone || '')
+            .replace(/\[nome_do_lead\]/g, name)
+            .replace(/\[lead_name\]/g, name)
+            .replace(/\[lead_phone\]/g, phone)
             .replace(/\[empresa\]/g, app.companies?.name || 'Nossa Empresa')
             .replace(/\[data\]/g, dateStr)
-            .replace(/\[hora\]/g, timeStr);
+            .replace(/\[hora\]/g, timeStr)
+            .replace(/\[local\]/g, app.category || 'Online')
+            .replace(/\[link_reuniao\]/g, app.meet_link || '');
     };
 
     const tasks = [];
+
+    // --- NORMALIZAÇÃO DE DESTINATÁRIOS ---
+    const recipients = [];
+    
+    // 1. Lead Principal
+    if (app.leads?.phone) {
+        recipients.push({ name: app.leads.name, phone: app.leads.phone, type: 'lead' });
+    }
+    
+    // 2. Convidados (Guests)
+    if (app.guests && Array.isArray(app.guests)) {
+        app.guests.forEach(g => {
+            // Evita duplicar se o guest for o próprio lead principal
+            if (!recipients.find(r => r.phone === g.phone)) {
+                recipients.push({ name: g.name, phone: g.phone, type: 'guest' });
+            }
+        });
+    }
 
     // -> ADMIN NOTIFICATION
     if (config.admin_phone && config.admin_notifications) {
@@ -144,14 +169,17 @@ export const sendAppointmentConfirmation = async (req, res) => {
         if (trigger) {
             const phone = formatPhoneForWhatsapp(config.admin_phone);
             if (phone) {
+                // Nome do lead principal para o admin ver quem agendou
+                const mainLeadName = app.leads?.name || recipients[0]?.name || 'Novo Agendamento';
                 console.log(`[${TRACE_ID}] 📤 Preparando envio Admin (${phone})...`);
+                
                 tasks.push(
                     sendMessage({ 
                         sessionId: activeSessionId, 
                         companyId, 
                         to: `${phone}@s.whatsapp.net`, 
                         type: 'text', 
-                        content: replaceVars(trigger.template) 
+                        content: replaceVars(trigger.template, mainLeadName, phone) 
                     }).catch(err => {
                         console.error(`[${TRACE_ID}] Erro Admin:`, err.message);
                         Logger.error('backend', 'Erro envio Admin', { error: err.message }, companyId);
@@ -161,25 +189,27 @@ export const sendAppointmentConfirmation = async (req, res) => {
         }
     }
 
-    // -> LEAD NOTIFICATION
-    if (app.leads?.phone && config.lead_notifications) {
+    // -> LEAD & GUESTS NOTIFICATION (LOOP)
+    if (recipients.length > 0 && config.lead_notifications) {
         const trigger = config.lead_notifications.find(n => n.type === 'on_booking' && n.active);
         if (trigger) {
-            const phone = formatPhoneForWhatsapp(app.leads.phone);
-            if (phone) {
-                console.log(`[${TRACE_ID}] 📤 Preparando envio Lead (${phone})...`);
-                tasks.push(
-                    sendMessage({ 
-                        sessionId: activeSessionId, 
-                        companyId, 
-                        to: `${phone}@s.whatsapp.net`, 
-                        type: 'text', 
-                        content: replaceVars(trigger.template) 
-                    }).catch(err => {
-                        console.error(`[${TRACE_ID}] Erro Lead:`, err.message);
-                        Logger.error('backend', 'Erro envio Lead', { error: err.message }, companyId);
-                    })
-                );
+            for (const recipient of recipients) {
+                const phone = formatPhoneForWhatsapp(recipient.phone);
+                if (phone) {
+                    console.log(`[${TRACE_ID}] 📤 Preparando envio ${recipient.type} (${phone})...`);
+                    tasks.push(
+                        sendMessage({ 
+                            sessionId: activeSessionId, 
+                            companyId, 
+                            to: `${phone}@s.whatsapp.net`, 
+                            type: 'text', 
+                            content: replaceVars(trigger.template, recipient.name, recipient.phone) 
+                        }).catch(err => {
+                            console.error(`[${TRACE_ID}] Erro ${recipient.type}:`, err.message);
+                            Logger.error('backend', `Erro envio ${recipient.type}`, { error: err.message }, companyId);
+                        })
+                    );
+                }
             }
         }
     }
@@ -189,7 +219,7 @@ export const sendAppointmentConfirmation = async (req, res) => {
         await Promise.all(tasks);
         await supabase.from('appointments').update({ confirmation_sent: true }).eq('id', appointmentId);
         
-        console.log(`[${TRACE_ID}] ✨ Sucesso! Mensagens entregues.`);
+        console.log(`[${TRACE_ID}] ✨ Sucesso! ${tasks.length} mensagens entregues.`);
         return res.json({ success: true, sent: tasks.length });
     }
 
