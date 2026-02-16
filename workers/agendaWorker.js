@@ -32,13 +32,26 @@ const resolveSession = async (companyId, preferredSessionId) => {
 };
 
 // Helper de Replace de Variáveis
-// FIX: Agora aceita 'rule' para pegar defaults configurados no Frontend
+// FIX: Agora aceita 'rule' para pegar defaults configurados no Frontend e TIMEZONE
 const formatMessage = (template, app, rule, recipientName, recipientPhone) => {
     if (!template) return "";
     
     const dateObj = new Date(app.start_time);
-    const dateStr = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(dateObj);
-    const timeStr = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(dateObj);
+    
+    // FIX DE HORÁRIO: Usa o timezone configurado ou padrão SP
+    const timeZone = rule?.timezone || 'America/Sao_Paulo';
+
+    const dateStr = new Intl.DateTimeFormat('pt-BR', { 
+        day: '2-digit', 
+        month: '2-digit', 
+        timeZone 
+    }).format(dateObj);
+
+    const timeStr = new Intl.DateTimeFormat('pt-BR', { 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        timeZone 
+    }).format(dateObj);
 
     // Prioridade: Dado do Evento > Dado da Configuração Global > Fallback
     const location = app.event_location_details || rule?.event_location_details || app.category || 'Online';
@@ -87,7 +100,7 @@ const processReminders = async () => {
                 *,
                 leads (id, name, phone),
                 companies (name),
-                availability_rules (notification_config, meeting_url, event_location_details)
+                availability_rules (notification_config, meeting_url, event_location_details, timezone)
             `)
             .eq('confirmation_sent', false) // CRÍTICO: Ainda não enviado
             .gte('created_at', lookbackWindow.toISOString()) 
@@ -99,7 +112,7 @@ const processReminders = async () => {
             for (const app of newBookings) {
                 // A. Resolver Configuração (Prioridade: Custom > Regra de Disponibilidade)
                 let config = app.custom_notification_config;
-                let ruleData = app.availability_rules; // Pega dados da regra (Link/Local padrão)
+                let ruleData = app.availability_rules; // Pega dados da regra (Link/Local/Timezone)
                 
                 if (!config && ruleData?.notification_config) {
                     config = ruleData.notification_config;
@@ -108,7 +121,7 @@ const processReminders = async () => {
                 // Fallback: Busca regra padrão ativa da empresa se não achou no join
                 if (!config) {
                      const { data: rules } = await supabase.from('availability_rules')
-                        .select('notification_config, meeting_url, event_location_details')
+                        .select('notification_config, meeting_url, event_location_details, timezone')
                         .eq('company_id', app.company_id)
                         .eq('is_active', true)
                         .limit(1);
@@ -203,7 +216,7 @@ const processReminders = async () => {
                 *,
                 leads (id, name, phone),
                 companies (name),
-                availability_rules (notification_config, meeting_url, event_location_details)
+                availability_rules (notification_config, meeting_url, event_location_details, timezone)
             `)
             .eq('status', 'confirmed')
             .eq('reminder_sent', false)
@@ -223,7 +236,7 @@ const processReminders = async () => {
 
                 if(!config) {
                      const { data: rules } = await supabase.from('availability_rules')
-                        .select('notification_config, meeting_url, event_location_details')
+                        .select('notification_config, meeting_url, event_location_details, timezone')
                         .eq('company_id', app.company_id)
                         .limit(1);
                      
