@@ -95,6 +95,14 @@ const killSession = (sessionId) => {
     }
 };
 
+// [NOVO] Função para desligamento gracioso do servidor
+export const shutdownAllSessions = () => {
+    console.log(`🛑 [SHUTDOWN] Encerrando ${sessions.size} sessões ativas para evitar conflitos de deploy...`);
+    for (const sessionId of sessions.keys()) {
+        killSession(sessionId);
+    }
+};
+
 export const startSession = async (sessionId, companyId) => {
     const existing = sessions.get(sessionId);
     if (existing && existing.sock?.ws?.isOpen) {
