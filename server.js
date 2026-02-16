@@ -8,7 +8,7 @@ import helmet from 'helmet';
 import * as Sentry from "@sentry/node";
 import axios from 'axios'; 
 import { createClient } from "@supabase/supabase-js";
-import { startSession } from './services/baileys/connection.js';
+import { startSession, shutdownAllSessions } from './services/baileys/connection.js';
 import { startSentinel } from './services/scheduler/sentinel.js';
 import { startAgendaWorker } from './workers/agendaWorker.js';
 import { startRetentionWorker } from './workers/retentionWorker.js';
@@ -80,6 +80,26 @@ process.on('unhandledRejection', (reason, promise) => {
         stack: reason instanceof Error ? reason.stack : null
     });
 });
+
+// --- GRACEFUL SHUTDOWN (RENDER DEPLOY FIX) ---
+// Quando o Render faz deploy, ele envia SIGTERM para o container antigo.
+// Precisamos desconectar o Baileys manualmente para evitar conflito 440.
+const handleGracefulShutdown = (signal) => {
+    console.log(`🛑 Recebido ${signal}. Iniciando desligamento gracioso...`);
+    
+    // 1. Encerra conexões do WhatsApp
+    shutdownAllSessions();
+    
+    // 2. Aguarda um pouco para logs e DB terminarem
+    setTimeout(() => {
+        console.log('👋 Desligamento concluído. Bye.');
+        process.exit(0);
+    }, 1500);
+};
+
+process.on('SIGTERM', () => handleGracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => handleGracefulShutdown('SIGINT'));
+
 
 // PATCH: USER-AGENT SPOOFING
 const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
