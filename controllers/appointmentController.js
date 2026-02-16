@@ -2,26 +2,29 @@
 import { createClient } from "@supabase/supabase-js";
 import { Logger } from '../utils/logger.js';
 
-// Controller agora é apenas um "Dummy" para não quebrar chamadas do Frontend.
-// A lógica real foi movida 100% para o agendaWorker.js para simplificação.
+// MODO ASYNC-FIRST:
+// Este controller agora serve apenas para cumprir o contrato da API REST.
+// Ele não envia mensagens diretamente. Apenas valida e retorna sucesso.
+// O trabalho pesado de envio é feito pelo 'agendaWorker.js' que roda a cada minuto.
 
 export const sendAppointmentConfirmation = async (req, res) => {
   const { appointmentId, companyId } = req.body;
   const TRACE_ID = `APP-${appointmentId?.slice(0,4)}`;
 
   try {
-    // Apenas loga que a solicitação chegou. O Worker vai pegar isso no banco em < 1 min.
-    console.log(`[${TRACE_ID}] 📥 Agendamento recebido. Delegando envio para AgendaWorker.`);
+    // Loga a intenção para fins de debug, mas não bloqueia a thread
+    // O Worker vai pegar esse registro no banco baseado em 'confirmation_sent = false'
+    console.log(`[${TRACE_ID}] 📥 Solicitação de confirmação recebida. Delegando para Fila Assíncrona (Worker).`);
 
     if (!appointmentId || !companyId) {
         return res.status(400).json({ error: "Dados incompletos." });
     }
 
-    // Retorna sucesso imediato para liberar a UI do cliente
+    // Retorna sucesso imediato para a UI não ficar travada esperando o WhatsApp
     return res.json({ 
         success: true, 
-        queued: true, 
-        message: "Agendamento registrado. A notificação será enviada pelo Worker em instantes." 
+        mode: 'async',
+        message: "Solicitação enfileirada. O envio será processado em instantes pelo sistema." 
     });
 
   } catch (error) {
