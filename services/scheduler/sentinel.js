@@ -160,7 +160,6 @@ const processAIResponse = async (payload) => {
         .maybeSingle();
 
     if (!lead) {
-        // Logger.info('sentinel', `Ignorado: Contato ${phone} não é um Lead.`, {}, company_id);
         return;
     }
 
@@ -253,11 +252,9 @@ const processAIResponse = async (payload) => {
         });
 
         // --- 6. Prompt Engineering (NOVO ENGINE CENTRALIZADO) ---
-        // Aqui usamos a função compartilhada para gerar o prompt exato
-        // que foi visto no simulador.
         let systemInstruction = buildSystemPrompt(agent);
 
-        // Adiciona informações de tempo de execução que não estão no config estático
+        // Adiciona informações de tempo de execução
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
         const availableLinks = agent.links_config?.map(l => `Link para "${l.title}": ${l.url}`).join('\n') || '';
 
@@ -301,9 +298,9 @@ const processAIResponse = async (payload) => {
                 config: {
                     systemInstruction: systemInstruction,
                     temperature: agent.level === 'senior' ? 0.5 : 0.7, 
-                    // CRÍTICO: Aumentado para 1000 tokens para evitar cortes em respostas detalhadas.
-                    // O modo "Thinking" consome tokens internamente e a resposta final precisa de espaço.
-                    maxOutputTokens: 1000, 
+                    // MAX TOKENS: Aumentado para 8192 para garantir que a IA nunca corte a fala
+                    // O controle de brevidade agora é feito via PROMPT (Stop after question).
+                    maxOutputTokens: 8192, 
                     ...toolsConfig
                 }
             });
@@ -403,7 +400,7 @@ const processAIResponse = async (payload) => {
                 config: { 
                     systemInstruction, 
                     temperature: 0.5, 
-                    maxOutputTokens: 1000, 
+                    maxOutputTokens: 8192, // Manteve 8k
                     ...toolsConfig 
                 }
             });
