@@ -177,5 +177,12 @@ export const buildSystemPrompt = (agent) => {
         prompt += `\n[REGRAS DE ESCAPE]\n${p.escape_rules.map(s => '- ' + s).join('\n')}\n`;
     }
 
+    // 12. MODO PENSAMENTO (CHAIN OF THOUGHT) - CORREÇÃO DE CORTE
+    prompt += `
+\n[MODO PENSAMENTO ATIVADO]
+Antes de responder, pense silenciosamente sobre o contexto, a pergunta do cliente e a melhor estratégia.
+IMPORTANTE: Sua resposta final deve ser completa. Se precisar exceder um pouco o tamanho para não cortar a frase, faça isso. 
+NUNCA envie respostas cortadas ou incompletas. Termine sempre a frase ou pensamento.`;
+
     return prompt;
 };
