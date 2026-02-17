@@ -5,7 +5,7 @@ import { sendMessage } from "../baileys/sender.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
-import axios from 'axios';
+import { buildSystemPrompt } from "../../utils/promptBuilder.js"; // IMPORTANTE: O "Cérebro" compartilhado
 
 // Cliente Supabase Service Role (Realtime)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -252,59 +252,37 @@ const processAIResponse = async (payload) => {
             };
         });
 
-        // --- 6. Prompt Engineering ---
+        // --- 6. Prompt Engineering (NOVO ENGINE CENTRALIZADO) ---
+        // Aqui usamos a função compartilhada para gerar o prompt exato
+        // que foi visto no simulador.
+        let systemInstruction = buildSystemPrompt(agent);
+
+        // Adiciona informações de tempo de execução que não estão no config estático
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
         const availableLinks = agent.links_config?.map(l => `Link para "${l.title}": ${l.url}`).join('\n') || '';
 
-        const negativeList = agent.personality_config?.negative_prompts?.map(p => `- EVITE: ${p}`).join('\n') || '';
-        const escapeList = agent.personality_config?.escape_rules?.map(p => `- REGRA DE ESCAPE: ${p}`).join('\n') || '';
-
-        let systemInstruction = `
-        VOCÊ É: ${agent.name}, um assistente nível ${agent.level.toUpperCase()} da empresa.
+        // Injeta dados dinâmicos do cliente
+        systemInstruction += `
         
-        SUA MISSÃO:
-        ${agent.prompt_instruction}
-        
-        CONTEXTO DO CLIENTE:
-        Nome: ${lead.name || 'Não identificado'}
+        [CONTEXTO ATUAL DA CONVERSA]
+        Cliente: ${lead.name || 'Não identificado'}
         Telefone: ${phone}
         
-        BASE DE CONHECIMENTO (ARQUIVOS):
+        [BASE DE CONHECIMENTO (ARQUIVOS)]
         ${filesKnowledge}
         
-        LINKS ÚTEIS DISPONÍVEIS (Use quando o cliente pedir):
+        [LINKS ÚTEIS DISPONÍVEIS]
         ${availableLinks}
-        
-        DIRETRIZES DE PERSONALIDADE:
-        Papel: ${agent.personality_config?.role || 'Atendente'}
-        Tom: ${agent.personality_config?.tone || 'Profissional'}
-        Contexto Empresa: ${agent.personality_config?.context || ''}
-
-        RESTRIÇÕES & REGRAS:
-        ${negativeList}
-        ${escapeList}
         `;
 
+        // Regras específicas de nível (Hardcoded safeguards)
         if (agent.level === 'junior') {
-            systemInstruction += `
-            - Responda de forma curta e direta.
-            - Use a ferramenta 'transfer_to_human' se o cliente solicitar ou se não souber responder.
-            - Não invente informações.`;
-        } else if (agent.level === 'pleno') {
-            systemInstruction += `
-            - Use técnicas de venda e persuasão.
-            - Tente contornar objeções simples.
-            - Use as informações dos arquivos para responder dúvidas.`;
-        } else if (agent.level === 'senior') {
-            systemInstruction += `
-            - Você é um especialista autônomo.
-            - Pode agendar reuniões e buscar arquivos no Drive se necessário.
-            - Analise o sentimento. Se o cliente estiver irritado, use 'transfer_to_human'.`;
-        }
+            systemInstruction += `\n[NÍVEL JUNIOR] Se não souber responder, use a ferramenta 'transfer_to_human'.`;
+        } 
 
         const fullContents = [...chatHistory, { role: 'user', parts: [{ text: userMessage }] }];
 
-        // Configuração de Tools: Junior agora tem acesso ao Transfer
+        // Configuração de Tools
         let tools = [TRANSFER_TOOL];
         if (agent.level === 'senior') {
             tools = [...tools, ...ADVANCED_TOOLS];
@@ -323,15 +301,24 @@ const processAIResponse = async (payload) => {
                 config: {
                     systemInstruction: systemInstruction,
                     temperature: agent.level === 'senior' ? 0.5 : 0.7, 
+                    maxOutputTokens: 250, // Limite para garantir respostas concisas
                     ...toolsConfig
                 }
             });
         } catch (genError) {
-             if (genError.message.includes('API key not valid')) {
-                 Logger.fatal('sentinel', 'Chave Gemini Inválida. Verifique o Render ou Configurações.', {}, company_id);
+             const errMsg = genError.message || '';
+             
+             if (errMsg.includes('API key not valid')) {
+                 Logger.fatal('sentinel', 'Chave Gemini Inválida. Verifique Configurações.', {}, company_id);
                  return;
              }
-             throw genError;
+             if (errMsg.includes('404') || errMsg.includes('not found')) {
+                 Logger.error('sentinel', `Modelo IA não encontrado: ${activeModel}. Tente alterar para 'gemini-1.5-flash' no banco.`, { error: errMsg }, company_id);
+                 return;
+             }
+             
+             Logger.error('sentinel', 'Erro na API Gemini', { error: errMsg }, company_id);
+             return;
         }
 
         // --- 8. Processamento de Tools e Envio ---
@@ -411,7 +398,12 @@ const processAIResponse = async (payload) => {
             toolResponse = await ai.models.generateContent({
                 model: activeModel,
                 contents: fullContents,
-                config: { systemInstruction, temperature: 0.5, ...toolsConfig }
+                config: { 
+                    systemInstruction, 
+                    temperature: 0.5, 
+                    maxOutputTokens: 250, 
+                    ...toolsConfig 
+                }
             });
             
             functionCalls = toolResponse.functionCalls;
@@ -422,7 +414,8 @@ const processAIResponse = async (payload) => {
         if (finalReply) {
             const sessionId = await getSessionId(company_id);
             if (sessionId) {
-                await new Promise(r => setTimeout(r, Math.min(finalReply.length * 30, 2000)));
+                // Delay humano proporcional ao tamanho
+                await new Promise(r => setTimeout(r, Math.min(finalReply.length * 30, 3000)));
                 
                 await sendMessage({
                     sessionId,
