@@ -4,6 +4,7 @@ import { GoogleGenAI } from "@google/genai";
 import { sendMessage } from "../baileys/sender.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport } from "../ai/agentTools.js";
+import { Logger } from "../../utils/logger.js";
 import axios from 'axios';
 
 // Cliente Supabase Service Role (Realtime)
@@ -77,6 +78,61 @@ const getAIClient = (apiKey) => {
     return aiInstances.get(apiKey);
 };
 
+// --- ALGORITMO DE SELEÇÃO DE AGENTE (THE BRAIN) ---
+const matchAgent = (content, lead, lastMsgDate, agents) => {
+    if (!agents || agents.length === 0) return { agent: null, reason: 'no_agents' };
+
+    const cleanContent = content ? content.trim().toLowerCase() : '';
+    
+    // 1. PALAVRA-CHAVE EXATA (Alta Prioridade)
+    const exactMatch = agents.find(a => 
+        a.trigger_config?.type === 'keyword_exact' && 
+        a.trigger_config.keywords?.some(k => k.toLowerCase() === cleanContent)
+    );
+    if (exactMatch) return { agent: exactMatch, reason: `keyword_exact: "${cleanContent}"` };
+
+    // 2. CONTÉM PALAVRA-CHAVE
+    const containsMatch = agents.find(a => 
+        a.trigger_config?.type === 'keyword_contains' && 
+        a.trigger_config.keywords?.some(k => cleanContent.includes(k.toLowerCase()))
+    );
+    if (containsMatch) return { agent: containsMatch, reason: `keyword_contains` };
+
+    // 3. ESTÁGIO DO FUNIL
+    // Só ativa se o lead já estiver nesta etapa específica
+    const stageMatch = agents.find(a => 
+        a.trigger_config?.type === 'pipeline_stage' && 
+        a.trigger_config.stage_id === lead.pipeline_stage_id
+    );
+    if (stageMatch) return { agent: stageMatch, reason: `pipeline_stage: ${lead.pipeline_stage_id}` };
+
+    // Cálculo de Tempo para Gatilhos Temporais
+    const hasHistory = !!lastMsgDate;
+    const hoursSinceLast = hasHistory ? (Date.now() - new Date(lastMsgDate).getTime()) / (1000 * 60 * 60) : 99999;
+
+    // 4. PRIMEIRA MENSAGEM DA VIDA (Boas Vindas)
+    // Se não tem histórico anterior (lastMsgDate é null), é a primeira vez
+    if (!hasHistory) {
+        const firstEver = agents.find(a => a.trigger_config?.type === 'first_message_ever');
+        if (firstEver) return { agent: firstEver, reason: 'first_message_ever' };
+    }
+
+    // 5. PRIMEIRA MENSAGEM DO DIA (Retorno)
+    // Se passou mais de 24h desde a última mensagem
+    if (hoursSinceLast >= 24) {
+        const firstDay = agents.find(a => a.trigger_config?.type === 'first_message_day');
+        if (firstDay) return { agent: firstDay, reason: 'first_message_day' };
+    }
+
+    // 6. SENTINELA PADRÃO (DEFAULT)
+    // Pega o marcado como default ou o que tiver 'all_messages'
+    const defaultAgent = agents.find(a => a.is_default) || agents.find(a => a.trigger_config?.type === 'all_messages');
+    
+    if (defaultAgent) return { agent: defaultAgent, reason: 'default_fallback' };
+
+    return { agent: null, reason: 'no_match_found' };
+};
+
 const processAIResponse = async (payload) => {
     const { id, content, remote_jid, company_id, from_me, message_type, media_url, transcription, created_at } = payload.new;
 
@@ -85,7 +141,7 @@ const processAIResponse = async (payload) => {
     // Ignora grupos e newsletters
     if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter')) return;
 
-    // Horizonte de Eventos (2 min)
+    // Horizonte de Eventos (2 min) - Evita responder mensagens muito antigas em sync
     const msgTime = new Date(created_at).getTime();
     if (Date.now() - msgTime > 2 * 60 * 1000) return;
 
@@ -99,24 +155,14 @@ const processAIResponse = async (payload) => {
     const phone = remote_jid.split('@')[0];
     const { data: lead } = await supabase
         .from('leads')
-        .select('id, name, bot_status, owner_id')
+        .select('id, name, bot_status, owner_id, pipeline_stage_id')
         .eq('company_id', company_id)
         .eq('phone', phone)
         .maybeSingle();
 
     if (!lead || lead.bot_status !== 'active') return;
 
-    // --- 2. Carrega Agente Ativo ---
-    const [agentRes, companyRes] = await Promise.all([
-        supabase.from('agents').select('*').eq('company_id', company_id).eq('is_active', true).maybeSingle(),
-        supabase.from('companies').select('ai_config').eq('id', company_id).single()
-    ]);
-
-    const agent = agentRes.data;
-    const companyConfig = companyRes.data?.ai_config;
-    if (!agent) return;
-
-    // --- 3. Prepara Input (Texto ou Transcrição) ---
+    // --- 2. Input Unificado ---
     let userMessage = content;
     if ((message_type === 'audio' || message_type === 'ptt') && transcription) {
         userMessage = `[Áudio Transcrito]: ${transcription}`;
@@ -124,24 +170,59 @@ const processAIResponse = async (payload) => {
         userMessage = `[Imagem Enviada] ${content || ''}`;
     }
     
-    if (!userMessage) return; // Se não tem texto nem transcrição, ignora
+    if (!userMessage) return;
+
+    // --- 3. Busca Contextual (Agentes + Histórico Recente) ---
+    // Buscamos TUDO em paralelo para performance
+    const [agentsRes, companyRes, historyRes] = await Promise.all([
+        supabase.from('agents').select('*').eq('company_id', company_id).eq('is_active', true),
+        supabase.from('companies').select('ai_config').eq('id', company_id).single(),
+        supabase.from('messages')
+            .select('created_at')
+            .eq('company_id', company_id)
+            .eq('remote_jid', remote_jid)
+            .eq('from_me', false) // Mensagens do cliente
+            .neq('id', id) // Exclui a atual
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle()
+    ]);
+
+    const activeAgents = agentsRes.data || [];
+    const lastMsgDate = historyRes.data?.created_at || null;
+    const companyConfig = companyRes.data?.ai_config;
+
+    // --- 4. O CÉREBRO: Escolha do Agente ---
+    const { agent, reason } = matchAgent(userMessage, lead, lastMsgDate, activeAgents);
+
+    if (!agent) {
+        // Se nenhum agente assumiu, loga como Info e encerra silenciosamente
+        // Logger.info('sentinel', `Nenhum agente elegível para ${phone}`, { reason }, company_id);
+        return;
+    }
+
+    // Log de Decisão (Auditabilidade)
+    Logger.info('sentinel', `Agente Selecionado: ${agent.name}`, { 
+        lead: phone, 
+        trigger: reason, 
+        agent_level: agent.level 
+    }, company_id);
 
     try {
         let activeApiKey = companyConfig?.apiKey || process.env.API_KEY;
-        // Junior e Pleno usam Flash, Senior usa Pro (para melhor raciocínio)
         let activeModel = 'gemini-3-flash-preview'; 
         if (agent.level === 'senior') activeModel = 'gemini-3-pro-preview';
-        if (companyConfig?.model) activeModel = companyConfig.model; // Override da empresa
+        if (companyConfig?.model) activeModel = companyConfig.model; 
 
         const ai = getAIClient(activeApiKey);
         if (!ai) return;
 
-        // --- 4. Definição de Nível e Contexto ---
-        let contextLimit = 5; // Junior
+        // --- 5. Contexto de Conversa ---
+        let contextLimit = 5; 
         if (agent.level === 'pleno') contextLimit = 12;
         if (agent.level === 'senior') contextLimit = 30;
 
-        const { data: history } = await supabase
+        const { data: chatHistoryData } = await supabase
             .from('messages')
             .select('content, from_me, message_type, transcription')
             .eq('company_id', company_id)
@@ -150,7 +231,7 @@ const processAIResponse = async (payload) => {
             .order('created_at', { ascending: false })
             .limit(contextLimit);
 
-        const chatHistory = (history || []).reverse().map(m => {
+        const chatHistory = (chatHistoryData || []).reverse().map(m => {
             let txt = m.content || "";
             if ((m.message_type === 'audio' || m.message_type === 'ptt') && m.transcription) {
                 txt = `[Áudio]: ${m.transcription}`;
@@ -161,9 +242,16 @@ const processAIResponse = async (payload) => {
             };
         });
 
-        // --- 5. Construção do Prompt ---
+        // --- 6. Prompt Engineering ---
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
         
+        // [NOVO] Injection de Links
+        const availableLinks = agent.links_config?.map(l => `Link para "${l.title}": ${l.url}`).join('\n') || '';
+
+        // Regras de Personalidade (Arrays)
+        const negativeList = agent.personality_config?.negative_prompts?.map(p => `- EVITE: ${p}`).join('\n') || '';
+        const escapeList = agent.personality_config?.escape_rules?.map(p => `- REGRA DE ESCAPE: ${p}`).join('\n') || '';
+
         let systemInstruction = `
         VOCÊ É: ${agent.name}, um assistente nível ${agent.level.toUpperCase()} da empresa.
         
@@ -177,11 +265,17 @@ const processAIResponse = async (payload) => {
         BASE DE CONHECIMENTO (ARQUIVOS):
         ${filesKnowledge}
         
-        PERSONALIDADE:
+        LINKS ÚTEIS DISPONÍVEIS (Use quando o cliente pedir):
+        ${availableLinks}
+        
+        DIRETRIZES DE PERSONALIDADE:
         Papel: ${agent.personality_config?.role || 'Atendente'}
         Tom: ${agent.personality_config?.tone || 'Profissional'}
-        
-        DIRETRIZES DE NÍVEL ${agent.level.toUpperCase()}:
+        Contexto Empresa: ${agent.personality_config?.context || ''}
+
+        RESTRIÇÕES & REGRAS:
+        ${negativeList}
+        ${escapeList}
         `;
 
         if (agent.level === 'junior') {
@@ -204,7 +298,7 @@ const processAIResponse = async (payload) => {
 
         const fullContents = [...chatHistory, { role: 'user', parts: [{ text: userMessage }] }];
 
-        // --- 6. Execução com Ferramentas (Sênior) ---
+        // --- 7. Execução com Ferramentas (Sênior) ---
         const toolsConfig = agent.level === 'senior' ? { 
             tools: [{ functionDeclarations: SENIOR_TOOLS }]
         } : {};
@@ -214,18 +308,17 @@ const processAIResponse = async (payload) => {
             contents: fullContents,
             config: {
                 systemInstruction: systemInstruction,
-                temperature: agent.level === 'senior' ? 0.5 : 0.7, // Sênior mais preciso
+                temperature: agent.level === 'senior' ? 0.5 : 0.7, 
                 ...toolsConfig
             }
         });
 
-        // --- 7. Processamento de Tools Loop ---
+        // --- 8. Loop de Ferramentas ---
         let toolResponse = response;
         let functionCalls = toolResponse.functionCalls;
         let loopLimit = 0; 
         let finalReply = "";
 
-        // Se tiver function calls (apenas Senior), processa
         while (functionCalls && functionCalls.length > 0 && loopLimit < 3) {
             loopLimit++;
             const parts = [];
@@ -306,7 +399,7 @@ const processAIResponse = async (payload) => {
 
         finalReply = toolResponse.text;
         
-        // --- 8. Envio da Resposta ---
+        // --- 9. Envio da Resposta ---
         if (finalReply) {
             const sessionId = await getSessionId(company_id);
             if (sessionId) {
@@ -323,12 +416,12 @@ const processAIResponse = async (payload) => {
         }
 
     } catch (error) {
-        console.error("❌ [SENTINEL] Erro Fatal:", error);
+        Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message, stack: error.stack }, company_id);
     }
 };
 
 export const startSentinel = () => {
-    console.log("🛡️ [SENTINEL] Cérebro da IA Iniciado (Multi-Nível).");
+    console.log("🛡️ [SENTINEL] Cérebro da IA Iniciado (Multi-Nível & Trigger-Based).");
     supabase
         .channel('ai-sentinel-global')
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
