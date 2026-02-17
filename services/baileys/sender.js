@@ -59,8 +59,9 @@ export const sendMessage = async ({
     contact,
     product,
     card,
-    driveFileId, // [NOVO] ID do arquivo na tabela drive_cache (ou Google ID)
-    companyId 
+    driveFileId, 
+    companyId,
+    timingConfig // [NOVO] Configuração de tempo { min_delay, max_delay }
 }) => {
     const session = sessions.get(sessionId);
     if (!session || !session.sock) throw new Error(`Sessão ${sessionId} não encontrada.`);
@@ -70,29 +71,21 @@ export const sendMessage = async ({
 
     try {
         // [FIX BRASIL] Validação de existência para corrigir 9º dígito
-        // Se o número for brasileiro e pessoal, perguntamos ao WhatsApp qual o JID correto.
-        // Isso resolve falhas de envio para números com/sem o 9 extra de forma definitiva.
         if (jid.startsWith('55') && jid.includes('@s.whatsapp.net')) {
             try {
-                // onWhatsApp retorna array. Pegamos o primeiro.
                 const [result] = await sock.onWhatsApp(jid);
                 if (result && result.exists) {
-                    jid = result.jid; // Usa o JID canônico retornado pelo servidor
+                    jid = result.jid; 
                 }
-            } catch (e) {
-                // Falha silenciosa (timeout/network). Segue com o JID original.
-                // Não bloqueia o envio, apenas perde a correção automática.
-            }
+            } catch (e) {}
         }
 
         // [NOVO] Lógica de Drive Streaming
-        // Se vier um driveFileId, baixamos o arquivo e sobrescrevemos os parâmetros de envio
         if (driveFileId && companyId) {
             console.log(`☁️ [SENDER] Buscando arquivo do Drive: ${driveFileId}`);
             try {
-                // Busca ID real do Google se for UUID do Supabase
                 let realGoogleId = driveFileId;
-                if (driveFileId.length === 36) { // UUID check simples
+                if (driveFileId.length === 36) { 
                      const { data: fileData } = await supabase.from('drive_cache').select('google_id').eq('id', driveFileId).single();
                      if (fileData) realGoogleId = fileData.google_id;
                 }
@@ -100,26 +93,23 @@ export const sendMessage = async ({
                 const driveData = await getFileBuffer(companyId, realGoogleId);
                 
                 if (driveData.isLargeFile) {
-                    // Fallback para Link se for muito grande
                     type = 'text';
                     content = `📁 *Arquivo Grande (${Math.round(driveData.size / 1024 / 1024)}MB)*\n\nO arquivo solicitada é muito grande para enviar por aqui. Acesse pelo link:\n${driveData.link}`;
                 } else {
-                    // Modo Streaming Nativo
                     const mime = driveData.mimeType;
                     fileName = driveData.fileName;
                     mimetype = mime;
                     
-                    // Mapeia MIME do Drive para Tipo do Baileys
                     if (mime.startsWith('image/')) {
                         type = 'image';
-                        url = driveData.buffer; // Baileys aceita Buffer no campo 'url' ou 'image'
+                        url = driveData.buffer; 
                     } else if (mime.startsWith('video/')) {
                         type = 'video';
                         url = driveData.buffer;
                     } else if (mime.startsWith('audio/')) {
                         type = 'audio';
                         url = driveData.buffer;
-                        ptt = false; // Áudio de arquivo, não PTT
+                        ptt = false; 
                     } else {
                         type = 'document';
                         url = driveData.buffer;
@@ -132,27 +122,50 @@ export const sendMessage = async ({
             }
         }
 
-        // Pausa Inicial Humanizada
-        await delay(randomDelay(500, 1000));
+        // --- CÁLCULO DE DELAY INTELIGENTE ---
+        // 1. Pausa Inicial (Reaction Time)
+        // Se houver config personalizada, usa. Senão, padrão rápido.
+        const minDelay = timingConfig?.min_delay_seconds ? timingConfig.min_delay_seconds * 1000 : 500;
+        const maxDelay = timingConfig?.max_delay_seconds ? timingConfig.max_delay_seconds * 1000 : 1500;
         
+        // Garante que max >= min
+        const safeMax = Math.max(maxDelay, minDelay);
+        
+        await delay(randomDelay(Math.floor(minDelay * 0.5), Math.floor(minDelay * 0.8)));
+        
+        // 2. Simulação de Digitação (Typing Time)
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
         await sock.sendPresenceUpdate(presenceType, jid);
 
         let productionTime = 1000;
-        if (type === 'text' && content) productionTime = Math.min(content.length * 50, 5000);
-        else if (type === 'audio' || ptt) productionTime = randomDelay(2000, 4000);
-        else if (type === 'sticker') productionTime = 1500;
-        else if (type === 'card') productionTime = 2000;
-        else if (driveFileId) productionTime = 2500; // Tempo de "upload" fake
+        
+        if (type === 'text' && content) {
+            // Regra: 50ms por caractere (velocidade humana rápida), limitado pelo Max Delay
+            const charTime = content.length * 40;
+            // Se tiver config, o tempo de digitação deve estar dentro do range configurado pelo usuário
+            // Mas também deve ser proporcional ao tamanho.
+            // Fórmula: Base Aleatória (dentro do config) + Fator Tamanho
+            
+            if (timingConfig) {
+                 // Respeita estritamente o range configurado, mas varia dentro dele
+                 productionTime = randomDelay(minDelay, safeMax);
+                 // Se o texto for muito grande, tende para o máximo
+                 if (content.length > 200) productionTime = safeMax;
+            } else {
+                // Default dinâmico
+                productionTime = Math.min(charTime, 6000); 
+            }
+        }
+        else if (type === 'audio' || ptt) productionTime = randomDelay(2000, 5000);
+        else if (type === 'sticker') productionTime = 1000;
+        else if (type === 'card') productionTime = 1500;
+        else if (driveFileId) productionTime = 2500;
 
         await delay(productionTime);
         await sock.sendPresenceUpdate('paused', jid);
 
         let sentMsg;
         
-        // Ajuste: Baileys aceita Buffer diretamente nas chaves (image, video, document)
-        // Se 'url' for um Buffer, o Baileys lida corretamente.
-
         switch (type) {
             case 'text':
                 sentMsg = await sock.sendMessage(jid, { 
@@ -169,7 +182,7 @@ export const sendMessage = async ({
                 break;
 
             case 'audio':
-                if (ptt && typeof url === 'string') { // Só converte se for URL, se for Buffer (Drive) assume que já é audio
+                if (ptt && typeof url === 'string') { 
                     try {
                         const { buffer, waveform, duration } = await convertAudioToOpus(url);
                         
@@ -192,7 +205,6 @@ export const sendMessage = async ({
                         sentMsg = await sock.sendMessage(jid, { audio: { url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
                     }
                 } else {
-                    // Áudio genérico (Buffer ou URL)
                     sentMsg = await sock.sendMessage(jid, { audio: url, ptt: false, mimetype: mimetype || 'audio/mp4' });
                 }
                 break;
@@ -203,7 +215,7 @@ export const sendMessage = async ({
 
             case 'sticker':
                 try {
-                    const stickerBuffer = typeof url === 'string' ? await convertToSticker(url) : url; // Se já vier buffer? Sharp lida.
+                    const stickerBuffer = typeof url === 'string' ? await convertToSticker(url) : url; 
                     sentMsg = await sock.sendMessage(jid, { sticker: stickerBuffer });
                 } catch (stickerErr) {
                     sentMsg = await sock.sendMessage(jid, { sticker: url });
@@ -255,18 +267,17 @@ export const sendMessage = async ({
                     thumbBuffer = await generateThumbnail(card.thumbnailUrl);
                 }
 
-                // Rich Link Construction (O "Card" Seguro)
                 sentMsg = await sock.sendMessage(jid, {
                     text: card.description ? `${card.title}\n\n${card.description}` : card.title,
                     contextInfo: {
                         externalAdReply: {
                             title: card.title,
                             body: card.description || "Clique para abrir",
-                            thumbnail: thumbBuffer, // Buffer da imagem
+                            thumbnail: thumbBuffer,
                             sourceUrl: card.link,
-                            mediaType: 1, // 1 = Imagem (Thumbnail), 2 = Vídeo
-                            renderLargerThumbnail: true, // Força o card grande
-                            showAdAttribution: true // Mostra etiqueta "Link" ou similar, opcional
+                            mediaType: 1, 
+                            renderLargerThumbnail: true, 
+                            showAdAttribution: true 
                         }
                     }
                 });
