@@ -219,9 +219,14 @@ export const startSession = async (sessionId, companyId) => {
                 }
 
                 if (isConflict) {
+                     // Adiciona um jitter significativo para evitar que as duas sessões reconectem sincronizadas
                      const jitter = Math.floor(Math.random() * (30000 - 15000 + 1) + 15000);
                      Logger.warn('baileys', `Conflito de Stream (440). Jitter: ${jitter}ms.`, { sessionId }, companyId);
+                     
+                     // Mata esta instância para dar chance à outra (se for o caso)
                      killSession(sessionId); 
+                     
+                     // Tenta reconectar depois do jitter
                      handleReconnect(sessionId, companyId, jitter); 
                      return;
                 }
