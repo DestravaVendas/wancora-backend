@@ -80,7 +80,7 @@ const getAIClient = (apiKey) => {
 
 // --- ALGORITMO DE SELEÇÃO DE AGENTE (THE BRAIN) ---
 const matchAgent = (content, lead, lastMsgDate, agents) => {
-    if (!agents || agents.length === 0) return { agent: null, reason: 'no_agents' };
+    if (!agents || agents.length === 0) return { agent: null, reason: 'no_agents_configured' };
 
     const cleanContent = content ? content.trim().toLowerCase() : '';
     
@@ -99,7 +99,6 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     if (containsMatch) return { agent: containsMatch, reason: `keyword_contains` };
 
     // 3. ESTÁGIO DO FUNIL
-    // Só ativa se o lead já estiver nesta etapa específica
     const stageMatch = agents.find(a => 
         a.trigger_config?.type === 'pipeline_stage' && 
         a.trigger_config.stage_id === lead.pipeline_stage_id
@@ -111,21 +110,18 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     const hoursSinceLast = hasHistory ? (Date.now() - new Date(lastMsgDate).getTime()) / (1000 * 60 * 60) : 99999;
 
     // 4. PRIMEIRA MENSAGEM DA VIDA (Boas Vindas)
-    // Se não tem histórico anterior (lastMsgDate é null), é a primeira vez
     if (!hasHistory) {
         const firstEver = agents.find(a => a.trigger_config?.type === 'first_message_ever');
         if (firstEver) return { agent: firstEver, reason: 'first_message_ever' };
     }
 
     // 5. PRIMEIRA MENSAGEM DO DIA (Retorno)
-    // Se passou mais de 24h desde a última mensagem
     if (hoursSinceLast >= 24) {
         const firstDay = agents.find(a => a.trigger_config?.type === 'first_message_day');
         if (firstDay) return { agent: firstDay, reason: 'first_message_day' };
     }
 
     // 6. SENTINELA PADRÃO (DEFAULT)
-    // Pega o marcado como default ou o que tiver 'all_messages'
     const defaultAgent = agents.find(a => a.is_default) || agents.find(a => a.trigger_config?.type === 'all_messages');
     
     if (defaultAgent) return { agent: defaultAgent, reason: 'default_fallback' };
@@ -141,7 +137,7 @@ const processAIResponse = async (payload) => {
     // Ignora grupos e newsletters
     if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter')) return;
 
-    // Horizonte de Eventos (2 min) - Evita responder mensagens muito antigas em sync
+    // Horizonte de Eventos (2 min) - Evita responder mensagens antigas em sync
     const msgTime = new Date(created_at).getTime();
     if (Date.now() - msgTime > 2 * 60 * 1000) return;
 
@@ -160,7 +156,15 @@ const processAIResponse = async (payload) => {
         .eq('phone', phone)
         .maybeSingle();
 
-    if (!lead || lead.bot_status !== 'active') return;
+    if (!lead) {
+        // Logger.info('sentinel', `Ignorado: Contato ${phone} não é um Lead.`, {}, company_id);
+        return;
+    }
+
+    if (lead.bot_status !== 'active') {
+        Logger.info('sentinel', `Ignorado: Bot pausado/desligado para ${phone}`, { status: lead.bot_status }, company_id);
+        return;
+    }
 
     // --- 2. Input Unificado ---
     let userMessage = content;
@@ -172,8 +176,7 @@ const processAIResponse = async (payload) => {
     
     if (!userMessage) return;
 
-    // --- 3. Busca Contextual (Agentes + Histórico Recente) ---
-    // Buscamos TUDO em paralelo para performance
+    // --- 3. Busca Contextual ---
     const [agentsRes, companyRes, historyRes] = await Promise.all([
         supabase.from('agents').select('*').eq('company_id', company_id).eq('is_active', true),
         supabase.from('companies').select('ai_config').eq('id', company_id).single(),
@@ -181,8 +184,8 @@ const processAIResponse = async (payload) => {
             .select('created_at')
             .eq('company_id', company_id)
             .eq('remote_jid', remote_jid)
-            .eq('from_me', false) // Mensagens do cliente
-            .neq('id', id) // Exclui a atual
+            .eq('from_me', false)
+            .neq('id', id)
             .order('created_at', { ascending: false })
             .limit(1)
             .maybeSingle()
@@ -192,16 +195,14 @@ const processAIResponse = async (payload) => {
     const lastMsgDate = historyRes.data?.created_at || null;
     const companyConfig = companyRes.data?.ai_config;
 
-    // --- 4. O CÉREBRO: Escolha do Agente ---
+    // --- 4. Escolha do Agente ---
     const { agent, reason } = matchAgent(userMessage, lead, lastMsgDate, activeAgents);
 
     if (!agent) {
-        // Se nenhum agente assumiu, loga como Info e encerra silenciosamente
-        // Logger.info('sentinel', `Nenhum agente elegível para ${phone}`, { reason }, company_id);
+        Logger.warn('sentinel', `Nenhum agente elegível para ${phone}`, { reason, msg: userMessage }, company_id);
         return;
     }
 
-    // Log de Decisão (Auditabilidade)
     Logger.info('sentinel', `Agente Selecionado: ${agent.name}`, { 
         lead: phone, 
         trigger: reason, 
@@ -210,6 +211,12 @@ const processAIResponse = async (payload) => {
 
     try {
         let activeApiKey = companyConfig?.apiKey || process.env.API_KEY;
+        
+        if (!activeApiKey) {
+            Logger.error('sentinel', 'FALHA CRÍTICA: Nenhuma API Key do Gemini configurada.', { company_id }, company_id);
+            return;
+        }
+
         let activeModel = 'gemini-3-flash-preview'; 
         if (agent.level === 'senior') activeModel = 'gemini-3-pro-preview';
         if (companyConfig?.model) activeModel = companyConfig.model; 
@@ -244,11 +251,8 @@ const processAIResponse = async (payload) => {
 
         // --- 6. Prompt Engineering ---
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
-        
-        // [NOVO] Injection de Links
         const availableLinks = agent.links_config?.map(l => `Link para "${l.title}": ${l.url}`).join('\n') || '';
 
-        // Regras de Personalidade (Arrays)
         const negativeList = agent.personality_config?.negative_prompts?.map(p => `- EVITE: ${p}`).join('\n') || '';
         const escapeList = agent.personality_config?.escape_rules?.map(p => `- REGRA DE ESCAPE: ${p}`).join('\n') || '';
 
@@ -292,28 +296,36 @@ const processAIResponse = async (payload) => {
             systemInstruction += `
             - Você é um especialista autônomo.
             - Pode agendar reuniões e buscar arquivos no Drive se necessário.
-            - INOVAÇÃO: Analise o sentimento do cliente. Se ele estiver muito irritado ou agressivo, use a ferramenta 'transfer_to_human' imediatamente.
-            - Use formatação rica (*negrito*, listas) para melhor leitura.`;
+            - Analise o sentimento. Se o cliente estiver irritado, use 'transfer_to_human'.`;
         }
 
         const fullContents = [...chatHistory, { role: 'user', parts: [{ text: userMessage }] }];
 
-        // --- 7. Execução com Ferramentas (Sênior) ---
         const toolsConfig = agent.level === 'senior' ? { 
             tools: [{ functionDeclarations: SENIOR_TOOLS }]
         } : {};
 
-        let response = await ai.models.generateContent({
-            model: activeModel,
-            contents: fullContents,
-            config: {
-                systemInstruction: systemInstruction,
-                temperature: agent.level === 'senior' ? 0.5 : 0.7, 
-                ...toolsConfig
-            }
-        });
+        // --- 7. Geração de Resposta ---
+        let response;
+        try {
+            response = await ai.models.generateContent({
+                model: activeModel,
+                contents: fullContents,
+                config: {
+                    systemInstruction: systemInstruction,
+                    temperature: agent.level === 'senior' ? 0.5 : 0.7, 
+                    ...toolsConfig
+                }
+            });
+        } catch (genError) {
+             if (genError.message.includes('API key not valid')) {
+                 Logger.fatal('sentinel', 'Chave Gemini Inválida. Verifique o Render ou Configurações.', {}, company_id);
+                 return;
+             }
+             throw genError;
+        }
 
-        // --- 8. Loop de Ferramentas ---
+        // --- 8. Processamento de Tools e Envio ---
         let toolResponse = response;
         let functionCalls = toolResponse.functionCalls;
         let loopLimit = 0; 
@@ -369,11 +381,9 @@ const processAIResponse = async (payload) => {
                             call.args.reason,
                             reportingPhones
                         );
-                        // Se transferiu, paramos o loop e não respondemos mais nada (o handoff já mandou msg)
                         return;
                     }
                 } catch (toolError) {
-                    console.error(`⚠️ [AI TOOL ERROR] ${call.name}:`, toolError);
                     result = { error: toolError.message };
                 }
 
@@ -399,11 +409,9 @@ const processAIResponse = async (payload) => {
 
         finalReply = toolResponse.text;
         
-        // --- 9. Envio da Resposta ---
         if (finalReply) {
             const sessionId = await getSessionId(company_id);
             if (sessionId) {
-                // Pequeno delay "humano" baseado no tamanho
                 await new Promise(r => setTimeout(r, Math.min(finalReply.length * 30, 2000)));
                 
                 await sendMessage({
@@ -412,6 +420,8 @@ const processAIResponse = async (payload) => {
                     type: 'text',
                     content: finalReply
                 });
+            } else {
+                Logger.error('sentinel', 'Falha ao responder: WhatsApp desconectado.', {}, company_id);
             }
         }
 
