@@ -20,7 +20,22 @@ const aiInstances = new Map();
 /**
  * Definição das Ferramentas (Functions) para o Gemini
  */
-const SENIOR_TOOLS = [
+// Ferramenta Universal (Disponível para Junior, Pleno e Senior)
+const TRANSFER_TOOL = {
+    name: "transfer_to_human",
+    description: "Transfere o atendimento para um humano e envia um relatório. Use se o cliente pedir humano, estiver muito irritado ou se a negociação fugir da sua alçada.",
+    parameters: {
+        type: "OBJECT",
+        properties: {
+            summary: { type: "STRING", description: "Resumo do que foi conversado até agora." },
+            reason: { type: "STRING", description: "Motivo da transferência." }
+        },
+        required: ["summary", "reason"]
+    }
+};
+
+// Ferramentas Avançadas (Apenas Senior)
+const ADVANCED_TOOLS = [
     {
         name: "search_files",
         description: "Busca arquivos técnicos, catálogos ou documentos no Google Drive da empresa.",
@@ -54,18 +69,6 @@ const SENIOR_TOOLS = [
                 description: { type: "STRING", description: "Detalhes do agendamento." }
             },
             required: ["title", "dateISO"]
-        }
-    },
-    {
-        name: "transfer_to_human",
-        description: "Transfere o atendimento para um humano e envia um relatório. Use se o cliente pedir humano, estiver muito irritado ou se a negociação fugir da sua alçada.",
-        parameters: {
-            type: "OBJECT",
-            properties: {
-                summary: { type: "STRING", description: "Resumo do que foi conversado até agora." },
-                reason: { type: "STRING", description: "Motivo da transferência." }
-            },
-            required: ["summary", "reason"]
         }
     }
 ];
@@ -285,7 +288,7 @@ const processAIResponse = async (payload) => {
         if (agent.level === 'junior') {
             systemInstruction += `
             - Responda de forma curta e direta.
-            - Se não souber, peça para aguardar um humano.
+            - Use a ferramenta 'transfer_to_human' se o cliente solicitar ou se não souber responder.
             - Não invente informações.`;
         } else if (agent.level === 'pleno') {
             systemInstruction += `
@@ -301,9 +304,15 @@ const processAIResponse = async (payload) => {
 
         const fullContents = [...chatHistory, { role: 'user', parts: [{ text: userMessage }] }];
 
-        const toolsConfig = agent.level === 'senior' ? { 
-            tools: [{ functionDeclarations: SENIOR_TOOLS }]
-        } : {};
+        // Configuração de Tools: Junior agora tem acesso ao Transfer
+        let tools = [TRANSFER_TOOL];
+        if (agent.level === 'senior') {
+            tools = [...tools, ...ADVANCED_TOOLS];
+        }
+
+        const toolsConfig = { 
+            tools: [{ functionDeclarations: tools }]
+        };
 
         // --- 7. Geração de Resposta ---
         let response;
@@ -381,6 +390,7 @@ const processAIResponse = async (payload) => {
                             call.args.reason,
                             reportingPhones
                         );
+                        // IMPORTANTE: Interrompe o loop se transferiu, pois o bot foi pausado.
                         return;
                     }
                 } catch (toolError) {
