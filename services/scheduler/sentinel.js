@@ -301,7 +301,9 @@ const processAIResponse = async (payload) => {
                 config: {
                     systemInstruction: systemInstruction,
                     temperature: agent.level === 'senior' ? 0.5 : 0.7, 
-                    maxOutputTokens: 250, // Limite para garantir respostas concisas
+                    // CRÍTICO: Aumentado para 1000 tokens para evitar cortes em respostas detalhadas.
+                    // O modo "Thinking" consome tokens internamente e a resposta final precisa de espaço.
+                    maxOutputTokens: 1000, 
                     ...toolsConfig
                 }
             });
@@ -401,7 +403,7 @@ const processAIResponse = async (payload) => {
                 config: { 
                     systemInstruction, 
                     temperature: 0.5, 
-                    maxOutputTokens: 250, 
+                    maxOutputTokens: 1000, 
                     ...toolsConfig 
                 }
             });
@@ -414,14 +416,15 @@ const processAIResponse = async (payload) => {
         if (finalReply) {
             const sessionId = await getSessionId(company_id);
             if (sessionId) {
-                // Delay humano proporcional ao tamanho
-                await new Promise(r => setTimeout(r, Math.min(finalReply.length * 30, 3000)));
+                // Configuração de Tempo (Delay Dinâmico)
+                const timingConfig = agent.flow_config?.timing;
                 
                 await sendMessage({
                     sessionId,
                     to: remote_jid,
                     type: 'text',
-                    content: finalReply
+                    content: finalReply,
+                    timingConfig // Passa a config de tempo para o Sender
                 });
             } else {
                 Logger.error('sentinel', 'Falha ao responder: WhatsApp desconectado.', {}, company_id);
