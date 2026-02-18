@@ -71,6 +71,7 @@ const ADVANCED_TOOLS = [
 const getAIClient = (apiKey) => {
     if (!apiKey) return null;
     if (!aiInstances.has(apiKey)) {
+        console.log(`[SENTINEL] Novo cliente Gemini inicializado.`);
         aiInstances.set(apiKey, new GoogleGenAI({ apiKey }));
     }
     return aiInstances.get(apiKey);
@@ -85,7 +86,6 @@ const generateContentWithRetry = async (aiModel, params, retries = 3) => {
             const isOverloaded = error.message?.includes('503') || error.message?.includes('Overloaded') || error.status === 503;
             
             if (isOverloaded && i < retries - 1) {
-                // Backoff exponencial (2s, 4s, 8s)
                 const delay = 2000 * Math.pow(2, i);
                 console.warn(`⚠️ [GEMINI] 503 Overload. Tentativa ${i + 1}/${retries} em ${delay}ms...`);
                 await new Promise(r => setTimeout(r, delay));
@@ -147,14 +147,21 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
 };
 
 const processAIResponse = async (payload) => {
+    // [TRACE 1] Evento Recebido
+    console.log(`🔍 [SENTINEL] Evento recebido ID: ${payload.new?.id}`);
+
+    if (!payload.new) return;
     const { id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = payload.new;
 
     if (from_me) return;
     if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter')) return;
 
-    // Horizonte de 2 min
+    // Horizonte de 5 min (aumentado para debug)
     const msgTime = new Date(created_at).getTime();
-    if (Date.now() - msgTime > 2 * 60 * 1000) return;
+    if (Date.now() - msgTime > 5 * 60 * 1000) {
+        console.log(`⚠️ [SENTINEL] Ignorando msg antiga: ${remote_jid}`);
+        return;
+    }
 
     // Debounce
     const lockKey = `${remote_jid}-${id}`;
@@ -162,15 +169,29 @@ const processAIResponse = async (payload) => {
     processingLock.add(lockKey);
     setTimeout(() => processingLock.delete(lockKey), 10000);
 
+    // [TRACE 2] Buscando Lead
     const phone = remote_jid.split('@')[0];
-    const { data: lead } = await supabase
+    const { data: lead, error: leadError } = await supabase
         .from('leads')
         .select('id, name, bot_status, owner_id, pipeline_stage_id')
         .eq('company_id', company_id)
-        .eq('phone', phone)
+        .ilike('phone', `%${phone}%`) // Busca flexível (contém o número)
         .maybeSingle();
 
-    if (!lead || lead.bot_status !== 'active') return;
+    if (leadError) {
+        console.error(`❌ [SENTINEL] Erro ao buscar lead:`, leadError);
+        return;
+    }
+
+    if (!lead) {
+        console.log(`⚠️ [SENTINEL] Lead não encontrado para ${phone}. (Lead Guard não criou ainda?)`);
+        return;
+    }
+
+    if (lead.bot_status !== 'active') {
+        console.log(`⏸️ [SENTINEL] Bot pausado para ${lead.name}. Status: ${lead.bot_status}`);
+        return;
+    }
 
     let userMessage = content;
     if ((message_type === 'audio' || message_type === 'ptt') && transcription) {
@@ -179,8 +200,12 @@ const processAIResponse = async (payload) => {
         userMessage = `[Imagem Enviada] ${content || ''}`;
     }
     
-    if (!userMessage) return;
+    if (!userMessage) {
+        console.log(`⚠️ [SENTINEL] Mensagem sem conteúdo processável.`);
+        return;
+    }
 
+    // [TRACE 3] Buscando Agentes
     const [agentsRes, companyRes, historyRes] = await Promise.all([
         supabase.from('agents').select('*').eq('company_id', company_id).eq('is_active', true),
         supabase.from('companies').select('ai_config').eq('id', company_id).single(),
@@ -199,25 +224,31 @@ const processAIResponse = async (payload) => {
     const lastMsgDate = historyRes.data?.created_at || null;
     const companyConfig = companyRes.data?.ai_config;
 
+    console.log(`ℹ️ [SENTINEL] Agentes ativos encontrados: ${activeAgents.length}`);
+
     const { agent, reason } = matchAgent(userMessage, lead, lastMsgDate, activeAgents);
 
     if (!agent) {
-         Logger.info('sentinel', `Nenhum agente elegível para ${phone}`, { reason }, company_id);
+         console.log(`⚠️ [SENTINEL] Nenhum agente deu match. Motivo: ${reason}`);
          return;
     }
 
     Logger.info('sentinel', `Agente Selecionado: ${agent.name}`, { lead: phone, trigger: reason }, company_id);
 
     try {
+        // [TRACE 4] Configuração de API
         let activeApiKey = companyConfig?.apiKey || process.env.API_KEY;
         if (!activeApiKey) {
-             Logger.error('sentinel', 'FALHA CRÍTICA: Sem API Key.', { company_id }, company_id);
+             console.error(`❌ [SENTINEL] FALHA CRÍTICA: Sem API Key para empresa ${company_id}.`);
              return;
         }
 
         let activeModel = 'gemini-3-flash-preview'; 
         if (agent.level === 'senior') activeModel = 'gemini-3-pro-preview';
+        // Se houver config explícita na empresa, usa ela, senão usa o padrão do agente
         if (companyConfig?.model) activeModel = companyConfig.model; 
+
+        console.log(`🤖 [SENTINEL] Inicializando Gemini com modelo: ${activeModel}`);
 
         const ai = getAIClient(activeApiKey);
         if (!ai) return;
@@ -276,7 +307,8 @@ const processAIResponse = async (payload) => {
 
         const toolsConfig = { tools: [{ functionDeclarations: tools }] };
 
-        // --- GERAÇÃO COM RETRY ---
+        // [TRACE 5] Geração com Retry
+        console.log(`🧠 [SENTINEL] Enviando prompt para Gemini...`);
         let response;
         try {
             response = await generateContentWithRetry(ai.models, {
@@ -290,12 +322,12 @@ const processAIResponse = async (payload) => {
                 }
             });
         } catch (genError) {
-             console.error(`[AI ERROR] Falha final após retries:`, genError.message);
-             // Se falhar 3x, desistimos silenciosamente para não spammar erro
+             console.error(`❌ [AI ERROR] Falha na geração Gemini:`, genError.message);
+             Logger.error('sentinel', 'Erro Gemini API', { error: genError.message }, company_id);
              return;
         }
 
-        // Tools Handling (MERGED FROM PREVIOUS VERSION)
+        // Tools Handling
         let toolResponse = response;
         let functionCalls = toolResponse.functionCalls;
         let loopLimit = 0; 
@@ -306,7 +338,7 @@ const processAIResponse = async (payload) => {
             const parts = [];
 
             for (const call of functionCalls) {
-                console.log(`🤖 [AGENTE] Tool: ${call.name}`);
+                console.log(`🛠️ [SENTINEL] Executando Tool: ${call.name}`);
                 let result = {};
 
                 try {
@@ -330,7 +362,6 @@ const processAIResponse = async (payload) => {
                     else if (call.name === 'send_file') {
                         const sessionId = await getSessionId(company_id);
                         if (sessionId) {
-                            // Envia o arquivo de forma assíncrona
                             sendMessage({
                                 sessionId,
                                 to: remote_jid,
@@ -352,7 +383,6 @@ const processAIResponse = async (payload) => {
             fullContents.push({ role: "model", parts: toolResponse.candidates[0].content.parts });
             fullContents.push({ role: "function", parts: parts });
 
-            // Retry também para o loop de tools
             toolResponse = await generateContentWithRetry(ai.models, {
                 model: activeModel,
                 contents: fullContents,
@@ -370,6 +400,7 @@ const processAIResponse = async (payload) => {
         finalReply = toolResponse.text;
         
         if (finalReply) {
+            console.log(`📤 [SENTINEL] Resposta gerada. Enviando para WhatsApp...`);
             const sessionId = await getSessionId(company_id);
             if (sessionId) {
                 const timingConfig = agent.flow_config?.timing;
@@ -378,14 +409,19 @@ const processAIResponse = async (payload) => {
                     to: remote_jid,
                     type: 'text',
                     content: finalReply,
-                    timingConfig
+                    timingConfig,
+                    companyId // Passa companyId para logging
                 });
+                console.log(`✅ [SENTINEL] Mensagem enviada com sucesso.`);
             } else {
                 Logger.warn('sentinel', 'Falha ao responder: WhatsApp desconectado.', {}, company_id);
             }
+        } else {
+             console.warn(`⚠️ [SENTINEL] IA gerou resposta vazia.`);
         }
 
     } catch (error) {
+        console.error(`❌ [SENTINEL] Erro Fatal:`, error);
         Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message }, company_id);
     }
 };
