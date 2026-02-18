@@ -1,7 +1,7 @@
 
 {
   "name": "wancora-backend-service",
-  "version": "5.3.2",
+  "version": "5.3.3",
   "type": "module",
   "main": "server.js",
   "scripts": {
