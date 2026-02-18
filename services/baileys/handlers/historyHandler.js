@@ -6,7 +6,8 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const HISTORY_MSG_LIMIT = 30; // Garante contexto recente
+// [AJUSTE] Reduzido para 10 para permitir download seguro de mídia
+const HISTORY_MSG_LIMIT = 10; 
 const HISTORY_MONTHS_LIMIT = 6;
 const processedHistoryChunks = new Set();
 
@@ -205,7 +206,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 for (const msg of topMessages) {
                     try {
                         const options = { 
-                            downloadMedia: false, 
+                            // [ATIVAÇÃO] Download de mídia ativado para histórico RECENTE
+                            downloadMedia: true, 
                             fetchProfilePic: false, 
                             createLead: true 
                         };
@@ -213,7 +215,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {}
                 }
-                await sleep(2); 
+                // [OTIMIZAÇÃO] Delay ligeiramente maior entre chats para dar tempo ao download de mídia
+                await sleep(50); 
             }
         }
 
