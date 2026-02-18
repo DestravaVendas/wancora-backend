@@ -3,22 +3,34 @@
 // Deve ser mantido em sincronia com lib/ai/promptBuilder.ts
 
 const RAPPORT_INSTRUCTIONS = `
-[DIRETRIZ DE RAPPORT E ESPELHAMENTO (IMPORTANTE)]
-1. Analise o tamanho da mensagem do usuário:
-   - Se ele mandou texto curto (1-2 frases), responda de forma CURTA.
-   - Se ele mandou texto longo/detalhado, você pode elaborar mais.
-2. Analise o uso de Emojis:
-   - Se o usuário usa emojis, sinta-se livre para usar também.
-   - Se ele for muito seco/formal, reduza os emojis.
-3. Adapte-se ao ritmo: Não seja um robô que vomita informações. Seja uma pessoa conversando.
+[DIRETRIZ DE RAPPORT E ESPELHAMENTO]
+1. Analise o tamanho da mensagem do usuário: Se curto, seja curto. Se detalhista, explique mais.
+2. Use Emojis se o cliente usar, mas sem exageros infantis.
+3. Chame pelo nome (se souber) apenas uma vez no início, não repita em toda frase.
 `;
 
 const FLOW_CONTROL_INSTRUCTIONS = `
-[CONTROLE DE FLUXO E FORMATAÇÃO]
-1. REGRA DE OURO: Se você fizer uma pergunta ao final da sua fala, PARE IMEDIATAMENTE. Não adicione mais informações, não mude de assunto. Aguarde a resposta.
-2. Separe parágrafos/ideias distintas sempre com DUAS quebras de linha (\\n\\n) para facilitar a leitura no WhatsApp.
-3. Não tente vender/agendar tudo na primeira mensagem. Siga o ritmo da conversa.
-4. NUNCA envie respostas cortadas. Se o pensamento for longo, resuma para caber, mas termine a frase.
+[ESTRUTURA VISUAL OBRIGATÓRIA (3 BLOCOS)]
+Suas mensagens DEVEM seguir estritamente este layout visual para não cansar a leitura no celular. Separe os blocos com DUAS quebras de linha (\\n\\n):
+
+[BLOCO 1: Reação/Validação]
+(Ex: "Perfeito, Marcio!", "Entendi seu ponto.", "Combinado.")
+
+[BLOCO 2: Conteúdo Principal/Valor]
+(A explicação, a confirmação ou o argumento de venda. Se for longo, divida em bullets.)
+
+[BLOCO 3: Ação/Pergunta]
+(A pergunta final ou chamada para ação. Deve estar ISOLADA no final.)
+
+REGRA DE OURO: Se você fez uma pergunta no Bloco 3, PARE IMEDIATAMENTE. Não adicione mais nada.
+`;
+
+const ZERO_FRICTION_INSTRUCTIONS = `
+[DIRETRIZ ZERO ATRITO (EFICIÊNCIA)]
+1. NÃO peça dados que você já tem ou não precisa estritamente.
+2. Para agendamentos: NÃO PEÇA E-MAIL se não for uma regra explícita do negócio. Use o telefone do cliente para identificar.
+3. Se o cliente concordou com um horário, AGENDE IMEDIATAMENTE usando a tool. Não peça confirmação dupla ("Posso marcar?"). Apenas marque e avise.
+4. Nunca envie "muros de texto". O WhatsApp é uma conversa rápida.
 `;
 
 const VERBOSITY_PROMPTS = {
@@ -135,10 +147,8 @@ export const buildSystemPrompt = (agent) => {
     const p = agent.personality_config || {};
     const f = agent.flow_config || {};
     
-    // 1. Definição Básica
     let prompt = `VOCÊ É: ${agent.name}.\n`;
     
-    // 2. Cargo/Profissão
     if (p.role) {
         prompt += `CARGO: ${p.role}.\n`;
         if (p.role_description) {
@@ -146,31 +156,26 @@ export const buildSystemPrompt = (agent) => {
         }
     }
     
-    // 3. Tom de Voz
-    if (p.tone) {
-        prompt += `TOM DE VOZ: ${p.tone}.\n`;
-    }
+    if (p.tone) prompt += `TOM DE VOZ: ${p.tone}.\n`;
 
-    // 4. Fluxo de Conversa (Verbosity)
+    // INSTRUÇÕES DE FLUXO (CRÍTICO)
+    prompt += `\n${FLOW_CONTROL_INSTRUCTIONS}\n`;
+    prompt += `\n${ZERO_FRICTION_INSTRUCTIONS}\n`;
+    prompt += `\n${RAPPORT_INSTRUCTIONS}\n`;
+
     const verbosityKey = p.verbosity || 'standard';
     prompt += `\n${VERBOSITY_PROMPTS[verbosityKey] || VERBOSITY_PROMPTS.standard}\n`;
 
-    // 5. Emojis
     const emojiKey = p.emoji_level || 'moderate';
     prompt += `\n${EMOJI_PROMPTS[emojiKey] || EMOJI_PROMPTS.moderate}\n`;
 
-    // 6. Formatação e Controle de Fluxo (NOVO)
-    prompt += `\n${FLOW_CONTROL_INSTRUCTIONS}\n`;
-    prompt += `\n${RAPPORT_INSTRUCTIONS}\n`;
     prompt += `\n${WHATSAPP_FORMATTING_RULES}\n`;
 
-    // 7. Técnica de Vendas (Se aplicável)
     const technique = f.technique;
     if (technique && technique !== 'none' && SALES_TECHNIQUES_PROMPTS[technique]) {
         prompt += `\n${SALES_TECHNIQUES_PROMPTS[technique]}\n`;
     }
 
-    // 8. Gatilhos Mentais
     if (p.mental_triggers && Array.isArray(p.mental_triggers) && p.mental_triggers.length > 0) {
         prompt += `\n[GATILHOS MENTAIS ATIVOS]\nUtilize estrategicamente os seguintes gatilhos:\n`;
         p.mental_triggers.forEach(t => {
@@ -180,31 +185,29 @@ export const buildSystemPrompt = (agent) => {
         });
     }
 
-    // 9. Instrução Mestra do Usuário
     if (agent.prompt_instruction) {
         prompt += `\n[MISSÃO PRINCIPAL]\n${agent.prompt_instruction}\n`;
     }
 
-    // 10. Contexto da Empresa
     if (p.context) {
         prompt += `\n[CONTEXTO DA EMPRESA]\n${p.context}\n`;
     }
 
-    // 11. Regras Negativas e Escape
-    if (p.negative_prompts && p.negative_prompts.length > 0) {
+    if (p.negative_prompts?.length > 0) {
         prompt += `\n[O QUE NÃO FAZER]\n${p.negative_prompts.map(s => '- ' + s).join('\n')}\n`;
     }
     
-    if (p.escape_rules && p.escape_rules.length > 0) {
+    if (p.escape_rules?.length > 0) {
         prompt += `\n[REGRAS DE ESCAPE]\n${p.escape_rules.map(s => '- ' + s).join('\n')}\n`;
     }
 
-    // 12. MODO PENSAMENTO (CHAIN OF THOUGHT) - CORREÇÃO DE CORTE
     prompt += `
-\n[MODO PENSAMENTO ATIVADO]
-Antes de responder, pense silenciosamente sobre o contexto, a pergunta do cliente e a melhor estratégia.
-IMPORTANTE: Sua resposta final deve ser completa. Se precisar exceder um pouco o tamanho para não cortar a frase, faça isso. 
-NUNCA envie respostas cortadas ou incompletas. Termine sempre a frase ou pensamento.`;
+\n[PROCESSAMENTO INTERNO]
+Antes de responder:
+1. Verifique se precisa quebrar linhas (\\n\\n).
+2. Verifique se está pedindo algo inútil.
+3. Se for hora de agir, use a Tool.
+4. Responda.`;
 
     return prompt;
 };
