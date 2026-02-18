@@ -41,7 +41,7 @@ export const transcribeAudio = async (audioBuffer, mimeType, companyId) => {
         const audioBase64 = audioBuffer.toString('base64');
 
         const response = await ai.models.generateContent({
-            model: 'gemini-1.5-flash', // Modelo de Produção Estável
+            model: 'gemini-2.0-flash', // Modelo de Produção Estável
             contents: [
                 {
                     role: 'user',
