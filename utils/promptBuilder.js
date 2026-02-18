@@ -4,9 +4,21 @@
 
 const RAPPORT_INSTRUCTIONS = `
 [DIRETRIZ DE RAPPORT E ESPELHAMENTO]
-1. Analise o tamanho da mensagem do usuário: Se curto, seja curto. Se detalhista, explique mais.
-2. Use Emojis se o cliente usar, mas sem exageros infantis.
-3. Chame pelo nome (se souber) apenas uma vez no início, não repita em toda frase.
+1. Analise o tamanho da mensagem do usuário:
+   - Se ele mandou texto curto (1-2 frases), responda de forma CURTA.
+   - Se ele mandou texto longo/detalhado, você pode elaborar mais.
+2. Analise o uso de Emojis:
+   - Se o usuário usa emojis, sinta-se livre para usar também.
+   - Se ele for muito seco/formal, reduza os emojis.
+3. Adapte-se ao ritmo: Não seja um robô que vomita informações. Seja uma pessoa conversando.
+`;
+
+const TRIAGE_INSTRUCTIONS = `
+[FASE 1: TRIAGEM OBRIGATÓRIA (CRÍTICO)]
+NÃO assuma que todo "Olá" é uma venda imediata.
+1. No início da conversa, apresente-se brevemente e pergunte: "Como posso ajudar?" ou "O que te traz por aqui?".
+2. Verifique o contexto: É cliente antigo? É suporte? É venda nova?
+3. SÓ inicie o pitch de vendas ou qualificação (SPIN/BANT) DEPOIS que o usuário demonstrar interesse no produto/serviço ou explicar o problema dele.
 `;
 
 const FLOW_CONTROL_INSTRUCTIONS = `
@@ -22,7 +34,7 @@ Suas mensagens DEVEM seguir estritamente este layout visual para não cansar a l
 [BLOCO 3: Ação/Pergunta]
 (A pergunta final ou chamada para ação. Deve estar ISOLADA no final.)
 
-REGRA DE OURO: Se você fez uma pergunta no Bloco 3, PARE IMEDIATAMENTE. Não adicione mais nada.
+REGRA DE OURO: Se você fez uma pergunta no Bloco 3, PARE IMEDIATAMENTE. Não adicione mais nada, não mude de assunto. Aguarde a resposta.
 `;
 
 const ZERO_FRICTION_INSTRUCTIONS = `
@@ -147,8 +159,10 @@ export const buildSystemPrompt = (agent) => {
     const p = agent.personality_config || {};
     const f = agent.flow_config || {};
     
+    // 1. Definição Básica
     let prompt = `VOCÊ É: ${agent.name}.\n`;
     
+    // 2. Cargo/Profissão
     if (p.role) {
         prompt += `CARGO: ${p.role}.\n`;
         if (p.role_description) {
@@ -156,26 +170,36 @@ export const buildSystemPrompt = (agent) => {
         }
     }
     
-    if (p.tone) prompt += `TOM DE VOZ: ${p.tone}.\n`;
+    // 3. Tom de Voz
+    if (p.tone) {
+        prompt += `TOM DE VOZ: ${p.tone}.\n`;
+    }
 
-    // INSTRUÇÕES DE FLUXO (CRÍTICO)
-    prompt += `\n${FLOW_CONTROL_INSTRUCTIONS}\n`;
-    prompt += `\n${ZERO_FRICTION_INSTRUCTIONS}\n`;
-    prompt += `\n${RAPPORT_INSTRUCTIONS}\n`;
+    // --- INSERÇÃO DA NOVA LÓGICA DE COMPORTAMENTO ---
+    prompt += `\n${TRIAGE_INSTRUCTIONS}\n`; // Nova Triagem
+    prompt += `\n${FLOW_CONTROL_INSTRUCTIONS}\n`; // Nova Estrutura 3 Blocos
+    prompt += `\n${ZERO_FRICTION_INSTRUCTIONS}\n`; // Nova Eficiência
+    prompt += `\n${RAPPORT_INSTRUCTIONS}\n`; // Rapport Original
+    // ------------------------------------------------
 
+    // 4. Fluxo de Conversa (Verbosity)
     const verbosityKey = p.verbosity || 'standard';
     prompt += `\n${VERBOSITY_PROMPTS[verbosityKey] || VERBOSITY_PROMPTS.standard}\n`;
 
+    // 5. Emojis
     const emojiKey = p.emoji_level || 'moderate';
     prompt += `\n${EMOJI_PROMPTS[emojiKey] || EMOJI_PROMPTS.moderate}\n`;
 
+    // 6. Formatação
     prompt += `\n${WHATSAPP_FORMATTING_RULES}\n`;
 
+    // 7. Técnica de Vendas (INTEGRALMENTE RESTAURADO)
     const technique = f.technique;
     if (technique && technique !== 'none' && SALES_TECHNIQUES_PROMPTS[technique]) {
         prompt += `\n${SALES_TECHNIQUES_PROMPTS[technique]}\n`;
     }
 
+    // 8. Gatilhos Mentais (INTEGRALMENTE RESTAURADO)
     if (p.mental_triggers && Array.isArray(p.mental_triggers) && p.mental_triggers.length > 0) {
         prompt += `\n[GATILHOS MENTAIS ATIVOS]\nUtilize estrategicamente os seguintes gatilhos:\n`;
         p.mental_triggers.forEach(t => {
@@ -185,29 +209,33 @@ export const buildSystemPrompt = (agent) => {
         });
     }
 
+    // 9. Instrução Mestra do Usuário
     if (agent.prompt_instruction) {
         prompt += `\n[MISSÃO PRINCIPAL]\n${agent.prompt_instruction}\n`;
     }
 
+    // 10. Contexto da Empresa
     if (p.context) {
         prompt += `\n[CONTEXTO DA EMPRESA]\n${p.context}\n`;
     }
 
-    if (p.negative_prompts?.length > 0) {
+    // 11. Regras Negativas e Escape
+    if (p.negative_prompts && p.negative_prompts.length > 0) {
         prompt += `\n[O QUE NÃO FAZER]\n${p.negative_prompts.map(s => '- ' + s).join('\n')}\n`;
     }
     
-    if (p.escape_rules?.length > 0) {
+    if (p.escape_rules && p.escape_rules.length > 0) {
         prompt += `\n[REGRAS DE ESCAPE]\n${p.escape_rules.map(s => '- ' + s).join('\n')}\n`;
     }
 
+    // 12. MODO PENSAMENTO (CHAIN OF THOUGHT) & PREPARAÇÃO
     prompt += `
 \n[PROCESSAMENTO INTERNO]
 Antes de responder:
-1. Verifique se precisa quebrar linhas (\\n\\n).
-2. Verifique se está pedindo algo inútil.
-3. Se for hora de agir, use a Tool.
-4. Responda.`;
+1. Verifique se precisa quebrar linhas (\\n\\n) para os 3 blocos.
+2. Verifique se está pedindo algo inútil (Zero Friction).
+3. Se for hora de agir (agendar/transferir), use a Tool imediatamente.
+4. Responda completando o pensamento.`;
 
     return prompt;
 };
