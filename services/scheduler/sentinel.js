@@ -147,6 +147,9 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
 };
 
 const processAIResponse = async (payload) => {
+    // Log de diagnóstico para provar que o evento chegou
+    console.log(`📡 [SENTINEL] Evento recebido no banco! ID: ${payload.new?.id}`);
+
     if (!payload.new) return;
     const { id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = payload.new;
 
@@ -252,8 +255,9 @@ const processAIResponse = async (payload) => {
              return;
         }
 
-        let activeModel = 'gemini-3-flash-preview'; 
-        if (agent.level === 'senior') activeModel = 'gemini-3-pro-preview';
+        // --- TROCA DE MODELO PARA ESTABILIDADE (V1.5) ---
+        let activeModel = 'gemini-1.5-flash'; 
+        if (agent.level === 'senior') activeModel = 'gemini-1.5-pro'; // Senior usa Pro
         if (companyConfig?.model) activeModel = companyConfig.model; 
 
         console.log(`🤖 [SENTINEL] Inicializando Gemini com modelo: ${activeModel}`);
@@ -316,7 +320,7 @@ const processAIResponse = async (payload) => {
         const toolsConfig = { tools: [{ functionDeclarations: tools }] };
 
         // [TRACE 5] Geração com Retry
-        console.log(`🧠 [SENTINEL] Enviando prompt para Gemini...`);
+        console.log(`🧠 [SENTINEL] Enviando prompt para Gemini (${activeModel})...`);
         let response;
         try {
             response = await generateContentWithRetry(ai.models, {
