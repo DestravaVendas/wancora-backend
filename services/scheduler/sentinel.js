@@ -15,8 +15,6 @@ const processingLock = new Set();
 const aiInstances = new Map();
 
 // --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL) ---
-// O SDK estável usa "functionDeclarations" dentro de um objeto "tools" no model config
-
 const ALL_TOOLS = [
     {
         name: "transfer_to_human",
@@ -67,10 +65,18 @@ const ALL_TOOLS = [
     }
 ];
 
+// Factory com tratamento de erro
 const getAIClient = (apiKey) => {
-    if (!apiKey) return null;
+    if (!apiKey || apiKey.trim().length < 10) return null;
+    
     if (!aiInstances.has(apiKey)) {
-        aiInstances.set(apiKey, new GoogleGenerativeAI(apiKey));
+        try {
+            const instance = new GoogleGenerativeAI(apiKey);
+            aiInstances.set(apiKey, instance);
+        } catch (e) {
+            console.error("❌ [SENTINEL] Erro ao instanciar GoogleGenerativeAI:", e.message);
+            return null;
+        }
     }
     return aiInstances.get(apiKey);
 };
@@ -116,7 +122,7 @@ const processAIResponse = async (payload) => {
     if (remote_jid === '0@s.whatsapp.net' || remote_jid === '12345678@broadcast') return;
 
     const msgTime = new Date(created_at).getTime();
-    if ((Date.now() - msgTime) / 1000 > 180) return; // 3 minutos de tolerância
+    if ((Date.now() - msgTime) / 1000 > 180) return; 
 
     const lockKey = `${remote_jid}-${id}`;
     if (processingLock.has(lockKey)) return;
@@ -156,8 +162,7 @@ const processAIResponse = async (payload) => {
         let activeApiKey = companyConfig?.apiKey || process.env.API_KEY;
         if (!activeApiKey) return;
 
-        // MODELO ESTÁVEL: GEMINI 1.5 FLASH
-        // O 2.0 ainda está instável em certas regiões
+        // Force Stable Model
         let activeModel = 'gemini-1.5-flash';
         if (companyConfig?.model && !companyConfig.model.includes('2.0')) {
             activeModel = companyConfig.model;
@@ -176,7 +181,6 @@ const processAIResponse = async (payload) => {
             .order('created_at', { ascending: false })
             .limit(contextLimit);
 
-        // Mapeia histórico para o formato do SDK Estável (user/model)
         const chatHistory = (chatHistoryData || []).reverse().map(m => {
             let txt = m.content || "";
             if ((m.message_type === 'audio' || m.message_type === 'ptt') && m.transcription) {
@@ -192,16 +196,13 @@ const processAIResponse = async (payload) => {
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
         systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nData: ${new Date().toLocaleString('pt-BR')}\n${filesKnowledge}`;
 
-        // Configura Tools apenas para Senior (ou se necessário)
         let toolsConfig = [];
         if (agent.level === 'senior') {
             toolsConfig = [{ functionDeclarations: ALL_TOOLS }];
         } else {
-            // Junior/Pleno tem apenas Transferência
-             toolsConfig = [{ functionDeclarations: [TRANSFER_TOOL] }];
+             toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }];
         }
 
-        // 1. Inicializa Modelo e Chat
         const model = genAI.getGenerativeModel({ 
             model: activeModel,
             systemInstruction,
@@ -218,12 +219,8 @@ const processAIResponse = async (payload) => {
 
         console.log(`🧠 [SENTINEL] Enviando para ${activeModel}...`);
 
-        // 2. Envia mensagem do usuário
         let result = await chat.sendMessage(userMessage);
         let response = result.response;
-        
-        // 3. Loop de Function Calling (SDK Estável)
-        // O SDK estável requer que enviemos a resposta da função de volta para o modelo.
         let functionCalls = response.functionCalls();
         let loopLimit = 0;
 
@@ -242,7 +239,7 @@ const processAIResponse = async (payload) => {
                     else if (call.name === 'transfer_to_human') {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
                         await handoffAndReport(company_id, lead.id, remote_jid, call.args.summary, call.args.reason, reportingPhones);
-                        return; // Para o fluxo, pois foi transferido
+                        return; 
                     }
                     else if (call.name === 'search_files') {
                         const { data: files } = await supabase.rpc('search_drive_files', { 
@@ -262,16 +259,13 @@ const processAIResponse = async (payload) => {
                                 driveFileId: call.args.google_id,
                                 companyId
                             }).catch(() => {});
-                            output = { success: true, message: "Arquivo enviado para o WhatsApp do cliente." };
-                        } else {
-                            output = { error: "WhatsApp desconectado." };
+                            output = { success: true, message: "Arquivo enviado." };
                         }
                     }
                 } catch (toolError) {
                     output = { error: toolError.message };
                 }
 
-                // SDK Estável requer array de partes de functionResponse
                 toolResults.push({
                     functionResponse: {
                         name: call.name,
@@ -280,12 +274,12 @@ const processAIResponse = async (payload) => {
                 });
             }
 
-            // Envia o resultado das tools de volta para o modelo gerar a resposta final
             result = await chat.sendMessage(toolResults);
             response = result.response;
             functionCalls = response.functionCalls();
         }
 
+        // ✅ Correção Confirmada: .text() como função
         const finalReply = response.text();
 
         if (finalReply) {
@@ -304,7 +298,6 @@ const processAIResponse = async (payload) => {
         }
 
     } catch (error) {
-        // Filtra erros de segurança do Google (conteúdo bloqueado)
         if (!error.message?.includes('SAFETY')) {
             Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message }, company_id);
         }
