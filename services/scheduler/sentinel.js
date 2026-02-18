@@ -255,9 +255,10 @@ const processAIResponse = async (payload) => {
              return;
         }
 
-        // --- TROCA DE MODELO PARA ESTABILIDADE (V1.5) ---
+        // --- MODELO PADRÃO COMERCIAL: GEMINI 1.5 FLASH ---
+        // Se o usuário configurar manualmente algo diferente no banco, respeita.
+        // Mas o padrão do sistema agora é 1.5 Flash para tudo.
         let activeModel = 'gemini-1.5-flash'; 
-        if (agent.level === 'senior') activeModel = 'gemini-1.5-pro'; // Senior usa Pro
         if (companyConfig?.model) activeModel = companyConfig.model; 
 
         console.log(`🤖 [SENTINEL] Inicializando Gemini com modelo: ${activeModel}`);
