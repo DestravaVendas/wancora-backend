@@ -24,6 +24,9 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const unwrapped = unwrapMessage(msg);
         let jid = normalizeJid(unwrapped.key.remoteJid);
         
+        // [REFINE] Block Official WhatsApp Messages
+        if (jid === '0@s.whatsapp.net') return;
+
         const type = getContentType(unwrapped.message);
         
         // Ignora tipos que são eventos e não mensagens visuais
