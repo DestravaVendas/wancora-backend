@@ -1,7 +1,7 @@
 
 {
   "name": "wancora-backend-service",
-  "version": "5.3.3",
+  "version": "5.3.5",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -19,7 +19,7 @@
   "license": "ISC",
   "description": "Microsserviço de Automação WhatsApp e API - Versão Gaming Mode",
   "dependencies": {
-    "@google/genai": "^0.2.0",
+    "@google/generative-ai": "^0.21.0",
     "@sentry/node": "^8.47.0",
     "@sentry/profiling-node": "^8.47.0",
     "@supabase/supabase-js": "^2.47.10",
