@@ -147,21 +147,30 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
 };
 
 const processAIResponse = async (payload) => {
-    // [TRACE 1] Evento Recebido
-    console.log(`🔍 [SENTINEL] Evento recebido ID: ${payload.new?.id}`);
-
     if (!payload.new) return;
     const { id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = payload.new;
 
+    // [GUARDIÃO 1] Ignora minhas próprias mensagens, grupos e sistema oficial do WhatsApp
     if (from_me) return;
     if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter')) return;
-
-    // Horizonte de 5 min (aumentado para debug)
-    const msgTime = new Date(created_at).getTime();
-    if (Date.now() - msgTime > 5 * 60 * 1000) {
-        console.log(`⚠️ [SENTINEL] Ignorando msg antiga: ${remote_jid}`);
+    if (remote_jid === '0@s.whatsapp.net' || remote_jid === '12345678@broadcast') {
+        console.log(`🛡️ [SENTINEL] Ignorando mensagem de sistema (WhatsApp Oficial/Broadcast).`);
         return;
     }
+
+    // [GUARDIÃO 2] CRONÔMETRO DE SEGURANÇA (CRÍTICO)
+    const msgTime = new Date(created_at).getTime();
+    const now = Date.now();
+    const ageInSeconds = (now - msgTime) / 1000;
+
+    if (ageInSeconds > 120) { 
+        if (ageInSeconds < 600) { 
+             console.log(`🛡️ [SENTINEL] Ignorando mensagem antiga/histórico (${Math.round(ageInSeconds)}s atrás): ${remote_jid}`);
+        }
+        return;
+    }
+
+    console.log(`🔍 [SENTINEL] Processando mensagem recente (${Math.round(ageInSeconds)}s): ${remote_jid}`);
 
     // Debounce
     const lockKey = `${remote_jid}-${id}`;
@@ -175,7 +184,7 @@ const processAIResponse = async (payload) => {
         .from('leads')
         .select('id, name, bot_status, owner_id, pipeline_stage_id')
         .eq('company_id', company_id)
-        .ilike('phone', `%${phone}%`) // Busca flexível (contém o número)
+        .ilike('phone', `%${phone}%`) 
         .maybeSingle();
 
     if (leadError) {
@@ -245,7 +254,6 @@ const processAIResponse = async (payload) => {
 
         let activeModel = 'gemini-3-flash-preview'; 
         if (agent.level === 'senior') activeModel = 'gemini-3-pro-preview';
-        // Se houver config explícita na empresa, usa ela, senão usa o padrão do agente
         if (companyConfig?.model) activeModel = companyConfig.model; 
 
         console.log(`🤖 [SENTINEL] Inicializando Gemini com modelo: ${activeModel}`);
