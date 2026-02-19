@@ -1,6 +1,5 @@
-
 import { createClient } from "@supabase/supabase-js";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai"; // IMPORTAÇÃO ADICIONADA: SchemaType
 import { sendMessage } from "../baileys/sender.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport } from "../ai/agentTools.js";
@@ -14,16 +13,17 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const processingLock = new Set();
 const aiInstances = new Map();
 
-// --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL) ---
+// --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL - CORRIGIDO) ---
+// É OBRIGATÓRIO usar SchemaType em vez de strings soltas.
 const ALL_TOOLS = [
     {
         name: "transfer_to_human",
         description: "Transfere para humano. Use se cliente pedir, estiver irritado ou o assunto for complexo demais.",
         parameters: {
-            type: "OBJECT",
+            type: SchemaType.OBJECT,
             properties: {
-                summary: { type: "STRING", description: "Resumo da conversa até agora." },
-                reason: { type: "STRING", description: "Motivo da transferência." }
+                summary: { type: SchemaType.STRING, description: "Resumo da conversa até agora." },
+                reason: { type: SchemaType.STRING, description: "Motivo da transferência." }
             },
             required: ["summary", "reason"]
         }
@@ -32,9 +32,9 @@ const ALL_TOOLS = [
         name: "search_files",
         description: "Busca arquivos ou documentos no Google Drive da empresa para responder dúvidas.",
         parameters: {
-            type: "OBJECT",
+            type: SchemaType.OBJECT,
             properties: {
-                query: { type: "STRING", description: "Termo de busca do arquivo." }
+                query: { type: SchemaType.STRING, description: "Termo de busca do arquivo." }
             },
             required: ["query"]
         }
@@ -43,9 +43,9 @@ const ALL_TOOLS = [
         name: "send_file",
         description: "Envia um arquivo encontrado no Drive para o cliente.",
         parameters: {
-            type: "OBJECT",
+            type: SchemaType.OBJECT,
             properties: {
-                google_id: { type: "STRING", description: "ID do arquivo no Google Drive (obtido via search_files)." }
+                google_id: { type: SchemaType.STRING, description: "ID do arquivo no Google Drive (obtido via search_files)." }
             },
             required: ["google_id"]
         }
@@ -54,11 +54,11 @@ const ALL_TOOLS = [
         name: "schedule_meeting",
         description: "Agenda uma reunião no calendário.",
         parameters: {
-            type: "OBJECT",
+            type: SchemaType.OBJECT,
             properties: {
-                title: { type: "STRING", description: "Título do evento." },
-                dateISO: { type: "STRING", description: "Data e hora ISO 8601 (YYYY-MM-DDTHH:mm:ss)." },
-                description: { type: "STRING", description: "Detalhes do agendamento." }
+                title: { type: SchemaType.STRING, description: "Título do evento." },
+                dateISO: { type: SchemaType.STRING, description: "Data e hora ISO 8601 (YYYY-MM-DDTHH:mm:ss)." },
+                description: { type: SchemaType.STRING, description: "Detalhes do agendamento." }
             },
             required: ["title", "dateISO"]
         }
@@ -159,13 +159,13 @@ const processAIResponse = async (payload) => {
     Logger.info('sentinel', `Agente: ${agent.name}`, { lead: phone, trigger: reason }, company_id);
 
     try {
-        let activeApiKey = companyConfig?.apiKey || process.env.API_KEY;
+        let activeApiKey = companyConfig?.apiKey || process.env.API_KEY; // <-- MESMO PONTO DE ATENÇÃO DO TRANSCRIBER: Verifique se no .env é API_KEY ou GEMINI_API_KEY
         if (!activeApiKey) return;
 
-        // Force Stable Model
-        let activeModel = 'gemini-1.5-flash';
-        if (companyConfig?.model && !companyConfig.model.includes('2.0')) {
-            activeModel = companyConfig.model;
+        // MODEL FALLBACK: Força 2.5 Flash se tentar usar 1.5 problemático
+        let activeModel = 'gemini-2.5-flash';
+        if (companyConfig?.model && !companyConfig.model.includes('1.5')) {
+             activeModel = companyConfig.model;
         }
 
         const genAI = getAIClient(activeApiKey);
@@ -206,7 +206,7 @@ const processAIResponse = async (payload) => {
         const model = genAI.getGenerativeModel({ 
             model: activeModel,
             systemInstruction,
-            tools: toolsConfig
+            tools: toolsConfig // Passando as ferramentas configuradas corretamente
         });
 
         const chat = model.startChat({
@@ -224,6 +224,7 @@ const processAIResponse = async (payload) => {
         let functionCalls = response.functionCalls();
         let loopLimit = 0;
 
+        // Loop de tratamento de Tools (Até 3 chamadas seguidas)
         while (functionCalls && functionCalls.length > 0 && loopLimit < 3) {
             loopLimit++;
             const toolResults = [];
@@ -239,7 +240,7 @@ const processAIResponse = async (payload) => {
                     else if (call.name === 'transfer_to_human') {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
                         await handoffAndReport(company_id, lead.id, remote_jid, call.args.summary, call.args.reason, reportingPhones);
-                        return; 
+                        return; // Encerra a IA aqui, humano assumiu
                     }
                     else if (call.name === 'search_files') {
                         const { data: files } = await supabase.rpc('search_drive_files', { 
@@ -274,12 +275,12 @@ const processAIResponse = async (payload) => {
                 });
             }
 
+            // Devolve o resultado da tool para o modelo pensar no que falar
             result = await chat.sendMessage(toolResults);
             response = result.response;
             functionCalls = response.functionCalls();
         }
 
-        // ✅ Correção Confirmada: .text() como função
         const finalReply = response.text();
 
         if (finalReply) {
@@ -298,14 +299,16 @@ const processAIResponse = async (payload) => {
         }
 
     } catch (error) {
-        if (!error.message?.includes('SAFETY')) {
+        if (error.message?.includes('404')) {
+             Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key não tem acesso ao modelo." }, company_id); // Corrigido companyId minúsculo aqui
+        } else if (!error.message?.includes('SAFETY')) {
             Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message }, company_id);
         }
     }
 };
 
 export const startSentinel = () => {
-    console.log("🛡️ [SENTINEL] IA Monitorando (SDK Stable)...");
+    console.log("🛡️ [SENTINEL] IA Monitorando (Model: Gemini 2.5 Flash)...");
     supabase
         .channel('ai-sentinel-global')
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
