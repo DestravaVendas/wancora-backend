@@ -27,9 +27,9 @@ export const transcribeAudio = async (audioBuffer, mimeType, companyId) => {
         const genAI = await getAIClient(companyId);
         if (!genAI) return null;
 
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        // FIX: Uso da versão 2.5 Flash para evitar 404
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-        // SDK Estável: Usa array de parts com inlineData
         const result = await model.generateContent([
             {
                 inlineData: {
