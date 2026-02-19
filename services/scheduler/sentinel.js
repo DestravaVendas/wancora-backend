@@ -207,7 +207,15 @@ const processAIResponse = async (payload) => {
 
         let systemInstruction = buildSystemPrompt(agent);
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
-        systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nData e Hora Atual: ${new Date().toLocaleString('pt-BR')}\n${filesKnowledge}`;
+        
+        // Consciência Temporal (Dia da semana + Data completa)
+        const agora = new Date();
+        const dataCompleta = agora.toLocaleDateString('pt-BR', { 
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
+        });
+        const horaCompleta = agora.toLocaleTimeString('pt-BR');
+        
+        systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nHoje é: ${dataCompleta} às ${horaCompleta}\n${filesKnowledge}`;
 
         // Libera as tools com base no nível do agente
         let toolsConfig = [];
