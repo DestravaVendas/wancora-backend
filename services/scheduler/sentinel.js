@@ -1,8 +1,8 @@
 import { createClient } from "@supabase/supabase-js";
-import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai"; // IMPORTAÇÃO ADICIONADA: SchemaType
+import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 import { sendMessage } from "../baileys/sender.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
-import { scheduleMeeting, handoffAndReport } from "../ai/agentTools.js";
+import { scheduleMeeting, handoffAndReport, checkAvailability } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
 import { buildSystemPrompt } from "../../utils/promptBuilder.js"; 
 
@@ -13,8 +13,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const processingLock = new Set();
 const aiInstances = new Map();
 
-// --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL - CORRIGIDO) ---
-// É OBRIGATÓRIO usar SchemaType em vez de strings soltas.
+// --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL - COMPLETO) ---
 const ALL_TOOLS = [
     {
         name: "transfer_to_human",
@@ -51,21 +50,32 @@ const ALL_TOOLS = [
         }
     },
     {
+        name: "check_availability",
+        description: "ANTES de sugerir um horário para o cliente, use esta ferramenta para consultar a agenda e ver quais horários estão OCUPADOS em uma data específica.",
+        parameters: {
+            type: SchemaType.OBJECT,
+            properties: {
+                dateISO: { type: SchemaType.STRING, description: "A data desejada em formato ISO 8601 (ex: 2026-02-25T00:00:00Z)." }
+            },
+            required: ["dateISO"]
+        }
+    },
+    {
         name: "schedule_meeting",
-        description: "Agenda uma reunião no calendário.",
+        description: "Agenda uma reunião no calendário após confirmar o horário com o cliente.",
         parameters: {
             type: SchemaType.OBJECT,
             properties: {
                 title: { type: SchemaType.STRING, description: "Título do evento." },
-                dateISO: { type: SchemaType.STRING, description: "Data e hora ISO 8601 (YYYY-MM-DDTHH:mm:ss)." },
-                description: { type: SchemaType.STRING, description: "Detalhes do agendamento." }
+                dateISO: { type: SchemaType.STRING, description: "Data e hora exata acordada em formato ISO 8601 (YYYY-MM-DDTHH:mm:ss)." },
+                description: { type: SchemaType.STRING, description: "Detalhes e pauta do agendamento." }
             },
             required: ["title", "dateISO"]
         }
     }
 ];
 
-// Factory com tratamento de erro
+// Factory com tratamento de erro e Fallback Global
 const getAIClient = (apiKey) => {
     if (!apiKey || apiKey.trim().length < 10) return null;
     
@@ -138,7 +148,7 @@ const processAIResponse = async (payload) => {
     if ((message_type === 'audio' || message_type === 'ptt') && transcription) {
         userMessage = `[Áudio Transcrito]: ${transcription}`;
     } else if (message_type === 'image') {
-        userMessage = `[Imagem Enviada]`;
+        userMessage = `[Imagem Enviada pelo Usuário]`;
     }
     
     if (!userMessage) return;
@@ -146,7 +156,7 @@ const processAIResponse = async (payload) => {
     const [agentsRes, companyRes, historyRes] = await Promise.all([
         supabase.from('agents').select('*').eq('company_id', company_id).eq('is_active', true),
         supabase.from('companies').select('ai_config').eq('id', company_id).single(),
-        supabase.from('messages').select('created_at').eq('company_id', company_id).eq('remote_jid', remote_jid).eq('from_me', false).neq('id', id).order('created_at', { ascending: false }).limit(1).maybeSingle()
+        supabase.from('messages').select('content, from_me, message_type, transcription, created_at').eq('company_id', company_id).eq('remote_jid', remote_jid).eq('from_me', false).neq('id', id).order('created_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
     const activeAgents = agentsRes.data || [];
@@ -159,10 +169,13 @@ const processAIResponse = async (payload) => {
     Logger.info('sentinel', `Agente: ${agent.name}`, { lead: phone, trigger: reason }, company_id);
 
     try {
-        let activeApiKey = companyConfig?.apiKey || process.env.API_KEY; // <-- MESMO PONTO DE ATENÇÃO DO TRANSCRIBER: Verifique se no .env é API_KEY ou GEMINI_API_KEY
-        if (!activeApiKey) return;
+        let activeApiKey = companyConfig?.apiKey || process.env.API_KEY || process.env.GEMINI_API_KEY; 
+        if (!activeApiKey) {
+            console.warn(`[SENTINEL] Nenhuma API Key configurada para empresa ${company_id}`);
+            return;
+        }
 
-        // MODEL FALLBACK: Força 2.5 Flash se tentar usar 1.5 problemático
+        // MODEL FALLBACK: Força 2.5 Flash para garantir estabilidade e evitar 404
         let activeModel = 'gemini-2.5-flash';
         if (companyConfig?.model && !companyConfig.model.includes('1.5')) {
              activeModel = companyConfig.model;
@@ -194,19 +207,20 @@ const processAIResponse = async (payload) => {
 
         let systemInstruction = buildSystemPrompt(agent);
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
-        systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nData: ${new Date().toLocaleString('pt-BR')}\n${filesKnowledge}`;
+        systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nData e Hora Atual: ${new Date().toLocaleString('pt-BR')}\n${filesKnowledge}`;
 
+        // Libera as tools com base no nível do agente
         let toolsConfig = [];
-        if (agent.level === 'senior') {
+        if (agent.level === 'senior' || agent.level === 'pleno') {
             toolsConfig = [{ functionDeclarations: ALL_TOOLS }];
         } else {
-             toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }];
+            toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }];
         }
 
         const model = genAI.getGenerativeModel({ 
             model: activeModel,
             systemInstruction,
-            tools: toolsConfig // Passando as ferramentas configuradas corretamente
+            tools: toolsConfig 
         });
 
         const chat = model.startChat({
@@ -217,30 +231,33 @@ const processAIResponse = async (payload) => {
             }
         });
 
-        console.log(`🧠 [SENTINEL] Enviando para ${activeModel}...`);
+        console.log(`🧠 [SENTINEL] Pensando (Model: ${activeModel})...`);
 
         let result = await chat.sendMessage(userMessage);
         let response = result.response;
         let functionCalls = response.functionCalls();
         let loopLimit = 0;
 
-        // Loop de tratamento de Tools (Até 3 chamadas seguidas)
+        // Loop de tratamento de Tools (Executa a ação e devolve pro Gemini analisar)
         while (functionCalls && functionCalls.length > 0 && loopLimit < 3) {
             loopLimit++;
             const toolResults = [];
 
             for (const call of functionCalls) {
-                console.log(`🛠️ Executando Tool: ${call.name}`);
+                console.log(`🛠️ Executando Tool: ${call.name} com args:`, call.args);
                 let output = {};
 
                 try {
-                    if (call.name === 'schedule_meeting') {
+                    if (call.name === 'check_availability') {
+                        output = await checkAvailability(company_id, call.args.dateISO);
+                    }
+                    else if (call.name === 'schedule_meeting') {
                         output = await scheduleMeeting(company_id, lead.id, call.args.title, call.args.dateISO, call.args.description, lead.owner_id);
                     }
                     else if (call.name === 'transfer_to_human') {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
                         await handoffAndReport(company_id, lead.id, remote_jid, call.args.summary, call.args.reason, reportingPhones);
-                        return; // Encerra a IA aqui, humano assumiu
+                        return; // Encerra a IA imediatamente, humano assumiu
                     }
                     else if (call.name === 'search_files') {
                         const { data: files } = await supabase.rpc('search_drive_files', { 
@@ -260,7 +277,9 @@ const processAIResponse = async (payload) => {
                                 driveFileId: call.args.google_id,
                                 companyId
                             }).catch(() => {});
-                            output = { success: true, message: "Arquivo enviado." };
+                            output = { success: true, message: "Arquivo enviado com sucesso." };
+                        } else {
+                            output = { success: false, message: "Sessão do WhatsApp desconectada." };
                         }
                     }
                 } catch (toolError) {
@@ -275,7 +294,7 @@ const processAIResponse = async (payload) => {
                 });
             }
 
-            // Devolve o resultado da tool para o modelo pensar no que falar
+            // Devolve o resultado da execução para a IA continuar o pensamento
             result = await chat.sendMessage(toolResults);
             response = result.response;
             functionCalls = response.functionCalls();
@@ -300,7 +319,7 @@ const processAIResponse = async (payload) => {
 
     } catch (error) {
         if (error.message?.includes('404')) {
-             Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key não tem acesso ao modelo." }, company_id); // Corrigido companyId minúsculo aqui
+             Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key não tem acesso ao modelo atual." }, company_id);
         } else if (!error.message?.includes('SAFETY')) {
             Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message }, company_id);
         }
@@ -308,7 +327,7 @@ const processAIResponse = async (payload) => {
 };
 
 export const startSentinel = () => {
-    console.log("🛡️ [SENTINEL] IA Monitorando (Model: Gemini 2.5 Flash)...");
+    console.log("🛡️ [SENTINEL] IA Monitorando Conversas (Model: Gemini 2.5 Flash)...");
     supabase
         .channel('ai-sentinel-global')
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
