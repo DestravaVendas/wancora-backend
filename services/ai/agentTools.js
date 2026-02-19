@@ -1,4 +1,3 @@
-
 import { createClient } from "@supabase/supabase-js";
 import { sendMessage } from "../baileys/sender.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
@@ -25,10 +24,10 @@ export const scheduleMeeting = async (companyId, leadId, title, dateISO, descrip
         }).select().single();
 
         if (error) throw error;
-        return { success: true, appointmentId: data.id, message: "Agendamento confirmado no sistema." };
+        return { success: true, appointmentId: data.id, message: "Agendamento confirmado no sistema com sucesso." };
     } catch (e) {
         console.error("[TOOL] Erro ao agendar:", e);
-        return { success: false, error: "Falha ao criar agendamento no banco de dados." };
+        return { success: false, error: "Falha ao criar agendamento no banco de dados. Informe ao cliente que houve um erro técnico." };
     }
 };
 
@@ -71,10 +70,56 @@ export const handoffAndReport = async (companyId, leadId, remoteJid, summary, re
             }
         }
 
-        return { success: true, message: "Transferência realizada e relatório enviado." };
+        return { success: true, message: "Transferência realizada e relatório enviado. O atendimento humano assumiu." };
 
     } catch (e) {
         console.error("[TOOL] Erro no handoff:", e);
         return { success: false, error: e.message };
+    }
+};
+
+/**
+ * Ferramenta (NOVA): Consultar Disponibilidade da Agenda
+ * Retorna os horários já OCUPADOS no dia solicitado para a IA não alucinar.
+ */
+export const checkAvailability = async (companyId, dateISO) => {
+    try {
+        const startOfDay = new Date(dateISO);
+        startOfDay.setHours(0, 0, 0, 0);
+        
+        const endOfDay = new Date(dateISO);
+        endOfDay.setHours(23, 59, 59, 999);
+
+        const { data, error } = await supabase
+            .from('appointments')
+            .select('start_time, end_time, title')
+            .eq('company_id', companyId)
+            .eq('status', 'confirmed') // Só pega os confirmados
+            .gte('start_time', startOfDay.toISOString())
+            .lte('start_time', endOfDay.toISOString())
+            .order('start_time', { ascending: true });
+
+        if (error) throw error;
+
+        // Se não tiver nada, o dia está todo livre
+        if (!data || data.length === 0) {
+            return { success: true, message: "A agenda está TOTALMENTE LIVRE neste dia. Você pode oferecer qualquer horário comercial (ex: 09h às 18h)." };
+        }
+
+        // Retorna os slots ocupados para a IA desviar deles
+        const occupiedSlots = data.map(app => ({
+            inicio: new Date(app.start_time).toLocaleTimeString('pt-BR', { hour: '2-digit', minute:'2-digit' }),
+            fim: new Date(app.end_time).toLocaleTimeString('pt-BR', { hour: '2-digit', minute:'2-digit' })
+        }));
+
+        return { 
+            success: true, 
+            message: "ATENÇÃO: A agenda possui os seguintes horários OCUPADOS neste dia. Você DEVE oferecer horários diferentes destes.",
+            occupied_slots: occupiedSlots
+        };
+
+    } catch (e) {
+        console.error("[TOOL] Erro ao checar agenda:", e);
+        return { success: false, error: "Falha ao consultar o banco de dados da agenda." };
     }
 };
