@@ -169,10 +169,10 @@ app.get('/health', (req, res) => {
  * 🔄 AUTO-RECONNECT
  */
 const restoreSessions = async () => {
-    // [FIX] Delay inicial de 10s para permitir que containers antigos morram (Graceful Shutdown)
-    // Isso evita o erro 440 (Conflict) durante deploys
-    console.log("⏳ [BOOT] Aguardando 10s para estabilização de containers...");
-    await new Promise(r => setTimeout(r, 10000));
+    // 🛡️ [FIX MÁXIMO] Aguarda 45s para garantir que o Render destrói o servidor antigo. 
+    // Isto IMPEDE o erro 440 Conflict e o Bad MAC!
+    console.log("⏳ [BOOT] Aguardando 45s para estabilização de containers pós-deploy...");
+    await new Promise(r => setTimeout(r, 45000));
 
     Logger.info('backend', 'Booting system: Restoring sessions...');
     try {
