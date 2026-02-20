@@ -7,7 +7,7 @@ import { transcribeAudio } from '../../ai/transcriber.js';
 import { createClient } from '@supabase/supabase-js';
 import { Logger } from '../../../utils/logger.js'; 
 import axios from 'axios';
-import { processAILogicDirectly } from '../../scheduler/sentinel.js'; // 🛡️ NOVO: Importação do Cérebro
+// 🛡️ NOVO: Importação do Cérebro REMOVIDA para usar Realtime
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -157,15 +157,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         await upsertMessage(messageData);
 
-        // 🛡️ INJEÇÃO DIRETA PARA A IA (Com atraso estratégico Anti-Bad MAC)
-        if (isRealtime && !fromMe && !isGroup) {
-            setTimeout(() => {
-                processAILogicDirectly({
-                    id: messageData.whatsapp_id, // Lock Key
-                    ...messageData
-                }).catch(e => console.error("❌ [SENTINEL DIRECT] Erro crítico:", e));
-            }, 3000); // 3 segundos de respiro para o Baileys salvar a Chave de Criptografia da chegada da mensagem
-        }
+        // 🛡️ INJEÇÃO DIRETA REMOVIDA AQUI PARA EVITAR BAD MAC
 
         if (isRealtime) {
             const { data: instance } = await supabase.from('instances').select('webhook_url, webhook_enabled, id').eq('session_id', sessionId).single();
