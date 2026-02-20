@@ -1,5 +1,4 @@
 import { createClient } from "@supabase/supabase-js";
-import WebSocket from "ws"; // 🛡️ FIX 1: Força o Motor de Rede correto para Node.js
 import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 import { sendMessage } from "../baileys/sender.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
@@ -7,10 +6,9 @@ import { scheduleMeeting, handoffAndReport, checkAvailability } from "../ai/agen
 import { Logger } from "../../utils/logger.js";
 import { buildSystemPrompt } from "../../utils/promptBuilder.js"; 
 
-// 🛡️ FIX 2: Aplicação do WebSocket Global
+// Conexão Limpa e Nativa (Sem forçar overrides que causam conflito)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
-    auth: { persistSession: false },
-    global: { WebSocket: WebSocket }
+    auth: { persistSession: false }
 });
 
 const processingLock = new Set();
@@ -54,11 +52,11 @@ const ALL_TOOLS = [
     },
     {
         name: "check_availability",
-        description: "ANTES de sugerir um horário para o cliente, use esta ferramenta para consultar a agenda e ver quais horários estão OCUPADOS em uma data específica.",
+        description: "ANTES de sugerir um horário para o cliente, use esta ferramenta para consultar a agenda e ver quais horários estão OCUPADOS.",
         parameters: {
             type: SchemaType.OBJECT,
             properties: {
-                dateISO: { type: SchemaType.STRING, description: "A data desejada em formato ISO 8601 (ex: 2026-02-25T00:00:00Z)." }
+                dateISO: { type: SchemaType.STRING, description: "Data ISO 8601 (ex: 2026-02-25T00:00:00Z)." }
             },
             required: ["dateISO"]
         }
@@ -70,18 +68,16 @@ const ALL_TOOLS = [
             type: SchemaType.OBJECT,
             properties: {
                 title: { type: SchemaType.STRING, description: "Título do evento." },
-                dateISO: { type: SchemaType.STRING, description: "Data e hora exata acordada em formato ISO 8601 (YYYY-MM-DDTHH:mm:ss)." },
-                description: { type: SchemaType.STRING, description: "Detalhes e pauta do agendamento." }
+                dateISO: { type: SchemaType.STRING, description: "Data e hora exata acordada em formato ISO 8601." },
+                description: { type: SchemaType.STRING, description: "Detalhes e pauta." }
             },
             required: ["title", "dateISO"]
         }
     }
 ];
 
-// Factory com tratamento de erro e Fallback Global
 const getAIClient = (apiKey) => {
     if (!apiKey || apiKey.trim().length < 10) return null;
-    
     if (!aiInstances.has(apiKey)) {
         try {
             const instance = new GoogleGenerativeAI(apiKey);
@@ -132,27 +128,14 @@ const processAIResponse = async (payload) => {
     
     const { id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = payload.new;
 
-    if (from_me) {
-        console.log("   ❌ Bloqueio: Mensagem do próprio bot.");
-        return;
-    }
-    if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter') || remote_jid === '0@s.whatsapp.net') {
-        console.log("   ❌ Bloqueio: Mensagem de grupo/sistema.");
-        return;
-    }
+    if (from_me) { console.log("   ❌ Bloqueio: Mensagem do próprio bot."); return; }
+    if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter') || remote_jid === '0@s.whatsapp.net') { return; }
 
     const msgTime = new Date(created_at).getTime();
-    const timeDiff = (Date.now() - msgTime) / 1000;
-    if (timeDiff > 180) {
-        console.log(`   ❌ Bloqueio: Mensagem muito antiga (${timeDiff.toFixed(0)}s).`);
-        return; 
-    }
+    if ((Date.now() - msgTime) / 1000 > 180) { console.log(`   ❌ Bloqueio: Mensagem muito antiga.`); return; }
 
     const lockKey = `${remote_jid}-${id}`;
-    if (processingLock.has(lockKey)) {
-        console.log("   ❌ Bloqueio: Em processamento.");
-        return;
-    }
+    if (processingLock.has(lockKey)) return;
     processingLock.add(lockKey);
     setTimeout(() => processingLock.delete(lockKey), 15000);
 
@@ -161,23 +144,14 @@ const processAIResponse = async (payload) => {
     
     const { data: lead } = await supabase.from('leads').select('id, name, bot_status, owner_id, pipeline_stage_id').eq('company_id', company_id).ilike('phone', `%${phone}%`).maybeSingle();
 
-    if (!lead) {
-        console.log("   ❌ Bloqueio: Lead não existe no banco.");
-        return;
-    }
-    if (lead.bot_status !== 'active') {
-        console.log(`   ❌ Bloqueio: Status do bot é '${lead.bot_status}'.`);
-        return;
-    }
+    if (!lead) { console.log("   ❌ Bloqueio: Lead não existe no banco."); return; }
+    if (lead.bot_status !== 'active') { console.log(`   ❌ Bloqueio: Status do bot é '${lead.bot_status}'.`); return; }
 
     console.log(`   ✅ Lead Validado: ${lead.name}`);
 
     let userMessage = content;
-    if ((message_type === 'audio' || message_type === 'ptt') && transcription) {
-        userMessage = `[Áudio Transcrito]: ${transcription}`;
-    } else if (message_type === 'image') {
-        userMessage = `[Imagem Enviada pelo Usuário]`;
-    }
+    if ((message_type === 'audio' || message_type === 'ptt') && transcription) { userMessage = `[Áudio Transcrito]: ${transcription}`; } 
+    else if (message_type === 'image') { userMessage = `[Imagem Enviada pelo Usuário]`; }
     
     if (!userMessage) return;
 
@@ -192,25 +166,17 @@ const processAIResponse = async (payload) => {
     const companyConfig = companyRes.data?.ai_config;
 
     const { agent, reason } = matchAgent(userMessage, lead, lastMsgDate, activeAgents);
-    if (!agent) {
-        console.log("   ❌ Bloqueio: Nenhum agente deu Match.");
-        return;
-    }
+    if (!agent) { console.log("   ❌ Bloqueio: Nenhum agente deu Match."); return; }
 
     console.log(`   🚀 Agente Acionado: ${agent.name} (${reason})`);
     Logger.info('sentinel', `Agente: ${agent.name}`, { lead: phone, trigger: reason }, company_id);
 
     try {
         let activeApiKey = companyConfig?.apiKey || process.env.API_KEY || process.env.GEMINI_API_KEY; 
-        if (!activeApiKey) {
-            console.warn(`   ❌ Bloqueio: Sem API Key!`);
-            return;
-        }
+        if (!activeApiKey) { console.warn(`   ❌ Bloqueio: Sem API Key!`); return; }
 
         let activeModel = 'gemini-2.5-flash';
-        if (companyConfig?.model && !companyConfig.model.includes('1.5')) {
-             activeModel = companyConfig.model;
-        }
+        if (companyConfig?.model && !companyConfig.model.includes('1.5')) { activeModel = companyConfig.model; }
 
         const genAI = getAIClient(activeApiKey);
         if (!genAI) return;
@@ -227,48 +193,27 @@ const processAIResponse = async (payload) => {
 
         const chatHistory = (chatHistoryData || []).reverse().map(m => {
             let txt = m.content || "";
-            if ((m.message_type === 'audio' || m.message_type === 'ptt') && m.transcription) {
-                txt = `[Áudio]: ${m.transcription}`;
-            }
-            return {
-                role: m.from_me ? 'model' : 'user',
-                parts: [{ text: txt }]
-            };
+            if ((m.message_type === 'audio' || m.message_type === 'ptt') && m.transcription) { txt = `[Áudio]: ${m.transcription}`; }
+            return { role: m.from_me ? 'model' : 'user', parts: [{ text: txt }] };
         });
 
         let systemInstruction = buildSystemPrompt(agent);
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
         
         const agora = new Date();
-        const dataCompleta = agora.toLocaleDateString('pt-BR', { 
-            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
-        });
+        const dataCompleta = agora.toLocaleDateString('pt-BR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
         const horaCompleta = agora.toLocaleTimeString('pt-BR');
         
         systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nHoje é: ${dataCompleta} às ${horaCompleta}\n${filesKnowledge}`;
 
         let toolsConfig = [];
-        if (agent.level === 'senior' || agent.level === 'pleno') {
-            toolsConfig = [{ functionDeclarations: ALL_TOOLS }];
-        } else {
-            toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }];
-        }
+        if (agent.level === 'senior' || agent.level === 'pleno') { toolsConfig = [{ functionDeclarations: ALL_TOOLS }]; } 
+        else { toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }]; }
 
-        const model = genAI.getGenerativeModel({ 
-            model: activeModel,
-            systemInstruction,
-            tools: toolsConfig 
-        });
+        const model = genAI.getGenerativeModel({ model: activeModel, systemInstruction, tools: toolsConfig });
+        const chat = model.startChat({ history: chatHistory, generationConfig: { temperature: 0.5, maxOutputTokens: 1000 } });
 
-        const chat = model.startChat({
-            history: chatHistory,
-            generationConfig: {
-                temperature: 0.5,
-                maxOutputTokens: 1000
-            }
-        });
-
-        console.log(`   🧠 [GEMINI] Pensando e chamando Google API...`);
+        console.log(`   🧠 [GEMINI] Pensando...`);
 
         let result = await chat.sendMessage(userMessage);
         let response = result.response;
@@ -284,52 +229,29 @@ const processAIResponse = async (payload) => {
                 let output = {};
 
                 try {
-                    if (call.name === 'check_availability') {
-                        output = await checkAvailability(company_id, call.args.dateISO);
-                    }
-                    else if (call.name === 'schedule_meeting') {
-                        output = await scheduleMeeting(company_id, lead.id, call.args.title, call.args.dateISO, call.args.description, lead.owner_id);
-                    }
+                    if (call.name === 'check_availability') { output = await checkAvailability(company_id, call.args.dateISO); }
+                    else if (call.name === 'schedule_meeting') { output = await scheduleMeeting(company_id, lead.id, call.args.title, call.args.dateISO, call.args.description, lead.owner_id); }
                     else if (call.name === 'transfer_to_human') {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
                         await handoffAndReport(company_id, lead.id, remote_jid, call.args.summary, call.args.reason, reportingPhones);
-                        console.log("   🛑 Chat transferido para humano.");
-                        return; 
+                        console.log("   🛑 Chat transferido para humano."); return; 
                     }
                     else if (call.name === 'search_files') {
-                        const { data: files } = await supabase.rpc('search_drive_files', { 
-                            p_company_id: company_id, 
-                            p_query: call.args.query,
-                            p_limit: 5,
-                            p_folder_id: agent.tools_config?.drive_folder_id || null
-                        });
+                        const { data: files } = await supabase.rpc('search_drive_files', { p_company_id: company_id, p_query: call.args.query, p_limit: 5, p_folder_id: agent.tools_config?.drive_folder_id || null });
                         output = { found: true, files: files || [] };
                     } 
                     else if (call.name === 'send_file') {
                         const sessionId = await getSessionId(company_id);
                         if (sessionId) {
-                            sendMessage({
-                                sessionId,
-                                to: remote_jid,
-                                driveFileId: call.args.google_id,
-                                companyId
-                            }).catch(() => {});
-                            output = { success: true, message: "Arquivo enviado com sucesso." };
-                        } else {
-                            output = { success: false, message: "Sessão do WhatsApp desconectada." };
-                        }
+                            sendMessage({ sessionId, to: remote_jid, driveFileId: call.args.google_id, companyId }).catch(() => {});
+                            output = { success: true, message: "Arquivo enviado." };
+                        } else { output = { success: false, message: "Sessão desconectada." }; }
                     }
                 } catch (toolError) {
-                    console.error("   ❌ Erro na Tool:", toolError.message);
                     output = { error: toolError.message };
                 }
 
-                toolResults.push({
-                    functionResponse: {
-                        name: call.name,
-                        response: output
-                    }
-                });
+                toolResults.push({ functionResponse: { name: call.name, response: output } });
             }
 
             result = await chat.sendMessage(toolResults);
@@ -340,61 +262,36 @@ const processAIResponse = async (payload) => {
         const finalReply = response.text();
 
         if (finalReply) {
-            console.log(`   💬 Resposta final gerada, enviando para Baileys...`);
+            console.log(`   💬 Resposta gerada, enviando...`);
             const sessionId = await getSessionId(company_id);
             if (sessionId) {
                 const timingConfig = agent.flow_config?.timing;
-                await sendMessage({
-                    sessionId,
-                    to: remote_jid,
-                    type: 'text',
-                    content: finalReply,
-                    timingConfig,
-                    companyId
-                });
-                console.log(`   ✅ SUCESSO: Mensagem colocada na fila de envio!`);
-            } else {
-                console.log("   ❌ ERRO: Sessão (SessionId) não encontrada.");
-            }
+                await sendMessage({ sessionId, to: remote_jid, type: 'text', content: finalReply, timingConfig, companyId });
+                console.log(`   ✅ SUCESSO: Mensagem na fila!`);
+            } else { console.log("   ❌ ERRO: Sessão não encontrada."); }
         }
 
     } catch (error) {
-        if (error.message?.includes('404')) {
-             console.error("   ❌ ERRO FATAL: Modelo 2.5 Flash Inexistente para esta API Key.");
-        } else if (!error.message?.includes('SAFETY')) {
-            console.error("   ❌ ERRO NA API GEMINI:", error.message);
-        }
+        if (error.message?.includes('404')) { console.error("   ❌ ERRO FATAL: Modelo Inexistente."); } 
+        else if (!error.message?.includes('SAFETY')) { console.error("   ❌ ERRO GEMINI:", error.message); }
     }
 };
 
-let isReconnecting = false;
-
-export const startSentinel = async () => {
-    if (isReconnecting) return;
-    console.log("🛡️ [SENTINEL] Preparando conexão Realtime com o banco...");
+export const startSentinel = () => {
+    console.log("🛡️ [SENTINEL] Inicializando conexão nativa com o banco...");
     
-    // 🛡️ FIX 3: Limpeza OBRIGATÓRIA de canais fantasmas
-    await supabase.removeAllChannels();
-
-    const sentinelChannel = supabase.channel('ai-sentinel-global');
-
-    sentinelChannel
+    // Deixamos a inteligência de reconexão a cargo do próprio SDK oficial do Supabase
+    supabase
+        .channel('ai-sentinel-global')
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
-        // 🛡️ FIX 4: O timeout vai DENTRO do subscribe (Exigência da API do Supabase v2)
         .subscribe((status, err) => {
             console.log(`📡 [REALTIME STATUS]: ${status}`);
             
             if (status === 'SUBSCRIBED') {
-                console.log("🟢 [SENTINEL] Conectado com sucesso (Modo Estável)!");
-                isReconnecting = false;
-            } 
-            else if (status === 'TIMED_OUT' || status === 'CLOSED' || status === 'CHANNEL_ERROR') {
-                console.log(`⚠️ [SENTINEL] Conexão perdida (${status}). A tentar reconectar em 10 segundos...`);
-                isReconnecting = true;
-                setTimeout(() => {
-                    isReconnecting = false;
-                    startSentinel();
-                }, 10000);
+                console.log("🟢 [SENTINEL] Conectado e escutando ativamente!");
             }
-        }, 30000); // <-- ESTE É O SEGREDO (30 segundos para o Render pensar)
+            if (err) {
+                console.error("❌ ERRO NO CANAL:", err.message || err);
+            }
+        });
 };
