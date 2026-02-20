@@ -220,7 +220,7 @@ export const processAILogicDirectly = async (messageData) => {
             .select('content, from_me, message_type, transcription')
             .eq('company_id', company_id)
             .eq('remote_jid', remote_jid)
-            .neq('id', id)
+            .neq('whatsapp_id', id)
             .order('created_at', { ascending: false })
             .limit(contextLimit);
 
