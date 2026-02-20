@@ -6,7 +6,6 @@ import { scheduleMeeting, handoffAndReport, checkAvailability } from "../ai/agen
 import { Logger } from "../../utils/logger.js";
 import { buildSystemPrompt } from "../../utils/promptBuilder.js"; 
 
-// Conexão Limpa e Nativa (Sem forçar overrides que causam conflito)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
@@ -14,7 +13,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const processingLock = new Set();
 const aiInstances = new Map();
 
-// --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL - COMPLETO) ---
+// --- DEFINIÇÃO DE TOOLS ---
 const ALL_TOOLS = [
     {
         name: "transfer_to_human",
@@ -52,11 +51,11 @@ const ALL_TOOLS = [
     },
     {
         name: "check_availability",
-        description: "ANTES de sugerir um horário para o cliente, use esta ferramenta para consultar a agenda e ver quais horários estão OCUPADOS.",
+        description: "ANTES de sugerir um horário para o cliente, use esta ferramenta para consultar a agenda e ver quais horários estão OCUPADOS em uma data específica.",
         parameters: {
             type: SchemaType.OBJECT,
             properties: {
-                dateISO: { type: SchemaType.STRING, description: "Data ISO 8601 (ex: 2026-02-25T00:00:00Z)." }
+                dateISO: { type: SchemaType.STRING, description: "A data desejada em formato ISO 8601 (ex: 2026-02-25T00:00:00Z)." }
             },
             required: ["dateISO"]
         }
@@ -68,8 +67,8 @@ const ALL_TOOLS = [
             type: SchemaType.OBJECT,
             properties: {
                 title: { type: SchemaType.STRING, description: "Título do evento." },
-                dateISO: { type: SchemaType.STRING, description: "Data e hora exata acordada em formato ISO 8601." },
-                description: { type: SchemaType.STRING, description: "Detalhes e pauta." }
+                dateISO: { type: SchemaType.STRING, description: "Data e hora exata acordada em formato ISO 8601 (YYYY-MM-DDTHH:mm:ss)." },
+                description: { type: SchemaType.STRING, description: "Detalhes e pauta do agendamento." }
             },
             required: ["title", "dateISO"]
         }
@@ -122,11 +121,11 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     return { agent: null, reason: 'no_match_found' };
 };
 
-const processAIResponse = async (payload) => {
-    console.log(`\n🔔 [RAIO-X] Novo evento detectado! ID:`, payload.new?.id);
-    if (!payload.new) return;
+// EXPORTAMOS a função para ser chamada DIRETAMENTE pelo listener
+export const processAILogicDirectly = async (messageData) => {
+    console.log(`\n🔔 [RAIO-X DIRECT] Processando mensagem do Listener! ID:`, messageData.id);
     
-    const { id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = payload.new;
+    const { id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = messageData;
 
     if (from_me) { console.log("   ❌ Bloqueio: Mensagem do próprio bot."); return; }
     if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter') || remote_jid === '0@s.whatsapp.net') { return; }
@@ -150,8 +149,11 @@ const processAIResponse = async (payload) => {
     console.log(`   ✅ Lead Validado: ${lead.name}`);
 
     let userMessage = content;
-    if ((message_type === 'audio' || message_type === 'ptt') && transcription) { userMessage = `[Áudio Transcrito]: ${transcription}`; } 
-    else if (message_type === 'image') { userMessage = `[Imagem Enviada pelo Usuário]`; }
+    if ((message_type === 'audio' || message_type === 'ptt') && transcription) {
+        userMessage = `[Áudio Transcrito]: ${transcription}`;
+    } else if (message_type === 'image') {
+        userMessage = `[Imagem Enviada pelo Usuário]`;
+    }
     
     if (!userMessage) return;
 
@@ -176,7 +178,9 @@ const processAIResponse = async (payload) => {
         if (!activeApiKey) { console.warn(`   ❌ Bloqueio: Sem API Key!`); return; }
 
         let activeModel = 'gemini-2.5-flash';
-        if (companyConfig?.model && !companyConfig.model.includes('1.5')) { activeModel = companyConfig.model; }
+        if (companyConfig?.model && !companyConfig.model.includes('1.5')) {
+             activeModel = companyConfig.model;
+        }
 
         const genAI = getAIClient(activeApiKey);
         if (!genAI) return;
@@ -193,7 +197,9 @@ const processAIResponse = async (payload) => {
 
         const chatHistory = (chatHistoryData || []).reverse().map(m => {
             let txt = m.content || "";
-            if ((m.message_type === 'audio' || m.message_type === 'ptt') && m.transcription) { txt = `[Áudio]: ${m.transcription}`; }
+            if ((m.message_type === 'audio' || m.message_type === 'ptt') && m.transcription) {
+                txt = `[Áudio]: ${m.transcription}`;
+            }
             return { role: m.from_me ? 'model' : 'user', parts: [{ text: txt }] };
         });
 
@@ -207,13 +213,16 @@ const processAIResponse = async (payload) => {
         systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nHoje é: ${dataCompleta} às ${horaCompleta}\n${filesKnowledge}`;
 
         let toolsConfig = [];
-        if (agent.level === 'senior' || agent.level === 'pleno') { toolsConfig = [{ functionDeclarations: ALL_TOOLS }]; } 
-        else { toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }]; }
+        if (agent.level === 'senior' || agent.level === 'pleno') {
+            toolsConfig = [{ functionDeclarations: ALL_TOOLS }];
+        } else {
+            toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }];
+        }
 
         const model = genAI.getGenerativeModel({ model: activeModel, systemInstruction, tools: toolsConfig });
         const chat = model.startChat({ history: chatHistory, generationConfig: { temperature: 0.5, maxOutputTokens: 1000 } });
 
-        console.log(`   🧠 [GEMINI] Pensando...`);
+        console.log(`   🧠 [GEMINI] Pensando e chamando Google API...`);
 
         let result = await chat.sendMessage(userMessage);
         let response = result.response;
@@ -234,7 +243,8 @@ const processAIResponse = async (payload) => {
                     else if (call.name === 'transfer_to_human') {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
                         await handoffAndReport(company_id, lead.id, remote_jid, call.args.summary, call.args.reason, reportingPhones);
-                        console.log("   🛑 Chat transferido para humano."); return; 
+                        console.log("   🛑 Chat transferido para humano.");
+                        return; 
                     }
                     else if (call.name === 'search_files') {
                         const { data: files } = await supabase.rpc('search_drive_files', { p_company_id: company_id, p_query: call.args.query, p_limit: 5, p_folder_id: agent.tools_config?.drive_folder_id || null });
@@ -244,10 +254,11 @@ const processAIResponse = async (payload) => {
                         const sessionId = await getSessionId(company_id);
                         if (sessionId) {
                             sendMessage({ sessionId, to: remote_jid, driveFileId: call.args.google_id, companyId }).catch(() => {});
-                            output = { success: true, message: "Arquivo enviado." };
-                        } else { output = { success: false, message: "Sessão desconectada." }; }
+                            output = { success: true, message: "Arquivo enviado com sucesso." };
+                        } else { output = { success: false, message: "Sessão do WhatsApp desconectada." }; }
                     }
                 } catch (toolError) {
+                    console.error("   ❌ Erro na Tool:", toolError.message);
                     output = { error: toolError.message };
                 }
 
@@ -262,36 +273,27 @@ const processAIResponse = async (payload) => {
         const finalReply = response.text();
 
         if (finalReply) {
-            console.log(`   💬 Resposta gerada, enviando...`);
+            console.log(`   💬 Resposta final gerada, enviando para Baileys...`);
             const sessionId = await getSessionId(company_id);
             if (sessionId) {
                 const timingConfig = agent.flow_config?.timing;
                 await sendMessage({ sessionId, to: remote_jid, type: 'text', content: finalReply, timingConfig, companyId });
-                console.log(`   ✅ SUCESSO: Mensagem na fila!`);
-            } else { console.log("   ❌ ERRO: Sessão não encontrada."); }
+                console.log(`   ✅ SUCESSO: Mensagem colocada na fila de envio!`);
+            } else {
+                console.log("   ❌ ERRO: Sessão (SessionId) não encontrada.");
+            }
         }
 
     } catch (error) {
-        if (error.message?.includes('404')) { console.error("   ❌ ERRO FATAL: Modelo Inexistente."); } 
-        else if (!error.message?.includes('SAFETY')) { console.error("   ❌ ERRO GEMINI:", error.message); }
+        if (error.message?.includes('404')) {
+             console.error("   ❌ ERRO FATAL: Modelo 2.5 Flash Inexistente para esta API Key.");
+        } else if (!error.message?.includes('SAFETY')) {
+            console.error("   ❌ ERRO NA API GEMINI:", error.message);
+        }
     }
 };
 
+// Esta função agora apenas loga que o motor direto está pronto.
 export const startSentinel = () => {
-    console.log("🛡️ [SENTINEL] Inicializando conexão nativa com o banco...");
-    
-    // Deixamos a inteligência de reconexão a cargo do próprio SDK oficial do Supabase
-    supabase
-        .channel('ai-sentinel-global')
-        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
-        .subscribe((status, err) => {
-            console.log(`📡 [REALTIME STATUS]: ${status}`);
-            
-            if (status === 'SUBSCRIBED') {
-                console.log("🟢 [SENTINEL] Conectado e escutando ativamente!");
-            }
-            if (err) {
-                console.error("❌ ERRO NO CANAL:", err.message || err);
-            }
-        });
+    console.log("🛡️ [SENTINEL] O Cérebro da IA está em Modo Direct-Action (Anti-Falha).");
 };
