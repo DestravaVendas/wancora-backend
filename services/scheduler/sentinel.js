@@ -124,25 +124,50 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
 };
 
 const processAIResponse = async (payload) => {
+    console.log(`\n🔔 [RAIO-X] Novo evento detectado! ID:`, payload.new?.id);
     if (!payload.new) return;
+    
     const { id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = payload.new;
 
-    if (from_me) return;
-    if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter')) return;
-    if (remote_jid === '0@s.whatsapp.net' || remote_jid === '12345678@broadcast') return;
+    if (from_me) {
+        console.log("   ❌ Bloqueio: Mensagem do próprio bot.");
+        return;
+    }
+    if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter') || remote_jid === '0@s.whatsapp.net') {
+        console.log("   ❌ Bloqueio: Mensagem de grupo/sistema.");
+        return;
+    }
 
     const msgTime = new Date(created_at).getTime();
-    if ((Date.now() - msgTime) / 1000 > 180) return; 
+    const timeDiff = (Date.now() - msgTime) / 1000;
+    if (timeDiff > 180) {
+        console.log(`   ❌ Bloqueio: Mensagem muito antiga (${timeDiff.toFixed(0)}s).`);
+        return; 
+    }
 
     const lockKey = `${remote_jid}-${id}`;
-    if (processingLock.has(lockKey)) return;
+    if (processingLock.has(lockKey)) {
+        console.log("   ❌ Bloqueio: Em processamento.");
+        return;
+    }
     processingLock.add(lockKey);
     setTimeout(() => processingLock.delete(lockKey), 15000);
 
     const phone = remote_jid.split('@')[0];
+    console.log(`   🔍 Buscando Lead: ${phone}...`);
+    
     const { data: lead } = await supabase.from('leads').select('id, name, bot_status, owner_id, pipeline_stage_id').eq('company_id', company_id).ilike('phone', `%${phone}%`).maybeSingle();
 
-    if (!lead || lead.bot_status !== 'active') return;
+    if (!lead) {
+        console.log("   ❌ Bloqueio: Lead não existe no banco.");
+        return;
+    }
+    if (lead.bot_status !== 'active') {
+        console.log(`   ❌ Bloqueio: Status do bot é '${lead.bot_status}'.`);
+        return;
+    }
+
+    console.log(`   ✅ Lead Validado: ${lead.name}`);
 
     let userMessage = content;
     if ((message_type === 'audio' || message_type === 'ptt') && transcription) {
@@ -164,18 +189,21 @@ const processAIResponse = async (payload) => {
     const companyConfig = companyRes.data?.ai_config;
 
     const { agent, reason } = matchAgent(userMessage, lead, lastMsgDate, activeAgents);
-    if (!agent) return;
+    if (!agent) {
+        console.log("   ❌ Bloqueio: Nenhum agente deu Match.");
+        return;
+    }
 
+    console.log(`   🚀 Agente Acionado: ${agent.name} (${reason})`);
     Logger.info('sentinel', `Agente: ${agent.name}`, { lead: phone, trigger: reason }, company_id);
 
     try {
         let activeApiKey = companyConfig?.apiKey || process.env.API_KEY || process.env.GEMINI_API_KEY; 
         if (!activeApiKey) {
-            console.warn(`[SENTINEL] Nenhuma API Key configurada para empresa ${company_id}`);
+            console.warn(`   ❌ Bloqueio: Sem API Key!`);
             return;
         }
 
-        // MODEL FALLBACK: Força 2.5 Flash para garantir estabilidade e evitar 404
         let activeModel = 'gemini-2.5-flash';
         if (companyConfig?.model && !companyConfig.model.includes('1.5')) {
              activeModel = companyConfig.model;
@@ -208,7 +236,6 @@ const processAIResponse = async (payload) => {
         let systemInstruction = buildSystemPrompt(agent);
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
         
-        // Consciência Temporal (Dia da semana + Data completa)
         const agora = new Date();
         const dataCompleta = agora.toLocaleDateString('pt-BR', { 
             weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
@@ -217,7 +244,6 @@ const processAIResponse = async (payload) => {
         
         systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nHoje é: ${dataCompleta} às ${horaCompleta}\n${filesKnowledge}`;
 
-        // Libera as tools com base no nível do agente
         let toolsConfig = [];
         if (agent.level === 'senior' || agent.level === 'pleno') {
             toolsConfig = [{ functionDeclarations: ALL_TOOLS }];
@@ -239,20 +265,19 @@ const processAIResponse = async (payload) => {
             }
         });
 
-        console.log(`🧠 [SENTINEL] Pensando (Model: ${activeModel})...`);
+        console.log(`   🧠 [GEMINI] Pensando e chamando Google API...`);
 
         let result = await chat.sendMessage(userMessage);
         let response = result.response;
         let functionCalls = response.functionCalls();
         let loopLimit = 0;
 
-        // Loop de tratamento de Tools (Executa a ação e devolve pro Gemini analisar)
         while (functionCalls && functionCalls.length > 0 && loopLimit < 3) {
             loopLimit++;
             const toolResults = [];
 
             for (const call of functionCalls) {
-                console.log(`🛠️ Executando Tool: ${call.name} com args:`, call.args);
+                console.log(`   🛠️ Executando Tool: ${call.name}`);
                 let output = {};
 
                 try {
@@ -265,7 +290,8 @@ const processAIResponse = async (payload) => {
                     else if (call.name === 'transfer_to_human') {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
                         await handoffAndReport(company_id, lead.id, remote_jid, call.args.summary, call.args.reason, reportingPhones);
-                        return; // Encerra a IA imediatamente, humano assumiu
+                        console.log("   🛑 Chat transferido para humano.");
+                        return; 
                     }
                     else if (call.name === 'search_files') {
                         const { data: files } = await supabase.rpc('search_drive_files', { 
@@ -291,6 +317,7 @@ const processAIResponse = async (payload) => {
                         }
                     }
                 } catch (toolError) {
+                    console.error("   ❌ Erro na Tool:", toolError.message);
                     output = { error: toolError.message };
                 }
 
@@ -302,7 +329,6 @@ const processAIResponse = async (payload) => {
                 });
             }
 
-            // Devolve o resultado da execução para a IA continuar o pensamento
             result = await chat.sendMessage(toolResults);
             response = result.response;
             functionCalls = response.functionCalls();
@@ -311,6 +337,7 @@ const processAIResponse = async (payload) => {
         const finalReply = response.text();
 
         if (finalReply) {
+            console.log(`   💬 Resposta final gerada, enviando para Baileys...`);
             const sessionId = await getSessionId(company_id);
             if (sessionId) {
                 const timingConfig = agent.flow_config?.timing;
@@ -322,22 +349,29 @@ const processAIResponse = async (payload) => {
                     timingConfig,
                     companyId
                 });
+                console.log(`   ✅ SUCESSO: Mensagem colocada na fila de envio!`);
+            } else {
+                console.log("   ❌ ERRO: Sessão (SessionId) não encontrada.");
             }
         }
 
     } catch (error) {
         if (error.message?.includes('404')) {
-             Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key não tem acesso ao modelo atual." }, company_id);
+             console.error("   ❌ ERRO FATAL: Modelo 2.5 Flash Inexistente para esta API Key.");
         } else if (!error.message?.includes('SAFETY')) {
-            Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message }, company_id);
+            console.error("   ❌ ERRO NA API GEMINI:", error.message);
         }
     }
 };
 
 export const startSentinel = () => {
-    console.log("🛡️ [SENTINEL] IA Monitorando Conversas (Model: Gemini 2.5 Flash)...");
+    console.log("🛡️ [SENTINEL] Preparando conexão Realtime com o banco...");
     supabase
         .channel('ai-sentinel-global')
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
-        .subscribe();
+        .subscribe((status, err) => {
+            console.log(`📡 [REALTIME STATUS]: ${status}`);
+            if (err) console.error("❌ ERRO DE CONEXÃO REALTIME:", err);
+            if (status === 'SUBSCRIBED') console.log("🟢 [SENTINEL] Conectado e escutando ativamente!");
+        });
 };
