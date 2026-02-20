@@ -29,6 +29,7 @@ const fixBuffer = (data) => {
 };
 
 // --- SISTEMA DE LOCK ASSÍNCRONO (IMPEDE CORRUPÇÃO DE ESCRITA SIMULTÂNEA) ---
+// Prática de Ouro: Fila Indiana de gravação, salvando instantaneamente mas sem atropelos.
 const writeLocks = new Map();
 
 class Mutex {
@@ -115,7 +116,7 @@ export const useSupabaseAuthState = async (sessionId) => {
                 },
                 set: async (data) => {
                     const mutex = getLock(sessionId);
-                    await mutex.lock(); // Inicia o Lock Exclusivo
+                    await mutex.lock(); // Inicia a Fila Indiana
 
                     try {
                         const rowsToUpsert = [];
@@ -150,7 +151,7 @@ export const useSupabaseAuthState = async (sessionId) => {
                         }
 
                         if (idsToDelete.length > 0) {
-                            // 🔥 CORREÇÃO DA SINTAXE DO SUPABASE AQUI 🔥
+                            // 🔥 O SINTAXE FATAL FOI CORRIGIDA AQUI 🔥
                             for (const item of idsToDelete) {
                                 try {
                                     await supabase
@@ -160,14 +161,14 @@ export const useSupabaseAuthState = async (sessionId) => {
                                         .eq('data_type', item.type)
                                         .eq('key_id', item.id);
                                 } catch (err) {
-                                    // Falha silenciosa correta sem usar o .catch encadeado
+                                    // Ignora erros de exclusão silenciosamente, sem quebrar o Baileys
                                 }
                             }
                         }
                     } catch (e) {
                         console.error('[AUTH NET] Erro:', e.message);
                     } finally {
-                        mutex.unlock(); // Liberta o Lock
+                        mutex.unlock(); // Liberta a catraca para o próximo
                     }
                 }
             }
