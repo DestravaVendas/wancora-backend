@@ -29,7 +29,6 @@ const fixBuffer = (data) => {
 };
 
 // --- SISTEMA DE LOCK ASSÍNCRONO (IMPEDE CORRUPÇÃO DE ESCRITA SIMULTÂNEA) ---
-// Isto resolve o "Bad MAC" causado pelo Event-Driven (Corrida de Catraca)
 const writeLocks = new Map();
 
 class Mutex {
@@ -151,20 +150,24 @@ export const useSupabaseAuthState = async (sessionId) => {
                         }
 
                         if (idsToDelete.length > 0) {
+                            // 🔥 CORREÇÃO DA SINTAXE DO SUPABASE AQUI 🔥
                             for (const item of idsToDelete) {
-                                await supabase
-                                    .from('baileys_auth_state')
-                                    .delete()
-                                    .eq('session_id', sessionId)
-                                    .eq('data_type', item.type)
-                                    .eq('key_id', item.id)
-                                    .catch(() => {});
+                                try {
+                                    await supabase
+                                        .from('baileys_auth_state')
+                                        .delete()
+                                        .eq('session_id', sessionId)
+                                        .eq('data_type', item.type)
+                                        .eq('key_id', item.id);
+                                } catch (err) {
+                                    // Falha silenciosa correta sem usar o .catch encadeado
+                                }
                             }
                         }
                     } catch (e) {
                         console.error('[AUTH NET] Erro:', e.message);
                     } finally {
-                        mutex.unlock(); // Liberta o Lock para a próxima operação
+                        mutex.unlock(); // Liberta o Lock
                     }
                 }
             }
