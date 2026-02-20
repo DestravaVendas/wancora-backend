@@ -314,7 +314,7 @@ export const processAILogicDirectly = async (messageData) => {
                                 sessionId,
                                 to: remote_jid,
                                 driveFileId: call.args.google_id,
-                                companyId
+                                companyId: company_id
                             }).catch(() => {});
                             output = { success: true, message: "Arquivo enviado com sucesso." };
                         } else {
@@ -347,21 +347,27 @@ export const processAILogicDirectly = async (messageData) => {
             const sessionId = await getSessionId(company_id);
             if (sessionId) {
                 const timingConfig = agent.flow_config?.timing;
-                await sendMessage({
-                    sessionId,
-                    to: remote_jid,
-                    type: 'text',
-                    content: finalReply,
-                    timingConfig,
-                    companyId
-                });
-                console.log(`   ✅ SUCESSO: Mensagem colocada na fila de envio!`);
+                try {
+                    await sendMessage({
+                        sessionId,
+                        to: remote_jid,
+                        type: 'text',
+                        content: finalReply,
+                        timingConfig,
+                        companyId: company_id
+                    });
+                    console.log(`   ✅ SUCESSO: Mensagem colocada na fila de envio!`);
+                } catch (sendError) {
+                    console.error("   ❌ [ERRO AO ENVIAR PARA A FILA]:", sendError);
+                }
             } else {
                 console.log("   ❌ ERRO: Sessão (SessionId) não encontrada.");
             }
         }
 
     } catch (error) {
+        console.error("\n   ❌ [ERRO CRÍTICO NA EXECUÇÃO DA IA]:", error);
+        
         if (error.message?.includes('404')) {
              Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key não tem acesso ao modelo atual." }, company_id);
         } else if (!error.message?.includes('SAFETY')) {
