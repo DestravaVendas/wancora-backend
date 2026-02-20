@@ -13,7 +13,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const processingLock = new Set();
 const aiInstances = new Map();
 
-// --- DEFINIÇÃO DE TOOLS ---
+// --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL - COMPLETO) ---
 const ALL_TOOLS = [
     {
         name: "transfer_to_human",
@@ -75,8 +75,10 @@ const ALL_TOOLS = [
     }
 ];
 
+// Factory com tratamento de erro e Fallback Global
 const getAIClient = (apiKey) => {
     if (!apiKey || apiKey.trim().length < 10) return null;
+    
     if (!aiInstances.has(apiKey)) {
         try {
             const instance = new GoogleGenerativeAI(apiKey);
@@ -121,30 +123,50 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     return { agent: null, reason: 'no_match_found' };
 };
 
-// EXPORTAMOS a função para ser chamada DIRETAMENTE pelo listener
+// 🛡️ NOVO: FUNÇÃO EXPORTADA PARA ACIONAMENTO DIRETO
 export const processAILogicDirectly = async (messageData) => {
-    console.log(`\n🔔 [RAIO-X DIRECT] Processando mensagem do Listener! ID:`, messageData.id);
+    if (!messageData) return;
     
+    console.log(`\n🔔 [RAIO-X DIRECT] Mensagem recebida! ID:`, messageData.id);
+
     const { id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = messageData;
 
-    if (from_me) { console.log("   ❌ Bloqueio: Mensagem do próprio bot."); return; }
-    if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter') || remote_jid === '0@s.whatsapp.net') { return; }
+    if (from_me) {
+        console.log("   ❌ Bloqueio: Mensagem do próprio bot.");
+        return;
+    }
+    if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter') || remote_jid === '0@s.whatsapp.net' || remote_jid === '12345678@broadcast') {
+        console.log("   ❌ Bloqueio: Mensagem de grupo/sistema.");
+        return;
+    }
 
     const msgTime = new Date(created_at).getTime();
-    if ((Date.now() - msgTime) / 1000 > 180) { console.log(`   ❌ Bloqueio: Mensagem muito antiga.`); return; }
+    if ((Date.now() - msgTime) / 1000 > 180) {
+        console.log(`   ❌ Bloqueio: Mensagem muito antiga.`);
+        return; 
+    } 
 
     const lockKey = `${remote_jid}-${id}`;
-    if (processingLock.has(lockKey)) return;
+    if (processingLock.has(lockKey)) {
+        console.log("   ❌ Bloqueio: Em processamento.");
+        return;
+    }
     processingLock.add(lockKey);
     setTimeout(() => processingLock.delete(lockKey), 15000);
 
     const phone = remote_jid.split('@')[0];
     console.log(`   🔍 Buscando Lead: ${phone}...`);
-    
+
     const { data: lead } = await supabase.from('leads').select('id, name, bot_status, owner_id, pipeline_stage_id').eq('company_id', company_id).ilike('phone', `%${phone}%`).maybeSingle();
 
-    if (!lead) { console.log("   ❌ Bloqueio: Lead não existe no banco."); return; }
-    if (lead.bot_status !== 'active') { console.log(`   ❌ Bloqueio: Status do bot é '${lead.bot_status}'.`); return; }
+    if (!lead) {
+        console.log("   ❌ Bloqueio: Lead não existe no banco.");
+        return;
+    }
+    if (lead.bot_status !== 'active') {
+        console.log(`   ❌ Bloqueio: Status do bot é '${lead.bot_status}'.`);
+        return;
+    }
 
     console.log(`   ✅ Lead Validado: ${lead.name}`);
 
@@ -168,15 +190,22 @@ export const processAILogicDirectly = async (messageData) => {
     const companyConfig = companyRes.data?.ai_config;
 
     const { agent, reason } = matchAgent(userMessage, lead, lastMsgDate, activeAgents);
-    if (!agent) { console.log("   ❌ Bloqueio: Nenhum agente deu Match."); return; }
+    if (!agent) {
+        console.log("   ❌ Bloqueio: Nenhum agente deu Match.");
+        return;
+    }
 
     console.log(`   🚀 Agente Acionado: ${agent.name} (${reason})`);
     Logger.info('sentinel', `Agente: ${agent.name}`, { lead: phone, trigger: reason }, company_id);
 
     try {
         let activeApiKey = companyConfig?.apiKey || process.env.API_KEY || process.env.GEMINI_API_KEY; 
-        if (!activeApiKey) { console.warn(`   ❌ Bloqueio: Sem API Key!`); return; }
+        if (!activeApiKey) {
+            console.warn(`   ❌ Bloqueio: Nenhuma API Key configurada para empresa ${company_id}`);
+            return;
+        }
 
+        // MODEL FALLBACK: Força 2.5 Flash para garantir estabilidade e evitar 404
         let activeModel = 'gemini-2.5-flash';
         if (companyConfig?.model && !companyConfig.model.includes('1.5')) {
              activeModel = companyConfig.model;
@@ -200,18 +229,25 @@ export const processAILogicDirectly = async (messageData) => {
             if ((m.message_type === 'audio' || m.message_type === 'ptt') && m.transcription) {
                 txt = `[Áudio]: ${m.transcription}`;
             }
-            return { role: m.from_me ? 'model' : 'user', parts: [{ text: txt }] };
+            return {
+                role: m.from_me ? 'model' : 'user',
+                parts: [{ text: txt }]
+            };
         });
 
         let systemInstruction = buildSystemPrompt(agent);
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
         
+        // Consciência Temporal (Dia da semana + Data completa)
         const agora = new Date();
-        const dataCompleta = agora.toLocaleDateString('pt-BR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+        const dataCompleta = agora.toLocaleDateString('pt-BR', { 
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
+        });
         const horaCompleta = agora.toLocaleTimeString('pt-BR');
         
         systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nHoje é: ${dataCompleta} às ${horaCompleta}\n${filesKnowledge}`;
 
+        // Libera as tools com base no nível do agente
         let toolsConfig = [];
         if (agent.level === 'senior' || agent.level === 'pleno') {
             toolsConfig = [{ functionDeclarations: ALL_TOOLS }];
@@ -219,52 +255,86 @@ export const processAILogicDirectly = async (messageData) => {
             toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }];
         }
 
-        const model = genAI.getGenerativeModel({ model: activeModel, systemInstruction, tools: toolsConfig });
-        const chat = model.startChat({ history: chatHistory, generationConfig: { temperature: 0.5, maxOutputTokens: 1000 } });
+        const model = genAI.getGenerativeModel({ 
+            model: activeModel,
+            systemInstruction,
+            tools: toolsConfig 
+        });
 
-        console.log(`   🧠 [GEMINI] Pensando e chamando Google API...`);
+        const chat = model.startChat({
+            history: chatHistory,
+            generationConfig: {
+                temperature: 0.5,
+                maxOutputTokens: 1000
+            }
+        });
+
+        console.log(`   🧠 [GEMINI] Pensando (Model: ${activeModel})...`);
 
         let result = await chat.sendMessage(userMessage);
         let response = result.response;
         let functionCalls = response.functionCalls();
         let loopLimit = 0;
 
+        // Loop de tratamento de Tools (Executa a ação e devolve pro Gemini analisar)
         while (functionCalls && functionCalls.length > 0 && loopLimit < 3) {
             loopLimit++;
             const toolResults = [];
 
             for (const call of functionCalls) {
-                console.log(`   🛠️ Executando Tool: ${call.name}`);
+                console.log(`   🛠️ Executando Tool: ${call.name} com args:`, call.args);
                 let output = {};
 
                 try {
-                    if (call.name === 'check_availability') { output = await checkAvailability(company_id, call.args.dateISO); }
-                    else if (call.name === 'schedule_meeting') { output = await scheduleMeeting(company_id, lead.id, call.args.title, call.args.dateISO, call.args.description, lead.owner_id); }
+                    if (call.name === 'check_availability') {
+                        output = await checkAvailability(company_id, call.args.dateISO);
+                    }
+                    else if (call.name === 'schedule_meeting') {
+                        output = await scheduleMeeting(company_id, lead.id, call.args.title, call.args.dateISO, call.args.description, lead.owner_id);
+                    }
                     else if (call.name === 'transfer_to_human') {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
                         await handoffAndReport(company_id, lead.id, remote_jid, call.args.summary, call.args.reason, reportingPhones);
                         console.log("   🛑 Chat transferido para humano.");
-                        return; 
+                        return; // Encerra a IA imediatamente, humano assumiu
                     }
                     else if (call.name === 'search_files') {
-                        const { data: files } = await supabase.rpc('search_drive_files', { p_company_id: company_id, p_query: call.args.query, p_limit: 5, p_folder_id: agent.tools_config?.drive_folder_id || null });
+                        const { data: files } = await supabase.rpc('search_drive_files', { 
+                            p_company_id: company_id, 
+                            p_query: call.args.query,
+                            p_limit: 5,
+                            p_folder_id: agent.tools_config?.drive_folder_id || null
+                        });
                         output = { found: true, files: files || [] };
                     } 
                     else if (call.name === 'send_file') {
                         const sessionId = await getSessionId(company_id);
                         if (sessionId) {
-                            sendMessage({ sessionId, to: remote_jid, driveFileId: call.args.google_id, companyId }).catch(() => {});
+                            sendMessage({
+                                sessionId,
+                                to: remote_jid,
+                                driveFileId: call.args.google_id,
+                                companyId
+                            }).catch(() => {});
                             output = { success: true, message: "Arquivo enviado com sucesso." };
-                        } else { output = { success: false, message: "Sessão do WhatsApp desconectada." }; }
+                        } else {
+                            output = { success: false, message: "Sessão do WhatsApp desconectada." };
+                        }
                     }
                 } catch (toolError) {
                     console.error("   ❌ Erro na Tool:", toolError.message);
                     output = { error: toolError.message };
                 }
 
-                toolResults.push({ functionResponse: { name: call.name, response: output } });
+                toolResults.push({
+                    functionResponse: {
+                        name: call.name,
+                        response: output
+                    }
+                });
             }
 
+            // Devolve o resultado da execução para a IA continuar o pensamento
             result = await chat.sendMessage(toolResults);
             response = result.response;
             functionCalls = response.functionCalls();
@@ -277,7 +347,14 @@ export const processAILogicDirectly = async (messageData) => {
             const sessionId = await getSessionId(company_id);
             if (sessionId) {
                 const timingConfig = agent.flow_config?.timing;
-                await sendMessage({ sessionId, to: remote_jid, type: 'text', content: finalReply, timingConfig, companyId });
+                await sendMessage({
+                    sessionId,
+                    to: remote_jid,
+                    type: 'text',
+                    content: finalReply,
+                    timingConfig,
+                    companyId
+                });
                 console.log(`   ✅ SUCESSO: Mensagem colocada na fila de envio!`);
             } else {
                 console.log("   ❌ ERRO: Sessão (SessionId) não encontrada.");
@@ -286,14 +363,14 @@ export const processAILogicDirectly = async (messageData) => {
 
     } catch (error) {
         if (error.message?.includes('404')) {
-             console.error("   ❌ ERRO FATAL: Modelo 2.5 Flash Inexistente para esta API Key.");
+             Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key não tem acesso ao modelo atual." }, company_id);
         } else if (!error.message?.includes('SAFETY')) {
-            console.error("   ❌ ERRO NA API GEMINI:", error.message);
+            Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message }, company_id);
         }
     }
 };
 
-// Esta função agora apenas loga que o motor direto está pronto.
+// 🛡️ O MOTOR DE REALTIME FOI SUBSTITUÍDO. O CÉREBRO AGORA É CHAMADO DIRETAMENTE.
 export const startSentinel = () => {
-    console.log("🛡️ [SENTINEL] O Cérebro da IA está em Modo Direct-Action (Anti-Falha).");
+    console.log("🛡️ [SENTINEL] IA Monitorando Conversas em Modo Direct-Action (Anti-Falha).");
 };
