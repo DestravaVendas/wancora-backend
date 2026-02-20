@@ -157,12 +157,14 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         await upsertMessage(messageData);
 
-        // 🛡️ NOVO: INJEÇÃO DIRETA PARA A IA (Sem depender de WebSockets do Render)
+        // 🛡️ NOVO: INJEÇÃO DIRETA PARA A IA (Com atraso estratégico Anti-Bad MAC)
         if (isRealtime && !fromMe && !isGroup) {
-            processAILogicDirectly({
-                id: messageData.whatsapp_id, // Lock Key
-                ...messageData
-            }).catch(e => console.error("❌ [SENTINEL DIRECT] Erro crítico:", e));
+            setTimeout(() => {
+                processAILogicDirectly({
+                    id: messageData.whatsapp_id, // Lock Key
+                    ...messageData
+                }).catch(e => console.error("❌ [SENTINEL DIRECT] Erro crítico:", e));
+            }, 2500); // 2.5 segundos de respiro para o Baileys salvar a Chave de Criptografia
         }
 
         if (isRealtime) {
