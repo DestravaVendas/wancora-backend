@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import WebSocket from "ws"; // 🔥 A MÁGICA QUE RESOLVE O TIMED_OUT DO RENDER 🔥
 import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 import { sendMessage } from "../baileys/sender.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
@@ -7,7 +8,9 @@ import { Logger } from "../../utils/logger.js";
 import { buildSystemPrompt } from "../../utils/promptBuilder.js"; 
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
-    auth: { persistSession: false }
+    auth: { persistSession: false },
+    global: { WebSocket: WebSocket }, // 🔥 Injeta o WebSocket nativo
+    realtime: { timeout: 45000 }
 });
 
 const processingLock = new Set();
@@ -123,13 +126,13 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     return { agent: null, reason: 'no_match_found' };
 };
 
-// 🛡️ NOVO: FUNÇÃO EXPORTADA PARA ACIONAMENTO DIRETO
-export const processAILogicDirectly = async (messageData) => {
-    if (!messageData) return;
+// 🛡️ NOVO: FUNÇÃO REVERTIDA PARA ESCUTAR O REALTIME
+const processAIResponse = async (payload) => {
+    if (!payload.new) return;
     
-    console.log(`\n🔔 [RAIO-X DIRECT] Mensagem recebida! ID:`, messageData.id);
+    console.log(`\n🔔 [RAIO-X REALTIME] Mensagem recebida! ID:`, payload.new.id);
 
-    const { id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = messageData;
+    const { id, content, remote_jid, company_id, from_me, message_type, transcription, created_at, whatsapp_id } = payload.new;
 
     if (from_me) {
         console.log("   ❌ Bloqueio: Mensagem do próprio bot.");
@@ -220,7 +223,7 @@ export const processAILogicDirectly = async (messageData) => {
             .select('content, from_me, message_type, transcription')
             .eq('company_id', company_id)
             .eq('remote_jid', remote_jid)
-            .neq('whatsapp_id', id)
+            .neq('whatsapp_id', whatsapp_id) // Mantemos proteção contra leitura dupla
             .order('created_at', { ascending: false })
             .limit(contextLimit);
 
@@ -376,7 +379,30 @@ export const processAILogicDirectly = async (messageData) => {
     }
 };
 
-// 🛡️ O MOTOR DE REALTIME FOI SUBSTITUÍDO. O CÉREBRO AGORA É CHAMADO DIRETAMENTE.
+let sentinelChannel = null;
+
+// 🛡️ REATIVAÇÃO DO REALTIME COM WEBSOCKETS INJETADOS E PROTEÇÃO DE QUEDAS
 export const startSentinel = () => {
-    console.log("🛡️ [SENTINEL] IA Monitorando Conversas em Modo Direct-Action (Anti-Falha).");
+    console.log("🛡️ [SENTINEL] Preparando conexão Realtime com o banco...");
+    
+    if (sentinelChannel) {
+        supabase.removeChannel(sentinelChannel);
+    }
+
+    sentinelChannel = supabase.channel(`ai-sentinel-${Date.now()}`);
+
+    sentinelChannel
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
+        .subscribe((status, err) => {
+            console.log(`📡 [REALTIME STATUS]: ${status}`);
+            
+            if (status === 'SUBSCRIBED') {
+                console.log("🟢 [SENTINEL] IA Conectada via Realtime (Modo Isolado e Seguro)!");
+            } 
+            else if (status === 'TIMED_OUT' || status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+                console.log("⚠️ [SENTINEL] Realtime caiu ou bloqueado. Tentando reconectar em 5 segundos...");
+                sentinelChannel = null;
+                setTimeout(() => { startSentinel(); }, 5000);
+            }
+        });
 };
