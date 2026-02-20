@@ -6,8 +6,12 @@ import { scheduleMeeting, handoffAndReport, checkAvailability } from "../ai/agen
 import { Logger } from "../../utils/logger.js";
 import { buildSystemPrompt } from "../../utils/promptBuilder.js"; 
 
+// 🛡️ FIX 1: Timeout estendido para 30 segundos (Evita o TIMED_OUT no Render)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
-    auth: { persistSession: false }
+    auth: { persistSession: false },
+    realtime: {
+        timeout: 30000 
+    }
 });
 
 const processingLock = new Set();
@@ -364,14 +368,36 @@ const processAIResponse = async (payload) => {
     }
 };
 
+// 🛡️ FIX 2: Loop Infinito de Reconexão para driblar quedas no Render
+let sentinelChannel = null;
+
 export const startSentinel = () => {
     console.log("🛡️ [SENTINEL] Preparando conexão Realtime com o banco...");
-    supabase
-        .channel('ai-sentinel-global')
+    
+    if (sentinelChannel) {
+        supabase.removeChannel(sentinelChannel);
+    }
+
+    // Nome dinâmico para garantir que o canal seja sempre "fresco"
+    sentinelChannel = supabase.channel(`ai-sentinel-${Date.now()}`);
+
+    sentinelChannel
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
         .subscribe((status, err) => {
             console.log(`📡 [REALTIME STATUS]: ${status}`);
-            if (err) console.error("❌ ERRO DE CONEXÃO REALTIME:", err);
-            if (status === 'SUBSCRIBED') console.log("🟢 [SENTINEL] Conectado e escutando ativamente!");
+            
+            if (status === 'SUBSCRIBED') {
+                console.log("🟢 [SENTINEL] Conectado e escutando ativamente!");
+            } 
+            else if (status === 'TIMED_OUT' || status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+                console.log("⚠️ [SENTINEL] Realtime falhou/caiu. Tentando reconectar em 5 segundos...");
+                sentinelChannel = null;
+                setTimeout(() => {
+                    startSentinel();
+                }, 5000);
+            }
+            if (err) {
+                console.error("❌ ERRO INTERNO DE REALTIME:", err);
+            }
         });
 };
