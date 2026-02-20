@@ -3,7 +3,6 @@ import { updateSyncStatus } from '../crm/sync.js';
 import { handlePresenceUpdate, handleContactsUpsert } from './handlers/contactHandler.js';
 import { handleReceiptUpdate, handleMessageUpdate, handleReaction } from './handlers/messageHandler.js';
 import { handleHistorySync, resetHistoryState } from './handlers/historyHandler.js'; // Import atualizado
-import { processAILogicDirectly } from '../scheduler/sentinel.js';
 import { enqueueMessage } from './messageQueue.js'; 
 
 export const setupListeners = ({ sock, sessionId, companyId }) => {
