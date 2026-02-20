@@ -1,4 +1,3 @@
-
 import { getContentType, normalizeJid, unwrapMessage, getBody } from '../../../utils/wppParsers.js';
 import { upsertMessage, ensureLeadExists, upsertContact } from '../../crm/sync.js';
 import { handleMediaUpload } from './mediaHandler.js';
@@ -8,6 +7,7 @@ import { transcribeAudio } from '../../ai/transcriber.js';
 import { createClient } from '@supabase/supabase-js';
 import { Logger } from '../../../utils/logger.js'; 
 import axios from 'axios';
+import { processAILogicDirectly } from '../../scheduler/sentinel.js'; // 🛡️ NOVO: Importação do Cérebro
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -59,12 +59,10 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
 
         // --- CORREÇÃO CRÍTICA: GARANTIA DE CONTATO ---
-        // Antes de processar lead ou mensagem, garantimos que o JID existe na tabela 'contacts'.
-        // Isso resolve o problema de "chats fantasmas" ou invisíveis para números novos.
         if (!fromMe && !isGroup) {
             await upsertContact(jid, companyId, pushName, null, false, null, false, null, { 
                 push_name: pushName,
-                last_message_at: new Date() // Já atualiza o timestamp para subir no chat
+                last_message_at: new Date()
             });
         }
         // ----------------------------------------------
@@ -72,7 +70,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         // --- GHOST CHAT PREVENTION (Groups) ---
         if (isGroup && participantJid && !fromMe) {
             if (pushName) {
-               await upsertContact(participantJid, companyId, null, null, false, null, false, null, { push_name: pushName });
+                await upsertContact(participantJid, companyId, null, null, false, null, false, null, { push_name: pushName });
             }
             if (isRealtime && fetchProfilePic) {
                 refreshContactInfo(sock, participantJid, companyId, pushName).catch(() => {});
@@ -90,7 +88,6 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             const myJid = normalizeJid(sock.user?.id);
             if (isRealtime || createLead) {
                 await ensureLeadExists(jid, companyId, pushName, myJid);
-                // Refresh full info (foto, business) em background
                 if (isRealtime || fetchProfilePic) {
                     refreshContactInfo(sock, jid, companyId, pushName).catch(() => {});
                 }
@@ -104,7 +101,6 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         // Transcrição
         if (isRealtime && mediaUrl && type === 'audioMessage') {
-             // Fire and forget transcription
              (async () => {
                  try {
                      const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
@@ -160,6 +156,14 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
 
         await upsertMessage(messageData);
+
+        // 🛡️ NOVO: INJEÇÃO DIRETA PARA A IA (Sem depender de WebSockets do Render)
+        if (isRealtime && !fromMe && !isGroup) {
+            processAILogicDirectly({
+                id: messageData.whatsapp_id, // Lock Key
+                ...messageData
+            }).catch(e => console.error("❌ [SENTINEL DIRECT] Erro crítico:", e));
+        }
 
         if (isRealtime) {
             const { data: instance } = await supabase.from('instances').select('webhook_url, webhook_enabled, id').eq('session_id', sessionId).single();
