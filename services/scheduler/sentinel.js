@@ -1,20 +1,18 @@
 import { createClient } from "@supabase/supabase-js";
-import WebSocket from "ws"; // 🔥 A MÁGICA QUE RESOLVE O TIMED_OUT DO RENDER 🔥
 import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 import { sendMessage } from "../baileys/sender.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport, checkAvailability } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
 import { buildSystemPrompt } from "../../utils/promptBuilder.js"; 
+import { EventEmitter } from "events"; // 🔥 INJEÇÃO DO EVENT BUS NATIVO
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
-    auth: { persistSession: false },
-    global: { WebSocket: WebSocket }, // 🔥 Injeta o WebSocket nativo
-    realtime: { 
-        timeout: 45000,
-        log_level: 'info' // 🔍 NOVO: Envia os logs internos de WebSocket do Supabase para o painel do Render
-    }
+    auth: { persistSession: false }
 });
+
+// 🛡️ EVENT BUS LOCAL: Comunicação instantânea na memória RAM (Substitui o Realtime)
+export const aiBus = new EventEmitter();
 
 const processingLock = new Set();
 const aiInstances = new Map();
@@ -129,13 +127,14 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     return { agent: null, reason: 'no_match_found' };
 };
 
-// 🛡️ NOVO: FUNÇÃO REVERTIDA PARA ESCUTAR O REALTIME
-const processAIResponse = async (payload) => {
-    if (!payload.new) return;
+// 🛡️ NOVO: FUNÇÃO ADAPTADA PARA RECEBER DADOS DO EVENT BUS
+const processAIResponse = async (messageData) => {
+    if (!messageData) return;
     
-    console.log(`\n🔔 [RAIO-X REALTIME] Mensagem recebida! ID:`, payload.new.id);
+    console.log(`\n🔔 [RAIO-X MEMÓRIA] Mensagem recebida via EventBus! ID:`, messageData.whatsapp_id);
 
-    const { id, content, remote_jid, company_id, from_me, message_type, transcription, created_at, whatsapp_id } = payload.new;
+    // Ajustamos os nomes das variáveis para bater com o objeto gerado no messageHandler
+    const { whatsapp_id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = messageData;
 
     if (from_me) {
         console.log("   ❌ Bloqueio: Mensagem do próprio bot.");
@@ -152,7 +151,7 @@ const processAIResponse = async (payload) => {
         return; 
     } 
 
-    const lockKey = `${remote_jid}-${id}`;
+    const lockKey = `${remote_jid}-${whatsapp_id}`;
     if (processingLock.has(lockKey)) {
         console.log("   ❌ Bloqueio: Em processamento.");
         return;
@@ -188,7 +187,7 @@ const processAIResponse = async (payload) => {
     const [agentsRes, companyRes, historyRes] = await Promise.all([
         supabase.from('agents').select('*').eq('company_id', company_id).eq('is_active', true),
         supabase.from('companies').select('ai_config').eq('id', company_id).single(),
-        supabase.from('messages').select('content, from_me, message_type, transcription, created_at').eq('company_id', company_id).eq('remote_jid', remote_jid).eq('from_me', false).neq('id', id).order('created_at', { ascending: false }).limit(1).maybeSingle()
+        supabase.from('messages').select('content, from_me, message_type, transcription, created_at').eq('company_id', company_id).eq('remote_jid', remote_jid).eq('from_me', false).neq('whatsapp_id', whatsapp_id).order('created_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
     const activeAgents = agentsRes.data || [];
@@ -226,7 +225,7 @@ const processAIResponse = async (payload) => {
             .select('content, from_me, message_type, transcription')
             .eq('company_id', company_id)
             .eq('remote_jid', remote_jid)
-            .neq('whatsapp_id', whatsapp_id) // Mantemos proteção contra leitura dupla
+            .neq('whatsapp_id', whatsapp_id) // Mantemos proteção contra leitura dupla usando o whatsapp_id
             .order('created_at', { ascending: false })
             .limit(contextLimit);
 
@@ -382,29 +381,20 @@ const processAIResponse = async (payload) => {
     }
 };
 
-let sentinelChannel = null;
-
-// 🛡️ REATIVAÇÃO DO REALTIME CONFIANDO NO BACKOFF NATIVO DO SUPABASE
+// 🛡️ REATIVAÇÃO DA IA USANDO A MEMÓRIA RAM (Substitui Realtime falho do Render)
 export const startSentinel = () => {
-    console.log("🛡️ [SENTINEL] Preparando conexão Realtime com o banco...");
+    console.log("🛡️ [SENTINEL] Preparando barramento de eventos locais (EventBus)...");
     
-    // Só cria o canal se ele não existir. Usamos um nome fixo para manter a estabilidade.
-    if (!sentinelChannel) {
-        sentinelChannel = supabase.channel('ai-sentinel-channel');
+    // Evita ouvintes duplicados caso o arquivo seja recarregado
+    aiBus.removeAllListeners('new_message_arrived');
+    
+    // Ouve a mensagem localmente e aplica um Delay Estratégico de 2.5s 
+    // Isso garante que o Baileys tem tempo de sobra para gravar a chave no Supabase sem causar o Bad MAC!
+    aiBus.on('new_message_arrived', (messageData) => {
+        setTimeout(() => {
+            processAIResponse(messageData).catch(e => console.error("Erro interno no Sentinel:", e));
+        }, 2500); 
+    });
 
-        sentinelChannel
-            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
-            .subscribe((status, err) => {
-                console.log(`📡 [REALTIME STATUS]: ${status}`);
-                
-                if (status === 'SUBSCRIBED') {
-                    console.log("🟢 [SENTINEL] IA Conectada via Realtime (Modo Isolado e Seguro)!");
-                } 
-                else if (status === 'TIMED_OUT' || status === 'CLOSED' || status === 'CHANNEL_ERROR') {
-                    console.log(`⚠️ [SENTINEL] Status: ${status}. O Supabase gerenciará a reconexão automaticamente...`);
-                    if (err) console.error("   Detalhes do Erro Realtime:", err);
-                    // O loop manual com setTimeout foi removido!
-                }
-            });
-    }
+    console.log("🟢 [SENTINEL] IA Conectada na Memória RAM (Imune a quedas de rede do Render e TIMED_OUT)!");
 };
