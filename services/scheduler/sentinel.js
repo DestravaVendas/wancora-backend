@@ -10,7 +10,10 @@ import { buildSystemPrompt } from "../../utils/promptBuilder.js";
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false },
     global: { WebSocket: WebSocket }, // 🔥 Injeta o WebSocket nativo
-    realtime: { timeout: 45000 }
+    realtime: { 
+        timeout: 45000,
+        log_level: 'info' // 🔍 NOVO: Envia os logs internos de WebSocket do Supabase para o painel do Render
+    }
 });
 
 const processingLock = new Set();
@@ -381,28 +384,27 @@ const processAIResponse = async (payload) => {
 
 let sentinelChannel = null;
 
-// 🛡️ REATIVAÇÃO DO REALTIME COM WEBSOCKETS INJETADOS E PROTEÇÃO DE QUEDAS
+// 🛡️ REATIVAÇÃO DO REALTIME CONFIANDO NO BACKOFF NATIVO DO SUPABASE
 export const startSentinel = () => {
     console.log("🛡️ [SENTINEL] Preparando conexão Realtime com o banco...");
     
-    if (sentinelChannel) {
-        supabase.removeChannel(sentinelChannel);
+    // Só cria o canal se ele não existir. Usamos um nome fixo para manter a estabilidade.
+    if (!sentinelChannel) {
+        sentinelChannel = supabase.channel('ai-sentinel-channel');
+
+        sentinelChannel
+            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
+            .subscribe((status, err) => {
+                console.log(`📡 [REALTIME STATUS]: ${status}`);
+                
+                if (status === 'SUBSCRIBED') {
+                    console.log("🟢 [SENTINEL] IA Conectada via Realtime (Modo Isolado e Seguro)!");
+                } 
+                else if (status === 'TIMED_OUT' || status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+                    console.log(`⚠️ [SENTINEL] Status: ${status}. O Supabase gerenciará a reconexão automaticamente...`);
+                    if (err) console.error("   Detalhes do Erro Realtime:", err);
+                    // O loop manual com setTimeout foi removido!
+                }
+            });
     }
-
-    sentinelChannel = supabase.channel(`ai-sentinel-${Date.now()}`);
-
-    sentinelChannel
-        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, processAIResponse)
-        .subscribe((status, err) => {
-            console.log(`📡 [REALTIME STATUS]: ${status}`);
-            
-            if (status === 'SUBSCRIBED') {
-                console.log("🟢 [SENTINEL] IA Conectada via Realtime (Modo Isolado e Seguro)!");
-            } 
-            else if (status === 'TIMED_OUT' || status === 'CLOSED' || status === 'CHANNEL_ERROR') {
-                console.log("⚠️ [SENTINEL] Realtime caiu ou bloqueado. Tentando reconectar em 5 segundos...");
-                sentinelChannel = null;
-                setTimeout(() => { startSentinel(); }, 5000);
-            }
-        });
 };
