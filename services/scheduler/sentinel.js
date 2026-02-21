@@ -215,9 +215,9 @@ const processAIResponse = async (messageData) => {
             return;
         }
 
-        // MODEL FALLBACK: Força 2.5 Flash para garantir estabilidade e evitar 404
-        let activeModel = 'gemini-2.5-flash';
-        if (companyConfig?.model && !companyConfig.model.includes('1.5')) {
+        // MODEL FALLBACK: Força 2.0 Flash para escalar com velocidade e baixo custo
+        let activeModel = 'gemini-2.0-flash';
+        if (companyConfig?.model && companyConfig.model !== 'gemini-1.5-flash') {
              activeModel = companyConfig.model;
         }
 
@@ -234,16 +234,28 @@ const processAIResponse = async (messageData) => {
             .order('created_at', { ascending: false })
             .limit(contextLimit);
 
-        const chatHistory = (chatHistoryData || []).reverse().map(m => {
-            let txt = m.content || "";
-            if ((m.message_type === 'audio' || m.message_type === 'ptt') && m.transcription) {
-                txt = `[Áudio]: ${m.transcription}`;
+        let chatHistory = [];
+        if (chatHistoryData && chatHistoryData.length > 0) {
+            // Mapeia e inverte para ordem cronológica
+            const rawHistory = chatHistoryData.reverse().map(m => {
+                let txt = m.content || "";
+                if ((m.message_type === 'audio' || m.message_type === 'ptt') && m.transcription) {
+                    txt = `[Áudio]: ${m.transcription}`;
+                }
+                return {
+                    role: m.from_me ? 'model' : 'user',
+                    parts: [{ text: txt }]
+                };
+            });
+
+            // Encontra o índice da primeira mensagem que é 'user'
+            const firstUserIndex = rawHistory.findIndex(msg => msg.role === 'user');
+            
+            // Só adiciona ao histórico a partir desse ponto (remove os 'model' soltos no início)
+            if (firstUserIndex !== -1) {
+                chatHistory = rawHistory.slice(firstUserIndex);
             }
-            return {
-                role: m.from_me ? 'model' : 'user',
-                parts: [{ text: txt }]
-            };
-        });
+        }
 
         let systemInstruction = buildSystemPrompt(agent);
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
