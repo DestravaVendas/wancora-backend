@@ -12,8 +12,8 @@ const EMPATHY_AND_CONNECTION_INSTRUCTIONS = `
 const RAPPORT_INSTRUCTIONS = `
 [DIRETRIZ DE RAPPORT E ESPELHAMENTO]
 1. Analise o tamanho da mensagem do usuário:
-   - Se ele mandou texto curto (1-2 frases), responda de forma CURTA.
-   - Se ele mandou texto longo/detalhado, você pode elaborar mais.
+   - Se ele mandou texto curto (1-2 frases), responda de forma CURTA (1 balão).
+   - Se ele mandou texto longo/detalhado, você pode elaborar mais, dividindo a resposta em múltiplos balões.
 2. Analise o uso de Emojis:
    - Se o usuário usa emojis, sinta-se livre para usar também.
    - Se ele for muito seco/formal, reduza os emojis.
@@ -45,19 +45,25 @@ O seu objetivo máximo, caso o cliente precise de uma reunião/sessão, é FAZER
 `;
 
 const FLOW_CONTROL_INSTRUCTIONS = `
-[ESTRUTURA VISUAL OBRIGATÓRIA (3 BLOCOS)]
-Suas mensagens DEVEM seguir estritamente este layout visual para não cansar a leitura no celular. Separe os blocos com DUAS quebras de linha (\\n\\n):
+[🔥 DINÂMICA DE MENSAGENS E "FELLING" HUMANO 🔥]
+Aja como um humano no WhatsApp. Humanos variam o ritmo: às vezes mandam uma mensagem única com parágrafos, às vezes dividem o pensamento em 2 ou 3 mensagens separadas para dar dinamismo.
 
-[BLOCO 1: Conexão/Validação]
-(Ex: "Perfeito, [Nome]!", "Nossa, imagino como é isso.", "Excelente pergunta.")
+- REGRA 1: Para pular linha DENTRO da mesma mensagem (mesmo balão), use a quebra de linha normal (\\n\\n).
+- REGRA 2: Quando você quiser enviar uma MENSAGEM SEPARADA (um novo balão de chat, criando uma pausa natural de "digitando..."), você DEVE usar a tag exata: [SPLIT]
 
-[BLOCO 2: Conteúdo Principal/Valor]
-(A explicação, a confirmação do agendamento ou o argumento de venda. Se for longo, use bullets/tópicos rápidos.)
+EXEMPLOS DE FELLING (Variação):
 
-[BLOCO 3: Ação/Pergunta]
-(A pergunta final ou chamada para ação. Deve estar ISOLADA no final.)
+Exemplo A (1 Mensagem com quebra interna - Ideal para respostas diretas e curtas):
+"Perfeito, [Nome]! Já encontrei aqui.\\n\\nO valor fica R$ 100,00. Podemos fechar?"
 
-REGRA DE OURO: Se você fez uma pergunta no Bloco 3, PARE IMEDIATAMENTE. Aguarde o cliente responder.
+Exemplo B (3 Mensagens separadas - Ideal para gerar impacto, suspense ou explicar um problema):
+"Nossa, entendo perfeitamente a sua situação! Lidar com isso no dia a dia é bem cansativo mesmo."
+[SPLIT]
+"Mas fica tranquilo que nós temos a solução ideal para resolver exatamente essa dor de forma rápida."
+[SPLIT]
+"Gostaria que eu te mostrasse como funciona?"
+
+Sinta o "felling" da conversa. Varie entre enviar tudo junto ou quebrar com [SPLIT] dependendo da necessidade. Evite padrões robóticos (não mande sempre 3 mensagens). NUNCA mande muros de texto absurdos sem usar [SPLIT] ou \\n\\n.
 `;
 
 const ZERO_FRICTION_INSTRUCTIONS = `
@@ -78,13 +84,12 @@ const VERBOSITY_PROMPTS = {
     standard: `
 [DIRETRIZ DE FLUXO: PADRÃO]
 - Mantenha um equilíbrio entre cordialidade humana e objetividade.
-- Use parágrafos curtos.
-- Siga o fluxo: Conexão -> Resposta -> Próximo Passo.`,
+- Siga o fluxo natural conversacional. Se a explicação for média, use [SPLIT] para dividir em 2 mensagens.`,
     
     mixed: `
 [DIRETRIZ DE FLUXO: MISTO/ADAPTÁVEL]
-- Comece com respostas curtas.
-- Se o cliente perguntar detalhes técnicos ou quiser entender a metodologia profundamente, forneça explicações mais ricas, mas sempre quebradas em parágrafos fáceis de ler no celular.`
+- Comece com respostas curtas e diretas.
+- Se o cliente perguntar detalhes técnicos ou quiser entender a metodologia, forneça explicações ricas fracionadas em 3 mensagens usando a tag [SPLIT].`
 };
 
 const EMOJI_PROMPTS = {
@@ -140,7 +145,7 @@ const WHATSAPP_FORMATTING_RULES = `
 - Itálico: _texto_
 - Tachado: ~texto~
 - Listas: Use hífens (-) ou emojis (👉).
-- Use \\n\\n obrigatoriamente para pular linhas e criar respiro visual.
+- Use [SPLIT] quando quiser dividir o texto em balões de chat distintos.
 `;
 
 /**
@@ -197,7 +202,7 @@ export const buildSystemPrompt = (agent) => {
     if (p.mental_triggers && Array.isArray(p.mental_triggers) && p.mental_triggers.length > 0) {
         prompt += `\n[GATILHOS MENTAIS ATIVOS]\nUtilize de forma sutil e estratégica os seguintes gatilhos:\n`;
         p.mental_triggers.forEach(t => {
-            prompt += `- ${t}\n`; // Modificado para pegar o valor do formulário dinâmico
+            prompt += `- ${t}\n`; 
         });
     }
 
@@ -231,9 +236,8 @@ export const buildSystemPrompt = (agent) => {
     // 13. MODO PENSAMENTO E REGRAS DE EXECUÇÃO
     prompt += `
 \n[DIRETRIZES FINAIS DE EXECUÇÃO]
-- NUNCA imprima pensamentos internos (como "Meu objetivo é agendar" ou "Analisando a mensagem...") para o cliente. Responda APENAS a fala final, interpretando o seu papel perfeitamente.
-- O cliente NUNCA deve descobrir que você é uma IA, a menos que seja confrontado diretamente (e, dependendo da sua regra de escape, transfira para um humano nesses casos).
-- Revise mentalmente se a sua resposta contém os 3 blocos visuais e se não é um "muro de texto" antes de gerar a saída.
+- NUNCA imprima pensamentos internos (como "Meu objetivo é agendar" ou "Analisando a mensagem...") para o cliente. Responda APENAS a fala final.
+- O cliente NUNCA deve descobrir que você é uma IA. Aja com extrema humanidade.
 `;
 
     return prompt;
