@@ -28,44 +28,84 @@ const fixBuffer = (data) => {
     }
 };
 
-// --- SISTEMA DE LOCK ASSÍNCRONO (IMPEDE CORRUPÇÃO DE ESCRITA SIMULTÂNEA) ---
-// Prática de Ouro: Fila Indiana de gravação, salvando instantaneamente mas sem atropelos.
-const writeLocks = new Map();
+// 🔥 MEMÓRIA RAM GLOBAL PARA AS CHAVES: O Fim do Bad MAC
+// Evita que o Baileys fique travado esperando o Supabase responder pela rede.
+const sessionCaches = new Map();
 
-class Mutex {
-    constructor() {
-        this.queue = [];
-        this.locked = false;
-    }
-    async lock() {
-        return new Promise(resolve => {
-            if (this.locked) {
-                this.queue.push(resolve);
-            } else {
-                this.locked = true;
-                resolve();
-            }
+const getSessionCache = (sessionId) => {
+    if (!sessionCaches.has(sessionId)) {
+        sessionCaches.set(sessionId, {
+            keys: new Map(),      // Leitura imediata (0ms)
+            writes: new Map(),    // Fila para gravar no Supabase
+            isFlushing: false
         });
     }
-    unlock() {
-        if (this.queue.length > 0) {
-            const nextResolve = this.queue.shift();
-            nextResolve();
-        } else {
-            this.locked = false;
+    return sessionCaches.get(sessionId);
+};
+
+// Função que roda no fundo para salvar no banco de dados em lotes
+const flushToDB = async (sessionId) => {
+    const cache = sessionCaches.get(sessionId);
+    if (!cache || cache.isFlushing || cache.writes.size === 0) return;
+    
+    cache.isFlushing = true;
+    
+    try {
+        const rowsToUpsert = [];
+        const idsToDelete = [];
+        
+        // Separa as chaves atuais e limpa a fila para receber as próximas
+        const currentWrites = new Map(cache.writes);
+        cache.writes.clear();
+
+        for (const [cacheKey, value] of currentWrites.entries()) {
+            const [type, id] = cacheKey.split('::');
+            
+            if (value) {
+                const stringified = JSON.stringify(value, BufferJSON.replacer);
+                rowsToUpsert.push({
+                    session_id: sessionId,
+                    data_type: type,
+                    key_id: id,
+                    payload: JSON.parse(stringified),
+                    updated_at: new Date()
+                });
+            } else {
+                idsToDelete.push({ type, id });
+            }
+        }
+
+        if (rowsToUpsert.length > 0) {
+            await supabase.from('baileys_auth_state').upsert(rowsToUpsert, { onConflict: 'session_id, data_type, key_id' });
+        }
+
+        if (idsToDelete.length > 0) {
+            for (const item of idsToDelete) {
+                try {
+                    await supabase.from('baileys_auth_state')
+                        .delete().eq('session_id', sessionId).eq('data_type', item.type).eq('key_id', item.id);
+                } catch(e) {}
+            }
+        }
+    } catch (e) {
+        console.error(`[AUTH DB] Erro no Lote da sessão ${sessionId}:`, e.message);
+    } finally {
+        cache.isFlushing = false;
+        // Se chegaram chaves novas enquanto salvava, chama a função de novo
+        if (cache.writes.size > 0) {
+            setTimeout(() => flushToDB(sessionId), 1000);
         }
     }
-}
+};
 
-const getLock = (sessionId) => {
-    if (!writeLocks.has(sessionId)) {
-        writeLocks.set(sessionId, new Mutex());
-    }
-    return writeLocks.get(sessionId);
+// Exportada para limpar a memória quando o bot desconecta
+export const clearSessionCache = (sessionId) => {
+    sessionCaches.delete(sessionId);
 };
 
 export const useSupabaseAuthState = async (sessionId) => {
-    
+    const cache = getSessionCache(sessionId);
+
     const fetchCreds = async () => {
         try {
             const { data, error } = await supabase
@@ -81,7 +121,6 @@ export const useSupabaseAuthState = async (sessionId) => {
             
             return fixBuffer(data.payload);
         } catch (e) {
-            console.error(`[AUTH] Falha leitura creds ${sessionId}:`, e.message);
             return null;
         }
     };
@@ -93,90 +132,65 @@ export const useSupabaseAuthState = async (sessionId) => {
             creds,
             keys: {
                 get: async (type, ids) => {
-                    try {
-                        const { data } = await supabase
-                            .from('baileys_auth_state')
-                            .select('key_id, payload')
-                            .eq('session_id', sessionId)
-                            .eq('data_type', type)
-                            .in('key_id', ids);
+                    const data = {};
+                    const missingIds = [];
 
-                        const result = {};
-                        data?.forEach(row => {
-                            const val = fixBuffer(row.payload);
-                            if (val) {
-                                result[row.key_id] = val;
-                            }
-                        });
-                        return result;
-                    } catch (e) {
-                        console.error(`[AUTH] Erro leitura keys ${type}:`, e.message);
-                        return {};
+                    // 1. Tenta pegar da RAM primeiro (Instantâneo, resolve o descompasso)
+                    for (const id of ids) {
+                        const cacheKey = `${type}::${id}`;
+                        if (cache.keys.has(cacheKey)) {
+                            data[id] = cache.keys.get(cacheKey);
+                        } else {
+                            missingIds.push(id);
+                        }
                     }
+
+                    // 2. Se não estiver na RAM (bot acabou de ligar), busca no Supabase
+                    if (missingIds.length > 0) {
+                        try {
+                            const { data: dbData } = await supabase
+                                .from('baileys_auth_state')
+                                .select('key_id, payload')
+                                .eq('session_id', sessionId)
+                                .eq('data_type', type)
+                                .in('key_id', missingIds);
+
+                            dbData?.forEach(row => {
+                                const val = fixBuffer(row.payload);
+                                if (val) {
+                                    data[row.key_id] = val;
+                                    cache.keys.set(`${type}::${row.key_id}`, val); // Alimenta a RAM para o futuro
+                                }
+                            });
+                        } catch (e) {}
+                    }
+                    return data;
                 },
                 set: async (data) => {
-                    const mutex = getLock(sessionId);
-                    await mutex.lock(); // Inicia a Fila Indiana
-
-                    try {
-                        const rowsToUpsert = [];
-                        const idsToDelete = [];
-
-                        for (const type in data) {
-                            for (const id in data[type]) {
-                                const value = data[type][id];
-                                
-                                if (value) {
-                                    const stringified = JSON.stringify(value, BufferJSON.replacer);
-                                    
-                                    rowsToUpsert.push({
-                                        session_id: sessionId,
-                                        data_type: type,
-                                        key_id: id,
-                                        payload: JSON.parse(stringified), 
-                                        updated_at: new Date()
-                                    });
-                                } else {
-                                    idsToDelete.push({ type, id });
-                                }
-                            }
-                        }
-
-                        if (rowsToUpsert.length > 0) {
-                            const { error } = await supabase
-                                .from('baileys_auth_state')
-                                .upsert(rowsToUpsert, { onConflict: 'session_id, data_type, key_id' });
+                    // 1. Grava TUDO na memória RAM instantaneamente (O Baileys não trava)
+                    for (const type in data) {
+                        for (const id in data[type]) {
+                            const value = data[type][id];
+                            const cacheKey = `${type}::${id}`;
                             
-                            if (error) console.error('[AUTH DB] Erro Upsert:', error.message);
-                        }
-
-                        if (idsToDelete.length > 0) {
-                            // 🔥 SINTAXE CORRETA DO TRY/CATCH APLICADA
-                            for (const item of idsToDelete) {
-                                try {
-                                    await supabase
-                                        .from('baileys_auth_state')
-                                        .delete()
-                                        .eq('session_id', sessionId)
-                                        .eq('data_type', item.type)
-                                        .eq('key_id', item.id);
-                                } catch (err) {
-                                    // Ignora erros de exclusão silenciosamente
-                                }
+                            if (value) {
+                                cache.keys.set(cacheKey, value);
+                                cache.writes.set(cacheKey, value);
+                            } else {
+                                cache.keys.delete(cacheKey);
+                                cache.writes.set(cacheKey, null); // Marca para deleção
                             }
                         }
-                    } catch (e) {
-                        console.error('[AUTH NET] Erro:', e.message);
-                    } finally {
-                        mutex.unlock(); // Liberta a catraca
+                    }
+
+                    // 2. Aciona o gravador de fundo (só salva na nuvem a cada 2s)
+                    if (!cache.isFlushing) {
+                        setTimeout(() => flushToDB(sessionId), 2000);
                     }
                 }
             }
         },
         saveCreds: async () => {
-            const mutex = getLock(sessionId);
-            await mutex.lock();
-
             try {
                 const stringified = JSON.stringify(creds, BufferJSON.replacer);
                 await supabase.from('baileys_auth_state').upsert({
@@ -186,11 +200,7 @@ export const useSupabaseAuthState = async (sessionId) => {
                     payload: JSON.parse(stringified),
                     updated_at: new Date()
                 }, { onConflict: 'session_id,data_type,key_id' });
-            } catch (e) {
-                console.error('[AUTH] Erro saveCreds:', e.message);
-            } finally {
-                mutex.unlock();
-            }
+            } catch (e) {}
         }
     };
 };
