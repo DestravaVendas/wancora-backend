@@ -26,7 +26,7 @@ const getAIClient = async (companyId) => {
 };
 
 /**
- * Transcreve um buffer de áudio usando Gemini 2.5 Flash
+ * Transcreve um buffer de áudio usando Gemini 2.0 Flash
  * @param {Buffer} audioBuffer - Buffer do arquivo de áudio (MP3/OGG/WAV)
  * @param {string} mimeType - Mime type do áudio
  * @param {string} companyId - ID da empresa para buscar a chave correta
