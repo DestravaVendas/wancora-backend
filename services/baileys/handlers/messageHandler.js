@@ -7,7 +7,7 @@ import { transcribeAudio } from '../../ai/transcriber.js';
 import { createClient } from '@supabase/supabase-js';
 import { Logger } from '../../../utils/logger.js'; 
 import axios from 'axios';
-import { aiBus } from '../../scheduler/sentinel.js'; // 🛡️ Importa o Barramento Nativo da RAM
+import { aiBus } from '../../scheduler/sentinel.js'; // 🛡️ NOVO: Importação do Event Bus Nativo
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -157,7 +157,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         await upsertMessage(messageData);
 
-        // 🛡️ O GATILHO NATIVO: Dispara o aviso para o Sentinel instantaneamente, sem usar rede externa!
+        // 🛡️ O GATILHO NATIVO: Dispara o aviso para o Sentinel instantaneamente, na RAM!
         if (isRealtime && !fromMe && !isGroup) {
             aiBus.emit('new_message_arrived', messageData);
         }
