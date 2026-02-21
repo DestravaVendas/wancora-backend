@@ -127,14 +127,14 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     return { agent: null, reason: 'no_match_found' };
 };
 
-// 🛡️ NOVO: FUNÇÃO ADAPTADA PARA RECEBER DADOS DO EVENT BUS
+// 🛡️ ADAPTADO PARA RECEBER O PAYLOAD DIRETO DO EVENT BUS
 const processAIResponse = async (messageData) => {
     if (!messageData) return;
     
-    console.log(`\n🔔 [RAIO-X MEMÓRIA] Mensagem recebida via EventBus! ID:`, messageData.whatsapp_id);
+    console.log(`\n🔔 [RAIO-X SENTINEL] Mensagem recebida via EventBus! ID:`, messageData.whatsapp_id);
 
-    // Ajustamos os nomes das variáveis para bater com o objeto gerado no messageHandler
-    const { whatsapp_id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = messageData;
+    // Ajustado para ler as variáveis diretas do objeto messageData
+    const { whatsapp_id: id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = messageData;
 
     if (from_me) {
         console.log("   ❌ Bloqueio: Mensagem do próprio bot.");
@@ -151,7 +151,7 @@ const processAIResponse = async (messageData) => {
         return; 
     } 
 
-    const lockKey = `${remote_jid}-${whatsapp_id}`;
+    const lockKey = `${remote_jid}-${id}`;
     if (processingLock.has(lockKey)) {
         console.log("   ❌ Bloqueio: Em processamento.");
         return;
@@ -187,7 +187,7 @@ const processAIResponse = async (messageData) => {
     const [agentsRes, companyRes, historyRes] = await Promise.all([
         supabase.from('agents').select('*').eq('company_id', company_id).eq('is_active', true),
         supabase.from('companies').select('ai_config').eq('id', company_id).single(),
-        supabase.from('messages').select('content, from_me, message_type, transcription, created_at').eq('company_id', company_id).eq('remote_jid', remote_jid).eq('from_me', false).neq('whatsapp_id', whatsapp_id).order('created_at', { ascending: false }).limit(1).maybeSingle()
+        supabase.from('messages').select('content, from_me, message_type, transcription, created_at').eq('company_id', company_id).eq('remote_jid', remote_jid).eq('from_me', false).neq('whatsapp_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
     const activeAgents = agentsRes.data || [];
@@ -225,7 +225,7 @@ const processAIResponse = async (messageData) => {
             .select('content, from_me, message_type, transcription')
             .eq('company_id', company_id)
             .eq('remote_jid', remote_jid)
-            .neq('whatsapp_id', whatsapp_id) // Mantemos proteção contra leitura dupla usando o whatsapp_id
+            .neq('whatsapp_id', id) 
             .order('created_at', { ascending: false })
             .limit(contextLimit);
 
@@ -281,7 +281,7 @@ const processAIResponse = async (messageData) => {
         let functionCalls = response.functionCalls();
         let loopLimit = 0;
 
-        // Loop de tratamento de Tools (Executa a ação e devolve pro Gemini analisar)
+        // Loop de tratamento de Tools
         while (functionCalls && functionCalls.length > 0 && loopLimit < 3) {
             loopLimit++;
             const toolResults = [];
@@ -301,7 +301,7 @@ const processAIResponse = async (messageData) => {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
                         await handoffAndReport(company_id, lead.id, remote_jid, call.args.summary, call.args.reason, reportingPhones);
                         console.log("   🛑 Chat transferido para humano.");
-                        return; // Encerra a IA imediatamente, humano assumiu
+                        return; 
                     }
                     else if (call.name === 'search_files') {
                         const { data: files } = await supabase.rpc('search_drive_files', { 
@@ -323,7 +323,7 @@ const processAIResponse = async (messageData) => {
                             }).catch(() => {});
                             output = { success: true, message: "Arquivo enviado com sucesso." };
                         } else {
-                            output = { success: false, message: "Sessão do WhatsApp desconectada." };
+                            output = { success: false, message: "Sessão desconectada." };
                         }
                     }
                 } catch (toolError) {
@@ -339,7 +339,6 @@ const processAIResponse = async (messageData) => {
                 });
             }
 
-            // Devolve o resultado da execução para a IA continuar o pensamento
             result = await chat.sendMessage(toolResults);
             response = result.response;
             functionCalls = response.functionCalls();
@@ -366,7 +365,7 @@ const processAIResponse = async (messageData) => {
                     console.error("   ❌ [ERRO AO ENVIAR PARA A FILA]:", sendError);
                 }
             } else {
-                console.log("   ❌ ERRO: Sessão (SessionId) não encontrada.");
+                console.log("   ❌ ERRO: Sessão não encontrada.");
             }
         }
 
@@ -374,27 +373,26 @@ const processAIResponse = async (messageData) => {
         console.error("\n   ❌ [ERRO CRÍTICO NA EXECUÇÃO DA IA]:", error);
         
         if (error.message?.includes('404')) {
-             Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key não tem acesso ao modelo atual." }, company_id);
+             Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key inválida." }, company_id);
         } else if (!error.message?.includes('SAFETY')) {
             Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message }, company_id);
         }
     }
 };
 
-// 🛡️ REATIVAÇÃO DA IA USANDO A MEMÓRIA RAM (Substitui Realtime falho do Render)
+// 🛡️ NOVO: O FIM DOS TIMEOUTS. MOTOR LIGADO NA RAM.
 export const startSentinel = () => {
     console.log("🛡️ [SENTINEL] Preparando barramento de eventos locais (EventBus)...");
     
-    // Evita ouvintes duplicados caso o arquivo seja recarregado
     aiBus.removeAllListeners('new_message_arrived');
     
     // Ouve a mensagem localmente e aplica um Delay Estratégico de 2.5s 
-    // Isso garante que o Baileys tem tempo de sobra para gravar a chave no Supabase sem causar o Bad MAC!
+    // Isso garante que o Baileys tem tempo de sobra para gravar a chave (Evita o Bad MAC)
     aiBus.on('new_message_arrived', (messageData) => {
         setTimeout(() => {
             processAIResponse(messageData).catch(e => console.error("Erro interno no Sentinel:", e));
         }, 2500); 
     });
 
-    console.log("🟢 [SENTINEL] IA Conectada na Memória RAM (Imune a quedas de rede do Render e TIMED_OUT)!");
+    console.log("🟢 [SENTINEL] IA Conectada na Memória RAM (Imune a quedas do Render e TIMED_OUT)!");
 };
