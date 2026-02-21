@@ -71,7 +71,7 @@ export const sendMessage = async ({
     card,
     driveFileId, 
     companyId,
-    timingConfig // [NOVO] Adicionado override_typing_time
+    timingConfig // [NOVO] Configuração de tempo { min_delay, max_delay, override_typing_time }
 }) => {
     const session = sessions.get(sessionId);
     if (!session || !session.sock) throw new Error(`Sessão ${sessionId} não encontrada.`);
@@ -133,16 +133,14 @@ export const sendMessage = async ({
         }
 
         // --- CÁLCULO DE DELAY INTELIGENTE E SEGURO (ANTI-BAD MAC) ---
-        // 1. Pausa Estratégica (Reaction Time & Crypto Sync)
         const minDelay = timingConfig?.min_delay_seconds ? timingConfig.min_delay_seconds * 1000 : 2500;
         const maxDelay = timingConfig?.max_delay_seconds ? timingConfig.max_delay_seconds * 1000 : 4000;
         
-        // Garante que max >= min e que nunca seja menor que o tempo de segurança criptográfica (2.5s original)
-        // Aqui o mínimo foi ajustado porque o Sentinel já controla os maiores delays
+        // Garante que max >= min 
         const safeMin = Math.max(minDelay, 1000); 
         const safeMax = Math.max(maxDelay, safeMin);
         
-        await delay(randomDelay(Math.floor(safeMin * 0.5), Math.floor(safeMax * 0.8)));
+        await delay(randomDelay(Math.floor(safeMin * 0.5), Math.floor(safeMin * 0.8)));
         
         // 2. Simulação de Digitação (Typing Time)
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
@@ -150,7 +148,7 @@ export const sendMessage = async ({
 
         let productionTime = 1000;
         
-        // 🧠 A IA AGORA COMANDA O TEMPO DE DIGITAÇÃO VIA SENTINEL
+        // 🧠 A IA NO SENTINEL AGORA COMANDA O TEMPO EXATO DA DIGITAÇÃO
         if (timingConfig?.override_typing_time) {
             productionTime = timingConfig.override_typing_time;
         } else if (type === 'text' && content) {
