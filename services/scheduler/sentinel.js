@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
-import { sendMessage, markMessageAsRead } from "../baileys/sender.js"; // 🔥 Módulo de Leitura Importado
+import { sendMessage, markMessageAsRead } from "../baileys/sender.js"; // 🔥 IMPORT DA LEITURA
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport, checkAvailability } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
@@ -11,7 +11,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-// 🛡️ EVENT BUS LOCAL: Comunicação instantânea na memória RAM
+// 🛡️ EVENT BUS LOCAL: Comunicação instantânea na memória RAM (Substitui o Realtime)
 export const aiBus = new EventEmitter();
 
 const processingLock = new Set();
@@ -131,12 +131,13 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     return { agent: null, reason: 'no_match_found' };
 };
 
-// 🛡️ ADAPTADO PARA RECEBER O PAYLOAD DIRETO DO EVENT BUS E FAZER QUEBRAS
+// 🛡️ ADAPTADO PARA RECEBER O PAYLOAD DIRETO DO EVENT BUS E SIMULAR HUMANIZAÇÃO
 const processAIResponse = async (messageData) => {
     if (!messageData) return;
     
     console.log(`\n🔔 [RAIO-X SENTINEL] Mensagem recebida via EventBus! ID:`, messageData.whatsapp_id);
 
+    // Ajustado para ler as variáveis diretas do objeto messageData
     const { whatsapp_id: id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = messageData;
 
     if (from_me) {
@@ -160,7 +161,7 @@ const processAIResponse = async (messageData) => {
         return;
     }
     processingLock.add(lockKey);
-    // 🛡️ A IA agora simula tempos humanos longos (ler, pensar, digitar várias mensagens). Lock em 60s.
+    // 🛡️ Aumentamos a tranca para 60s, pois agora a IA vai "demorar" muito tempo agindo como humano (Ler, pensar e digitar várias vezes)
     setTimeout(() => processingLock.delete(lockKey), 60000);
 
     const phone = remote_jid.split('@')[0];
@@ -247,7 +248,7 @@ const processAIResponse = async (messageData) => {
         let systemInstruction = buildSystemPrompt(agent);
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
         
-        // Consciência Temporal
+        // Consciência Temporal (Dia da semana + Data completa)
         const agora = new Date();
         const dataCompleta = agora.toLocaleDateString('pt-BR', { 
             weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
@@ -354,27 +355,43 @@ const processAIResponse = async (messageData) => {
         // 🧠 FLUXO DE COMPORTAMENTO HUMANO AVANÇADO (VISUALIZAR, PENSAR, DIGITAR E QUEBRAR)
         // =========================================================================
         if (finalReply) {
-            console.log(`   💬 Resposta final gerada. Iniciando comportamento humano...`);
+            console.log(`   💬 Resposta final gerada. Iniciando fluxo humano...`);
             const sessionId = await getSessionId(company_id);
             
             if (sessionId) {
-                // PASSO 1: Marcar como lida ("Visualizou") instataneamente após a IA pensar
-                await markMessageAsRead(sessionId, remote_jid, id);
-                console.log(`   👀 Visto Azul enviado. Aguardando ~10 segundos...`);
+                // PASSO 1: Marcar como lida ("Visualizou")
+                await markMessageAsRead(sessionId, remote_jid, id); // Usa o id (whatsapp_id) da mensagem de entrada
+                console.log(`   👀 Visto Azul enviado. Aguardando ~10 segundos de leitura...`);
 
-                // PASSO 2: Ficar "olhando/pensando" por um tempo natural (8 a 12s) antes de começar a digitar
+                // PASSO 2: Ficar "olhando/pensando" por um tempo natural antes de começar a digitar
                 await delay(randomDelay(8000, 12000));
 
                 // PASSO 3: Quebra Inteligente baseada no felling da IA
-                // A IA agora usa a tag [SPLIT] quando ela mesma quer criar uma mensagem separada
+                // Tenta quebrar usando a tag [SPLIT] que ensinámos no promptBuilder
                 let chunks = finalReply.split(/\[SPLIT\]/i).map(c => c.trim()).filter(c => c.length > 0);
-
-                // Fallback de sanidade: Se a IA não usou SPLIT, mas gerou um textão absurdo, nós ajudamos
-                if (chunks.length === 1 && finalReply.length > 500) {
+                
+                // Fallback de segurança: Se a IA não usar o SPLIT e mandar um texto gigante, quebra por \n\n
+                if (chunks.length === 1 && finalReply.length > 300) {
                     chunks = finalReply.split(/\n\n+/).map(c => c.trim()).filter(c => c.length > 0);
                 }
 
-                // Limite de sanidade: Máximo de 4 balões para não ser banido por spam
+                // Agrupa blocos muito pequenos (como "Olá!") com o próximo
+                let mergedChunks = [];
+                let tempStr = "";
+                for (const c of chunks) {
+                    if (tempStr.length + c.length < 120 && c.length < 100) { 
+                        tempStr += (tempStr.length > 0 ? "\n" : "") + c;
+                    } else {
+                        if (tempStr) mergedChunks.push(tempStr);
+                        tempStr = c;
+                    }
+                }
+                if (tempStr) mergedChunks.push(tempStr);
+                
+                if (mergedChunks.length > 0) chunks = mergedChunks;
+                if (chunks.length === 0) chunks = [finalReply]; // Último recurso
+
+                // Limite de sanidade: Máximo de 4 balões 
                 if (chunks.length > 4) {
                     const limitChunks = [chunks[0]];
                     limitChunks.push(chunks.slice(1, -1).join('\n\n'));
@@ -388,10 +405,10 @@ const processAIResponse = async (messageData) => {
                     
                     // PASSO 5: Definir o tempo do "Digitando..."
                     // A primeira mensagem finge que está formulando a ideia inicial (7 a 10s)
-                    // As partes seguintes digitam mais rápido (2 a 10s, proporcional ao tamanho)
+                    // As partes seguintes digitam mais rápido, simulando a continuação do raciocínio
                     let typingTime = randomDelay(7000, 10000); 
                     if (i > 0) {
-                        typingTime = Math.min(Math.max(chunk.length * 40, 2000), 10000); 
+                        typingTime = Math.min(Math.max(chunk.length * 40, 2500), 9000); 
                     }
 
                     try {
@@ -401,7 +418,7 @@ const processAIResponse = async (messageData) => {
                             type: 'text',
                             content: chunk,
                             timingConfig: { 
-                                override_typing_time: typingTime, // Força o tempo exato do "digitando..."
+                                override_typing_time: typingTime, // Força o sender.js a usar este tempo para o composing
                                 min_delay_seconds: 0.5, 
                                 max_delay_seconds: 1.5
                             },
@@ -440,7 +457,7 @@ export const startSentinel = () => {
     aiBus.removeAllListeners('new_message_arrived');
     
     aiBus.on('new_message_arrived', (messageData) => {
-        // Delay inicial de 2.5s para não causar colisão na gravação do BD (Anti-BadMAC)
+        // Atraso de segurança Anti Bad MAC (2.5s) continua ativado
         setTimeout(() => {
             processAIResponse(messageData).catch(e => console.error("Erro interno no Sentinel:", e));
         }, 2500); 
