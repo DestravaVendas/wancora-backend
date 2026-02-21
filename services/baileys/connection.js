@@ -7,7 +7,7 @@ import makeWASocket, {
     isJidBroadcast,
     proto
 } from '@whiskeysockets/baileys';
-import { useSupabaseAuthState } from '../../auth/supabaseAuth.js';
+import { useSupabaseAuthState, clearSessionCache } from '../../auth/supabaseAuth.js';
 import { setupListeners } from './listener.js';
 import { deleteSessionData, updateInstanceStatus, normalizeJid } from '../crm/sync.js';
 import { createClient } from "@supabase/supabase-js";
@@ -90,6 +90,7 @@ const killSession = (sessionId) => {
             console.error(`Erro ao matar sessão: ${e.message}`);
         }
         sessions.delete(sessionId);
+        clearSessionCache(sessionId); // 🔥 LIMPA A MEMÓRIA RAM 
         // Limpa cache de histórico para evitar dados parciais na reconexão
         resetHistoryState(sessionId);
     }
@@ -126,7 +127,8 @@ export const startSession = async (sessionId, companyId) => {
             printQRInTerminal: false,
             auth: {
                 creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, logger),
+                // Passa as chaves diretas para a nossa RAM customizada!
+                keys: state.keys,
             },
             msgRetryCounterCache: redis ? {
                 get: async (key) => {
