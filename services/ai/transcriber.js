@@ -39,9 +39,9 @@ export const transcribeAudio = async (audioBuffer, mimeType, companyId) => {
             return null;
         }
 
-        // Utiliza o modelo 2.5 de produção
+        // Utiliza o modelo 2.0 flash de produção
         const model = genAI.getGenerativeModel({ 
-            model: "gemini-2.5-flash",
+            model: "gemini-2.0-flash",
             // Mantemos a temperatura baixa para garantir que ele não invente palavras
             generationConfig: {
                 temperature: 0.2, 
