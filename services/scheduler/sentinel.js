@@ -1,21 +1,25 @@
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
-import { sendMessage } from "../baileys/sender.js";
+import { sendMessage, markMessageAsRead } from "../baileys/sender.js"; // 🔥 Módulo de Leitura Importado
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport, checkAvailability } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
 import { buildSystemPrompt } from "../../utils/promptBuilder.js"; 
-import { EventEmitter } from "events"; // 🔥 INJEÇÃO DO EVENT BUS NATIVO
+import { EventEmitter } from "events"; 
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
 
-// 🛡️ EVENT BUS LOCAL: Comunicação instantânea na memória RAM (Substitui o Realtime)
+// 🛡️ EVENT BUS LOCAL: Comunicação instantânea na memória RAM
 export const aiBus = new EventEmitter();
 
 const processingLock = new Set();
 const aiInstances = new Map();
+
+// Helper de Atraso Humano
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
 
 // --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL - COMPLETO) ---
 const ALL_TOOLS = [
@@ -157,7 +161,8 @@ const processAIResponse = async (messageData) => {
         return;
     }
     processingLock.add(lockKey);
-    setTimeout(() => processingLock.delete(lockKey), 15000);
+    // 🛡️ Aumentamos a tranca para 60s, pois agora a IA vai "demorar" muito tempo agindo como humano
+    setTimeout(() => processingLock.delete(lockKey), 60000);
 
     const phone = remote_jid.split('@')[0];
     console.log(`   🔍 Buscando Lead: ${phone}...`);
@@ -301,7 +306,7 @@ const processAIResponse = async (messageData) => {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
                         await handoffAndReport(company_id, lead.id, remote_jid, call.args.summary, call.args.reason, reportingPhones);
                         console.log("   🛑 Chat transferido para humano.");
-                        return; 
+                        return; // Encerra a IA imediatamente, humano assumiu
                     }
                     else if (call.name === 'search_files') {
                         const { data: files } = await supabase.rpc('search_drive_files', { 
@@ -346,23 +351,88 @@ const processAIResponse = async (messageData) => {
 
         const finalReply = response.text();
 
+        // =========================================================================
+        // 🧠 FLUXO DE COMPORTAMENTO HUMANO AVANÇADO (VISUALIZAR, PENSAR, DIGITAR E QUEBRAR)
+        // =========================================================================
         if (finalReply) {
-            console.log(`   💬 Resposta final gerada, enviando para Baileys...`);
+            console.log(`   💬 Resposta final gerada. Iniciando comportamento humano...`);
             const sessionId = await getSessionId(company_id);
+            
             if (sessionId) {
-                const timingConfig = agent.flow_config?.timing;
-                try {
-                    await sendMessage({
-                        sessionId,
-                        to: remote_jid,
-                        type: 'text',
-                        content: finalReply,
-                        timingConfig,
-                        companyId: company_id
-                    });
-                    console.log(`   ✅ SUCESSO: Mensagem colocada na fila de envio!`);
-                } catch (sendError) {
-                    console.error("   ❌ [ERRO AO ENVIAR PARA A FILA]:", sendError);
+                // PASSO 1: Marcar como lida ("Visualizou")
+                await markMessageAsRead(sessionId, remote_jid, id); // Usa o id (whatsapp_id) mapeado no topo
+                console.log(`   👀 Visto Azul enviado. Agurdando ~10 segundos...`);
+
+                // PASSO 2: Ficar "olhando/pensando" por um tempo natural antes de começar a digitar
+                await delay(randomDelay(8000, 12000));
+
+                // PASSO 3: Quebra Inteligente de Mensagem
+                // Tenta quebrar por parágrafos duplos (\n\n) que a IA naturalmente usa
+                let rawChunks = finalReply.split(/\n\n+/).map(c => c.trim()).filter(c => c.length > 0);
+                
+                // Se a IA gerou um textão único e grande, tenta quebrar por frases terminadas em ponto.
+                if (rawChunks.length === 1 && finalReply.length > 300) {
+                    rawChunks = finalReply.split(/(?<=[.!?])\s+(?=[A-Z])/).map(c => c.trim()).filter(c => c.length > 0);
+                }
+
+                // Agrupa chunks muito pequenos (ex: um "Olá!") com o próximo, para não mandar balões de 1 palavra
+                let chunks = [];
+                let tempStr = "";
+                for (const c of rawChunks) {
+                    if (tempStr.length + c.length < 150) { 
+                        tempStr += (tempStr.length > 0 ? "\n" : "") + c;
+                    } else {
+                        if (tempStr) chunks.push(tempStr);
+                        tempStr = c;
+                    }
+                }
+                if (tempStr) chunks.push(tempStr);
+                
+                // Fallback de segurança: Se algo der errado na quebra, manda tudo junto
+                if (chunks.length === 0) chunks = [finalReply]; 
+
+                // Limite de sanidade: Máximo de 4 balões para não ser banido por spam
+                if (chunks.length > 4) {
+                    const limitChunks = [chunks[0]];
+                    limitChunks.push(chunks.slice(1, -1).join('\n\n'));
+                    limitChunks.push(chunks[chunks.length - 1]);
+                    chunks = limitChunks.filter(c => c.length > 0);
+                }
+
+                // PASSO 4: Loop de Envio Fracionado
+                for (let i = 0; i < chunks.length; i++) {
+                    const chunk = chunks[i];
+                    
+                    // PASSO 5: Definir o tempo do "Digitando..."
+                    // A primeira mensagem finge que está formulando a ideia (7 a 10s)
+                    // As partes seguintes digitam mais rápido (simulando que já sabe o que vai dizer)
+                    let typingTime = randomDelay(7000, 10000); 
+                    if (i > 0) {
+                        typingTime = Math.min(Math.max(chunk.length * 40, 3000), 8000); 
+                    }
+
+                    try {
+                        await sendMessage({
+                            sessionId,
+                            to: remote_jid,
+                            type: 'text',
+                            content: chunk,
+                            timingConfig: { 
+                                override_typing_time: typingTime, // Força o tempo de "digitando..."
+                                min_delay_seconds: 1, // Delays normais reduzidos pois o typingTime já segura o envio
+                                max_delay_seconds: 2
+                            },
+                            companyId: company_id
+                        });
+                        console.log(`   ✅ Parte ${i+1}/${chunks.length} enviada! (Digitou por ${Math.round(typingTime/1000)}s)`);
+                        
+                        // PASSO 6: O "respiro" entre enviar uma parte e começar a digitar a próxima
+                        if (i < chunks.length - 1) {
+                            await delay(randomDelay(1500, 3500));
+                        }
+                    } catch (sendError) {
+                        console.error("   ❌ [ERRO AO ENVIAR PARTE]:", sendError.message);
+                    }
                 }
             } else {
                 console.log("   ❌ ERRO: Sessão não encontrada.");
@@ -380,14 +450,12 @@ const processAIResponse = async (messageData) => {
     }
 };
 
-// 🛡️ NOVO: O FIM DOS TIMEOUTS. MOTOR LIGADO NA RAM.
+// 🛡️ O FIM DOS TIMEOUTS. MOTOR LIGADO NA RAM.
 export const startSentinel = () => {
     console.log("🛡️ [SENTINEL] Preparando barramento de eventos locais (EventBus)...");
     
     aiBus.removeAllListeners('new_message_arrived');
     
-    // Ouve a mensagem localmente e aplica um Delay Estratégico de 2.5s 
-    // Isso garante que o Baileys tem tempo de sobra para gravar a chave (Evita o Bad MAC)
     aiBus.on('new_message_arrived', (messageData) => {
         setTimeout(() => {
             processAIResponse(messageData).catch(e => console.error("Erro interno no Sentinel:", e));
