@@ -1,12 +1,10 @@
-
 import makeWASocket, { 
     DisconnectReason, 
     fetchLatestBaileysVersion,
-    makeCacheableSignalKeyStore,
     Browsers,
     isJidBroadcast,
     proto
-} from '@whiskeysockets/baileys';
+} from '@whiskeysockets/baileys'; // 🔥 makeCacheableSignalKeyStore REMOVIDO!
 import { useSupabaseAuthState } from '../../auth/supabaseAuth.js';
 import { setupListeners } from './listener.js';
 import { deleteSessionData, updateInstanceStatus, normalizeJid } from '../crm/sync.js';
@@ -14,7 +12,7 @@ import { createClient } from "@supabase/supabase-js";
 import getRedisClient from '../redisClient.js'; 
 import pino from 'pino';
 import { Logger } from '../../utils/logger.js'; 
-import { resetHistoryState } from './handlers/historyHandler.js'; // Import Vital
+import { resetHistoryState } from './handlers/historyHandler.js'; 
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -64,22 +62,17 @@ const killSession = (sessionId) => {
         console.log(`💀 [CONNECTION] Matando sessão ${sessionId} (Hard Kill)...`);
         const session = sessions.get(sessionId);
         try {
-            // Remove listeners do Baileys
             if (session.sock && session.sock.ev) {
                 session.sock.ev.removeAllListeners('connection.update');
                 session.sock.ev.removeAllListeners('creds.update');
                 session.sock.ev.removeAllListeners('messages.upsert');
             }
-            
-            // Encerra socket de forma segura
             session.sock.end(undefined);
             
-            // Limpeza de WebSocket de baixo nível (Defensiva)
             if (session.sock.ws) {
                 if (typeof session.sock.ws.removeAllListeners === 'function') {
                     session.sock.ws.removeAllListeners();
                 }
-                
                 if (typeof session.sock.ws.terminate === 'function') {
                     session.sock.ws.terminate();
                 } else if (typeof session.sock.ws.close === 'function') {
@@ -90,12 +83,10 @@ const killSession = (sessionId) => {
             console.error(`Erro ao matar sessão: ${e.message}`);
         }
         sessions.delete(sessionId);
-        // Limpa cache de histórico para evitar dados parciais na reconexão
         resetHistoryState(sessionId);
     }
 };
 
-// [NOVO] Função para desligamento gracioso do servidor
 export const shutdownAllSessions = () => {
     console.log(`🛑 [SHUTDOWN] Encerrando ${sessions.size} sessões ativas para evitar conflitos de deploy...`);
     for (const sessionId of sessions.keys()) {
@@ -126,7 +117,10 @@ export const startSession = async (sessionId, companyId) => {
             printQRInTerminal: false,
             auth: {
                 creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, logger),
+                // 🔥 PROTEÇÃO MÁXIMA: Ligação direta! Ao remover o "Cache", 
+                // obrigamos o Baileys a usar o seu Mutex síncrono para cada mensagem,
+                // impedindo a perda de chaves quando a rede pisca!
+                keys: state.keys, 
             },
             msgRetryCounterCache: redis ? {
                 get: async (key) => {
@@ -141,8 +135,10 @@ export const startSession = async (sessionId, companyId) => {
                 }
             } : undefined,
             browser: Browsers.ubuntu("Chrome"), 
-            syncFullHistory: true, 
-            markOnlineOnConnect: false, // Otimização: Evita flood de presença antes do sync
+            // 🚀 FIM DOS ERROS 500: Desligar o Full History impede o afogamento de CPU 
+            // que derrubava o servidor ao tentar baixar 1.172 mensagens antigas.
+            syncFullHistory: false, 
+            markOnlineOnConnect: false, 
             generateHighQualityLinkPreview: true,
             defaultQueryTimeoutMs: 90000, 
             retryRequestDelayMs: 2500,
@@ -219,14 +215,9 @@ export const startSession = async (sessionId, companyId) => {
                 }
 
                 if (isConflict) {
-                     // Adiciona um jitter significativo para evitar que as duas sessões reconectem sincronizadas
                      const jitter = Math.floor(Math.random() * (30000 - 15000 + 1) + 15000);
-                     Logger.warn('baileys', `Conflito de Stream (440). Jitter: ${jitter}ms.`, { sessionId }, companyId);
-                     
-                     // Mata esta instância para dar chance à outra (se for o caso)
+                     Logger.warn('baileys', `Conflito de Stream/Restart (515/440). Jitter: ${jitter}ms.`, { sessionId }, companyId);
                      killSession(sessionId); 
-                     
-                     // Tenta reconectar depois do jitter
                      handleReconnect(sessionId, companyId, jitter); 
                      return;
                 }
@@ -262,7 +253,6 @@ export const startSession = async (sessionId, companyId) => {
                     is_business_account: isBiz
                 };
 
-                // Se já estava completo, mantém. Se não, reseta para importar.
                 if (prev?.sync_status !== 'completed') {
                     updatePayload.sync_status = 'importing_contacts';
                     updatePayload.sync_percent = 5;
