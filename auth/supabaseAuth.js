@@ -1,4 +1,4 @@
-import { BufferJSON, initAuthCreds } from '@whiskeysockets/baileys';
+import { BufferJSON, initAuthCreds, makeMutex } from '@whiskeysockets/baileys';
 import { createClient } from '@supabase/supabase-js';
 
 // Cliente Supabase Service Role
@@ -6,7 +6,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-// 🛡️ REVISÃO DE SERIALIZAÇÃO
+// 🛡️ REVISÃO DE SERIALIZAÇÃO (Mantido exatamente como o original)
 const fixBuffer = (data) => {
     if (!data) return null;
     try {
@@ -28,44 +28,12 @@ const fixBuffer = (data) => {
     }
 };
 
-// --- SISTEMA DE LOCK ASSÍNCRONO (IMPEDE CORRUPÇÃO DE ESCRITA SIMULTÂNEA) ---
-// Prática de Ouro: Fila Indiana de gravação, salvando instantaneamente mas sem atropelos.
-const writeLocks = new Map();
-
-class Mutex {
-    constructor() {
-        this.queue = [];
-        this.locked = false;
-    }
-    async lock() {
-        return new Promise(resolve => {
-            if (this.locked) {
-                this.queue.push(resolve);
-            } else {
-                this.locked = true;
-                resolve();
-            }
-        });
-    }
-    unlock() {
-        if (this.queue.length > 0) {
-            const nextResolve = this.queue.shift();
-            nextResolve();
-        } else {
-            this.locked = false;
-        }
-    }
-}
-
-const getLock = (sessionId) => {
-    if (!writeLocks.has(sessionId)) {
-        writeLocks.set(sessionId, new Mutex());
-    }
-    return writeLocks.get(sessionId);
-};
-
 export const useSupabaseAuthState = async (sessionId) => {
     
+    // 🛡️ O Mutex Oficial do Baileys (Cria a "Fila Indiana" inquebrável para esta sessão)
+    const mutex = makeMutex();
+
+    // 1. Carrega credenciais principais (creds.json)
     const fetchCreds = async () => {
         try {
             const { data, error } = await supabase
@@ -103,6 +71,7 @@ export const useSupabaseAuthState = async (sessionId) => {
 
                         const result = {};
                         data?.forEach(row => {
+                            // IMPORTANTE: Aplica o fixBuffer em cada chave recuperada
                             const val = fixBuffer(row.payload);
                             if (val) {
                                 result[row.key_id] = val;
@@ -115,82 +84,80 @@ export const useSupabaseAuthState = async (sessionId) => {
                     }
                 },
                 set: async (data) => {
-                    const mutex = getLock(sessionId);
-                    await mutex.lock(); // Inicia a Fila Indiana
+                    // 🔥 Usa o Mutex do Baileys para envolver toda a operação de escrita
+                    await mutex.mutex(async () => {
+                        try {
+                            const rowsToUpsert = [];
+                            const idsToDelete = [];
 
-                    try {
-                        const rowsToUpsert = [];
-                        const idsToDelete = [];
-
-                        for (const type in data) {
-                            for (const id in data[type]) {
-                                const value = data[type][id];
-                                
-                                if (value) {
-                                    const stringified = JSON.stringify(value, BufferJSON.replacer);
+                            for (const type in data) {
+                                for (const id in data[type]) {
+                                    const value = data[type][id];
                                     
-                                    rowsToUpsert.push({
-                                        session_id: sessionId,
-                                        data_type: type,
-                                        key_id: id,
-                                        payload: JSON.parse(stringified), 
-                                        updated_at: new Date()
-                                    });
-                                } else {
-                                    idsToDelete.push({ type, id });
+                                    if (value) {
+                                        // Serializa garantindo que Buffers virem { type: 'Buffer', data: [...] }
+                                        const stringified = JSON.stringify(value, BufferJSON.replacer);
+                                        
+                                        rowsToUpsert.push({
+                                            session_id: sessionId,
+                                            data_type: type,
+                                            key_id: id,
+                                            payload: JSON.parse(stringified), // Salva como JSON puro no banco
+                                            updated_at: new Date()
+                                        });
+                                    } else {
+                                        idsToDelete.push({ type, id });
+                                    }
                                 }
                             }
-                        }
 
-                        if (rowsToUpsert.length > 0) {
-                            const { error } = await supabase
-                                .from('baileys_auth_state')
-                                .upsert(rowsToUpsert, { onConflict: 'session_id, data_type, key_id' });
-                            
-                            if (error) console.error('[AUTH DB] Erro Upsert:', error.message);
-                        }
+                            if (rowsToUpsert.length > 0) {
+                                // Upsert em lote para performance
+                                const { error } = await supabase
+                                    .from('baileys_auth_state')
+                                    .upsert(rowsToUpsert, { onConflict: 'session_id, data_type, key_id' });
+                                
+                                if (error) console.error('[AUTH DB] Erro Upsert:', error.message);
+                            }
 
-                        if (idsToDelete.length > 0) {
-                            // 🔥 O SINTAXE FATAL FOI CORRIGIDA AQUI 🔥
-                            for (const item of idsToDelete) {
-                                try {
-                                    await supabase
-                                        .from('baileys_auth_state')
-                                        .delete()
-                                        .eq('session_id', sessionId)
-                                        .eq('data_type', item.type)
-                                        .eq('key_id', item.id);
-                                } catch (err) {
-                                    // Ignora erros de exclusão silenciosamente, sem quebrar o Baileys
+                            if (idsToDelete.length > 0) {
+                                // 🔥 CORREÇÃO: Try/Catch interno para exclusão não quebrar o Baileys
+                                for (const item of idsToDelete) {
+                                    try {
+                                        await supabase
+                                            .from('baileys_auth_state')
+                                            .delete()
+                                            .eq('session_id', sessionId)
+                                            .eq('data_type', item.type)
+                                            .eq('key_id', item.id);
+                                    } catch (err) {
+                                        // Falha silenciosa correta
+                                    }
                                 }
                             }
+                        } catch (e) {
+                            console.error('[AUTH NET] Erro set keys:', e.message);
                         }
-                    } catch (e) {
-                        console.error('[AUTH NET] Erro:', e.message);
-                    } finally {
-                        mutex.unlock(); // Liberta a catraca para o próximo
-                    }
+                    });
                 }
             }
         },
         saveCreds: async () => {
-            const mutex = getLock(sessionId);
-            await mutex.lock();
-
-            try {
-                const stringified = JSON.stringify(creds, BufferJSON.replacer);
-                await supabase.from('baileys_auth_state').upsert({
-                    session_id: sessionId,
-                    data_type: 'creds',
-                    key_id: 'creds',
-                    payload: JSON.parse(stringified),
-                    updated_at: new Date()
-                }, { onConflict: 'session_id,data_type,key_id' });
-            } catch (e) {
-                console.error('[AUTH] Erro saveCreds:', e.message);
-            } finally {
-                mutex.unlock();
-            }
+             // 🔥 Mutex oficial protege a gravação das credenciais principais também
+             await mutex.mutex(async () => {
+                try {
+                    const stringified = JSON.stringify(creds, BufferJSON.replacer);
+                    await supabase.from('baileys_auth_state').upsert({
+                        session_id: sessionId,
+                        data_type: 'creds',
+                        key_id: 'creds',
+                        payload: JSON.parse(stringified),
+                        updated_at: new Date()
+                    }, { onConflict: 'session_id,data_type,key_id' });
+                } catch (e) {
+                    console.error('[AUTH] Erro saveCreds:', e.message);
+                }
+            });
         }
     };
 };
