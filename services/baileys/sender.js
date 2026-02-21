@@ -1,4 +1,3 @@
-
 import { sessions } from './connection.js';
 import { delay, generateWAMessageFromContent, proto } from '@whiskeysockets/baileys';
 import { normalizeJid } from '../../utils/wppParsers.js';
@@ -14,6 +13,17 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 });
 
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
+
+// 🛡️ NOVO: Função para forçar a visualização (visto azul) antes de responder
+export const markMessageAsRead = async (sessionId, jid, messageId) => {
+    const session = sessions.get(sessionId);
+    if (!session || !session.sock) return;
+    try {
+        await session.sock.readMessages([{ remoteJid: jid, id: messageId }]);
+    } catch (e) {
+        console.error("[SENDER] Erro ao marcar como lido:", e.message);
+    }
+};
 
 // Helper para converter imagem em Sticker WebP (512x512)
 const convertToSticker = async (url) => {
@@ -61,7 +71,7 @@ export const sendMessage = async ({
     card,
     driveFileId, 
     companyId,
-    timingConfig // [NOVO] Configuração de tempo { min_delay, max_delay }
+    timingConfig // [NOVO] Configuração de tempo { min_delay, max_delay, override_typing_time }
 }) => {
     const session = sessions.get(sessionId);
     if (!session || !session.sock) throw new Error(`Sessão ${sessionId} não encontrada.`);
@@ -141,20 +151,16 @@ export const sendMessage = async ({
 
         let productionTime = 1000;
         
-        if (type === 'text' && content) {
+        // 🧠 IA AGORA CONTROLA O TEMPO DE DIGITAÇÃO!
+        if (timingConfig?.override_typing_time) {
+            productionTime = timingConfig.override_typing_time;
+        } else if (type === 'text' && content) {
             // Regra: 50ms por caractere (velocidade humana rápida), limitado pelo Max Delay
             const charTime = content.length * 40;
-            // Se tiver config, o tempo de digitação deve estar dentro do range configurado pelo usuário
-            // Mas também deve ser proporcional ao tamanho.
-            // Fórmula: Base Aleatória (dentro do config) + Fator Tamanho
-            
             if (timingConfig) {
-                 // Respeita estritamente o range configurado, mas varia dentro dele
                  productionTime = randomDelay(minDelay, safeMax);
-                 // Se o texto for muito grande, tende para o máximo
                  if (content.length > 200) productionTime = safeMax;
             } else {
-                // Default dinâmico
                 productionTime = Math.min(charTime, 6000); 
             }
         }
