@@ -7,7 +7,7 @@ import { transcribeAudio } from '../../ai/transcriber.js';
 import { createClient } from '@supabase/supabase-js';
 import { Logger } from '../../../utils/logger.js'; 
 import axios from 'axios';
-// 🛡️ NOVO: Importação do Cérebro REMOVIDA para usar Realtime
+import { aiBus } from '../../scheduler/sentinel.js'; // 🛡️ Importa o Barramento Nativo da RAM
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -157,7 +157,10 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         await upsertMessage(messageData);
 
-        // 🛡️ INJEÇÃO DIRETA REMOVIDA AQUI PARA EVITAR BAD MAC
+        // 🛡️ O GATILHO NATIVO: Dispara o aviso para o Sentinel instantaneamente, sem usar rede externa!
+        if (isRealtime && !fromMe && !isGroup) {
+            aiBus.emit('new_message_arrived', messageData);
+        }
 
         if (isRealtime) {
             const { data: instance } = await supabase.from('instances').select('webhook_url, webhook_enabled, id').eq('session_id', sessionId).single();
