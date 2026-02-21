@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
-import { sendMessage, markMessageAsRead } from "../baileys/sender.js"; // 🔥 IMPORT DA LEITURA
+import { sendMessage, markMessageAsRead } from "../baileys/sender.js"; // 🔥 Módulo de Leitura Importado
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport, checkAvailability } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
@@ -11,7 +11,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-// 🛡️ EVENT BUS LOCAL: Comunicação instantânea na memória RAM (Substitui o Realtime)
+// 🛡️ EVENT BUS LOCAL: Comunicação instantânea na memória RAM
 export const aiBus = new EventEmitter();
 
 const processingLock = new Set();
@@ -131,7 +131,7 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     return { agent: null, reason: 'no_match_found' };
 };
 
-// 🛡️ ADAPTADO PARA RECEBER O PAYLOAD DIRETO DO EVENT BUS E SIMULAR HUMANIZAÇÃO
+// 🛡️ ADAPTADO PARA RECEBER O PAYLOAD DIRETO DO EVENT BUS
 const processAIResponse = async (messageData) => {
     if (!messageData) return;
     
@@ -161,7 +161,7 @@ const processAIResponse = async (messageData) => {
         return;
     }
     processingLock.add(lockKey);
-    // 🛡️ Aumentamos a tranca para 60s, pois agora a IA vai "demorar" muito tempo agindo como humano (Ler, pensar e digitar várias vezes)
+    // 🛡️ Aumentamos a tranca para 60s, pois agora a IA vai "demorar" muito tempo agindo como humano
     setTimeout(() => processingLock.delete(lockKey), 60000);
 
     const phone = remote_jid.split('@')[0];
@@ -306,7 +306,7 @@ const processAIResponse = async (messageData) => {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
                         await handoffAndReport(company_id, lead.id, remote_jid, call.args.summary, call.args.reason, reportingPhones);
                         console.log("   🛑 Chat transferido para humano.");
-                        return; // Encerra a IA imediatamente
+                        return; // Encerra a IA imediatamente, humano assumiu
                     }
                     else if (call.name === 'search_files') {
                         const { data: files } = await supabase.rpc('search_drive_files', { 
@@ -355,43 +355,42 @@ const processAIResponse = async (messageData) => {
         // 🧠 FLUXO DE COMPORTAMENTO HUMANO AVANÇADO (VISUALIZAR, PENSAR, DIGITAR E QUEBRAR)
         // =========================================================================
         if (finalReply) {
-            console.log(`   💬 Resposta final gerada. Iniciando fluxo humano...`);
+            console.log(`   💬 Resposta final gerada. Iniciando comportamento humano...`);
             const sessionId = await getSessionId(company_id);
             
             if (sessionId) {
                 // PASSO 1: Marcar como lida ("Visualizou")
-                await markMessageAsRead(sessionId, remote_jid, id); // Usa o id (whatsapp_id) da mensagem de entrada
-                console.log(`   👀 Visto Azul enviado. Aguardando ~10 segundos de leitura...`);
+                await markMessageAsRead(sessionId, remote_jid, id); // Usa o id (whatsapp_id) mapeado no topo
+                console.log(`   👀 Visto Azul enviado. Agurdando ~10 segundos...`);
 
                 // PASSO 2: Ficar "olhando/pensando" por um tempo natural antes de começar a digitar
                 await delay(randomDelay(8000, 12000));
 
-                // PASSO 3: Quebra Inteligente baseada no felling da IA
-                // Tenta quebrar usando a tag [SPLIT] que ensinámos no promptBuilder
-                let chunks = finalReply.split(/\[SPLIT\]/i).map(c => c.trim()).filter(c => c.length > 0);
+                // PASSO 3: Quebra Inteligente de Mensagem
+                // A IA agora envia a flag [SPLIT] quando ela mesma quer dividir a mensagem em balões diferentes
+                let rawChunks = finalReply.split(/\[SPLIT\]/i).map(c => c.trim()).filter(c => c.length > 0);
                 
-                // Fallback de segurança: Se a IA não usar o SPLIT e mandar um texto gigante, quebra por \n\n
-                if (chunks.length === 1 && finalReply.length > 300) {
-                    chunks = finalReply.split(/\n\n+/).map(c => c.trim()).filter(c => c.length > 0);
+                // Fallback de segurança: Se a IA não obedeceu o SPLIT e gerou um bloco gigante de texto, forçamos a quebra por frase
+                if (rawChunks.length === 1 && finalReply.length > 300) {
+                    rawChunks = finalReply.split(/\n\n+/).map(c => c.trim()).filter(c => c.length > 0);
                 }
 
-                // Agrupa blocos muito pequenos (como "Olá!") com o próximo
-                let mergedChunks = [];
+                // Agrupa pequenos pedaços (ex: um "Ok!") com a frase seguinte para não enviar balões minúsculos
+                let chunks = [];
                 let tempStr = "";
-                for (const c of chunks) {
-                    if (tempStr.length + c.length < 120 && c.length < 100) { 
+                for (const c of rawChunks) {
+                    if (tempStr.length + c.length < 150) { 
                         tempStr += (tempStr.length > 0 ? "\n" : "") + c;
                     } else {
-                        if (tempStr) mergedChunks.push(tempStr);
+                        if (tempStr) chunks.push(tempStr);
                         tempStr = c;
                     }
                 }
-                if (tempStr) mergedChunks.push(tempStr);
+                if (tempStr) chunks.push(tempStr);
                 
-                if (mergedChunks.length > 0) chunks = mergedChunks;
-                if (chunks.length === 0) chunks = [finalReply]; // Último recurso
+                if (chunks.length === 0) chunks = [finalReply]; 
 
-                // Limite de sanidade: Máximo de 4 balões 
+                // Limite de sanidade: Máximo de 4 balões seguidos para evitar ser invasivo
                 if (chunks.length > 4) {
                     const limitChunks = [chunks[0]];
                     limitChunks.push(chunks.slice(1, -1).join('\n\n'));
@@ -404,11 +403,11 @@ const processAIResponse = async (messageData) => {
                     const chunk = chunks[i];
                     
                     // PASSO 5: Definir o tempo do "Digitando..."
-                    // A primeira mensagem finge que está formulando a ideia inicial (7 a 10s)
-                    // As partes seguintes digitam mais rápido, simulando a continuação do raciocínio
+                    // A primeira mensagem finge que está formulando a ideia (7 a 10s)
+                    // As partes seguintes digitam mais rápido com base no peso (simulando que já sabe o que vai dizer)
                     let typingTime = randomDelay(7000, 10000); 
                     if (i > 0) {
-                        typingTime = Math.min(Math.max(chunk.length * 40, 2500), 9000); 
+                        typingTime = Math.min(Math.max(chunk.length * 40, 3000), 8000); 
                     }
 
                     try {
@@ -418,15 +417,15 @@ const processAIResponse = async (messageData) => {
                             type: 'text',
                             content: chunk,
                             timingConfig: { 
-                                override_typing_time: typingTime, // Força o sender.js a usar este tempo para o composing
-                                min_delay_seconds: 0.5, 
-                                max_delay_seconds: 1.5
+                                override_typing_time: typingTime, // Força o tempo exato do comando "digitando..."
+                                min_delay_seconds: 1, 
+                                max_delay_seconds: 2
                             },
                             companyId: company_id
                         });
                         console.log(`   ✅ Parte ${i+1}/${chunks.length} enviada! (Digitou por ${Math.round(typingTime/1000)}s)`);
                         
-                        // PASSO 6: O "respiro" entre enviar uma parte e começar a digitar a próxima
+                        // PASSO 6: O "respiro" natural entre enviar uma parte e começar a digitar a próxima
                         if (i < chunks.length - 1) {
                             await delay(randomDelay(1500, 3500));
                         }
@@ -456,8 +455,8 @@ export const startSentinel = () => {
     
     aiBus.removeAllListeners('new_message_arrived');
     
+    // Ouve a mensagem localmente. O delay de 2.5s foi mantido para a segurança do Mutex.
     aiBus.on('new_message_arrived', (messageData) => {
-        // Atraso de segurança Anti Bad MAC (2.5s) continua ativado
         setTimeout(() => {
             processAIResponse(messageData).catch(e => console.error("Erro interno no Sentinel:", e));
         }, 2500); 
