@@ -122,16 +122,18 @@ export const sendMessage = async ({
             }
         }
 
-        // --- CÁLCULO DE DELAY INTELIGENTE ---
-        // 1. Pausa Inicial (Reaction Time)
-        // Se houver config personalizada, usa. Senão, padrão rápido.
-        const minDelay = timingConfig?.min_delay_seconds ? timingConfig.min_delay_seconds * 1000 : 500;
-        const maxDelay = timingConfig?.max_delay_seconds ? timingConfig.max_delay_seconds * 1000 : 1500;
+        // --- CÁLCULO DE DELAY INTELIGENTE E SEGURO (ANTI-BAD MAC) ---
+        // 1. Pausa Estratégica (Reaction Time & Crypto Sync)
+        // O Cérebro agora é tão rápido que pode atropelar a criptografia do WhatsApp.
+        // Adicionamos 2.5s base para a catraca da chave DB assentar.
+        const minDelay = timingConfig?.min_delay_seconds ? timingConfig.min_delay_seconds * 1000 : 2500;
+        const maxDelay = timingConfig?.max_delay_seconds ? timingConfig.max_delay_seconds * 1000 : 4000;
         
-        // Garante que max >= min
-        const safeMax = Math.max(maxDelay, minDelay);
+        // Garante que max >= min e que nunca seja menor que 2.5s
+        const safeMin = Math.max(minDelay, 2500);
+        const safeMax = Math.max(maxDelay, safeMin);
         
-        await delay(randomDelay(Math.floor(minDelay * 0.5), Math.floor(minDelay * 0.8)));
+        await delay(randomDelay(Math.floor(safeMin * 0.5), Math.floor(safeMin * 0.8)));
         
         // 2. Simulação de Digitação (Typing Time)
         const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
