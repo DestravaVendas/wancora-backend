@@ -1,7 +1,7 @@
 
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
-import { sendMessage, sendPollVote, sendReaction, deleteMessage, markChatAsRead } from "../controllers/whatsappController.js"; 
+import { sendMessage, sendPollVote, sendReaction, deleteMessage, markChatAsRead, subscribeToPresence } from "../controllers/whatsappController.js";
 import { requireAuth } from "../middleware/auth.js";
 import { apiLimiter } from "../middleware/limiter.js";
 import { normalizeJid } from "../utils/wppParsers.js";
@@ -125,6 +125,19 @@ router.post("/read", async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         res.json({ success: false });
+    }
+});
+
+// Forçar Inscrição de Presença (Online Status)
+router.post("/presence", async (req, res) => {
+    const { sessionId, remoteJid } = req.body;
+    if (!sessionId || !remoteJid) return res.status(400).json({ error: "Faltam parâmetros" });
+
+    try {
+        await subscribeToPresence(sessionId, remoteJid);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
