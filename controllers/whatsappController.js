@@ -282,3 +282,18 @@ export const getSessionId = async (companyId) => {
         return anySession?.session_id || null;
     } catch (error) { return null; }
 };
+
+export const subscribeToPresence = async (sessionId, remoteJid) => {
+    try {
+        const session = sessions.get(sessionId);
+        if (!session?.sock) return { success: false, error: "Sessão desconectada." };
+        
+        const jid = normalizeJid(remoteJid);
+        await session.sock.presenceSubscribe(jid);
+        
+        return { success: true };
+    } catch (error) {
+        console.error(`[Controller] Erro ao assinar presença para ${remoteJid}:`, error.message);
+        return { success: false, error: error.message };
+    }
+};
