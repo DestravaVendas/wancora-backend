@@ -333,6 +333,29 @@ const handleReconnect = (sessionId, companyId, extraDelay = 0) => {
     setTimeout(() => startSession(sessionId, companyId), delayMs);
 };
 
+/**
+ * Encerra todas as sessões ativas (Graceful Shutdown)
+ */
+export const shutdownAllSessions = async () => {
+    Logger.info('baileys', `Encerrando todas as sessões ativas para desligamento...`);
+    const activeSessions = Array.from(sessions.keys());
+    
+    for (const sessionId of activeSessions) {
+        try {
+            const sock = sessions.get(sessionId);
+            if (sock) {
+                sock.end(); // Fecha a conexão WebSocket de forma limpa
+                Logger.info('baileys', `Sessão encerrada: ${sessionId}`);
+            }
+        } catch (e) {
+            Logger.error('baileys', `Erro ao encerrar sessão: ${sessionId}`, { error: e.message });
+        }
+    }
+    
+    sessions.clear();
+    retries.clear();
+};
+
 export const deleteSession = async (sessionId, companyId) => {
     killSession(sessionId);
     retries.delete(sessionId); 
