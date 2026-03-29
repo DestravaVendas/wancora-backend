@@ -104,6 +104,22 @@ export const shutdownAllSessions = () => {
     }
 };
 
+// [NOVO] Monitoramento de Performance Periódico
+setInterval(() => {
+    const activeSessions = sessions.size;
+    const redis = getRedisClient();
+    const redisStatus = redis ? redis.status : 'not_configured';
+    
+    if (activeSessions > 0) {
+        console.log(`📊 [MONITOR] Sessões Ativas: ${activeSessions} | Redis Status: ${redisStatus}`);
+        
+        // Se houver muitas sessões, logamos um aviso se o Redis estiver offline
+        if (activeSessions > 20 && redisStatus !== 'ready') {
+            console.warn(`🚨 [PERF] Alerta: ${activeSessions} sessões ativas mas Redis não está pronto! Risco de lentidão.`);
+        }
+    }
+}, 60000 * 5); // A cada 5 minutos
+
 export const startSession = async (sessionId, companyId) => {
     const existing = sessions.get(sessionId);
     if (existing && existing.sock?.ws?.isOpen) {
@@ -127,12 +143,17 @@ export const startSession = async (sessionId, companyId) => {
             printQRInTerminal: false,
             auth: {
                 creds: state.creds,
-                // Passa as chaves diretas para a nossa RAM customizada!
-                keys: state.keys,
+                // Otimização: Envolve as chaves em um cache de memória para performance
+                keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
             msgRetryCounterCache: redis ? {
                 get: async (key) => {
+                    const start = Date.now();
                     const result = await redis.get(`retry:${sessionId}:${key}`);
+                    const duration = Date.now() - start;
+                    if (duration > 100) {
+                        console.warn(`⚠️ [PERF] Redis GET lento: ${duration}ms para chave ${key}`);
+                    }
                     return result ? parseInt(result) : 0;
                 },
                 set: async (key, value) => {
@@ -214,10 +235,20 @@ export const startSession = async (sessionId, companyId) => {
                 const isConflict = errorMsg.includes('Stream Errored (conflict)') || statusCode === 440 || statusCode === 515;
                 const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 403;
 
-                if (isLoggedOut || (isCryptoError && !isConflict)) {
-                    Logger.fatal('baileys', `Sessão encerrada permanentemente.`, { sessionId, error: errorMsg }, companyId);
+                // [REPARO] Se for erro de criptografia mas não for logout real, tentamos apenas reconectar
+                // Deletar a sessão (deleteSession) obriga o usuário a ler o QR Code de novo.
+                if (isLoggedOut) {
+                    Logger.fatal('baileys', `Sessão encerrada permanentemente (Logout).`, { sessionId, error: errorMsg }, companyId);
                     await deleteSession(sessionId, companyId);
                     return; 
+                }
+
+                if (isCryptoError && !isConflict) {
+                    Logger.error('baileys', `Erro de Criptografia (Bad MAC/Signal). Tentando reparar...`, { sessionId, error: errorMsg }, companyId);
+                    // Não deletamos os dados, apenas matamos a instância na RAM e forçamos reconexão limpa
+                    killSession(sessionId);
+                    handleReconnect(sessionId, companyId, 5000);
+                    return;
                 }
 
                 if (isConflict) {
