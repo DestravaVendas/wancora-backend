@@ -131,23 +131,51 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     return { agent: null, reason: 'no_match_found' };
 };
 
+// 🛡️ [ESTABILIDADE] Fila de Conversação por Lead
+// Garante que a IA não responda múltiplas vezes ao mesmo tempo para o mesmo lead
+// e que as mensagens sejam processadas em ordem.
+const conversationLocks = new Map();
+
 // 🛡️ ADAPTADO PARA RECEBER O PAYLOAD DIRETO DO EVENT BUS
 const processAIResponse = async (messageData) => {
     if (!messageData) return;
     
-    console.log(`\n🔔 [RAIO-X SENTINEL] Mensagem recebida via EventBus! ID:`, messageData.whatsapp_id);
+    const { whatsapp_id: id, remote_jid, company_id, from_me } = messageData;
 
-    // Ajustado para ler as variáveis diretas do objeto messageData
-    const { whatsapp_id: id, content, remote_jid, company_id, from_me, message_type, transcription, created_at } = messageData;
+    if (from_me) return;
+    if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter') || remote_jid === '0@s.whatsapp.net' || remote_jid === '12345678@broadcast') return;
 
-    if (from_me) {
-        console.log("   ❌ Bloqueio: Mensagem do próprio bot.");
-        return;
+    // [FILA POR CONVERSA]
+    // Se já houver um processamento em curso para este lead, aguardamos ele terminar.
+    if (!conversationLocks.has(remote_jid)) {
+        conversationLocks.set(remote_jid, Promise.resolve());
     }
-    if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter') || remote_jid === '0@s.whatsapp.net' || remote_jid === '12345678@broadcast') {
-        console.log("   ❌ Bloqueio: Mensagem de grupo/sistema.");
-        return;
-    }
+
+    const currentLock = conversationLocks.get(remote_jid);
+    
+    // Enfileiramos o processamento desta mensagem
+    const nextTask = currentLock.then(async () => {
+        try {
+            await _internalProcessAI(messageData);
+        } catch (e) {
+            console.error(`❌ [SENTINEL] Erro na fila de ${remote_jid}:`, e.message);
+        }
+    });
+
+    conversationLocks.set(remote_jid, nextTask);
+
+    // Limpeza da fila após o término para não vazar memória
+    nextTask.finally(() => {
+        if (conversationLocks.get(remote_jid) === nextTask) {
+            conversationLocks.delete(remote_jid);
+        }
+    });
+};
+
+const _internalProcessAI = async (messageData) => {
+    const { whatsapp_id: id, content, remote_jid, company_id, from_me, message_type, transcription, created_at, session_id: msgSessionId } = messageData;
+    
+    console.log(`\n🔔 [RAIO-X SENTINEL] Processando:`, id);
 
     const msgTime = new Date(created_at).getTime();
     if ((Date.now() - msgTime) / 1000 > 180) {
@@ -187,7 +215,10 @@ const processAIResponse = async (messageData) => {
         userMessage = `[Imagem Enviada pelo Usuário]`;
     }
     
-    if (!userMessage) return;
+    if (!userMessage) {
+        console.log("   ❌ Bloqueio: Mensagem vazia ou não descriptografada.");
+        return;
+    }
 
     const [agentsRes, companyRes, historyRes] = await Promise.all([
         supabase.from('agents').select('*').eq('company_id', company_id).eq('is_active', true),
@@ -368,7 +399,9 @@ const processAIResponse = async (messageData) => {
         // =========================================================================
         if (finalReply) {
             console.log(`   💬 Resposta final gerada. Iniciando comportamento humano...`);
-            const sessionId = await getSessionId(company_id);
+            
+            // 🔥 CORREÇÃO: Usa o sessionId da mensagem original se disponível, senão busca o padrão
+            const sessionId = msgSessionId || await getSessionId(company_id);
             
             if (sessionId) {
                 // PASSO 1: Marcar como lida ("Visualizou")
