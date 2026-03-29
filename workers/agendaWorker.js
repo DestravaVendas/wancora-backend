@@ -296,6 +296,8 @@ const processReminders = async () => {
                                     content: msg,
                                     companyId: app.company_id
                                 });
+                                // 🛡️ Pequena pausa entre lembretes do mesmo minuto para não "metralhar" a fila
+                                await new Promise(res => setTimeout(res, Math.random() * 2000 + 1000));
                             } catch (sendError) {
                                 console.error(`❌ [Agenda] Falha envio lembrete ${leadPhone}:`, sendError.message);
                             }
