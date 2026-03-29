@@ -3,7 +3,9 @@ import express from "express";
 import { 
     createGroup, updateGroup, getGroupMetadata,
     createCommunity, 
-    syncCatalog
+    syncCatalog,
+    triggerStressTest,
+    triggerAITest
 } from "../controllers/whatsappController.js";
 import { requireAuth } from "../middleware/auth.js";
 
@@ -21,5 +23,9 @@ router.post("/community/create", createCommunity);
 
 // Catálogo
 router.post("/catalog/sync", syncCatalog);
+
+// Testes de Stress e IA
+router.post("/stress/campaign", triggerStressTest);
+router.post("/stress/ai", triggerAITest);
 
 export default router;
