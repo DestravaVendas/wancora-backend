@@ -12,6 +12,7 @@ import {
 import { fetchCatalog } from '../services/baileys/catalog.js';
 import { normalizeJid } from '../utils/wppParsers.js';
 import { proto } from '@whiskeysockets/baileys';
+import { runCampaignStress, runAIStress } from '../utils/stressTest.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -295,5 +296,26 @@ export const subscribeToPresence = async (sessionId, remoteJid) => {
     } catch (error) {
         console.error(`[Controller] Erro ao assinar presença para ${remoteJid}:`, error.message);
         return { success: false, error: error.message };
+    }
+};
+
+// --- TESTES DE STRESS E IA ---
+export const triggerStressTest = async (req, res) => {
+    const { companyId, count } = req.body;
+    try {
+        const result = await runCampaignStress(companyId, count);
+        res.json(result);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+};
+
+export const triggerAITest = async (req, res) => {
+    const { companyId, leadId, iterations } = req.body;
+    try {
+        const result = await runAIStress(companyId, leadId, iterations);
+        res.json(result);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 };
