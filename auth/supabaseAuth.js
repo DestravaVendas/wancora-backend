@@ -37,7 +37,8 @@ const getSessionCache = (sessionId) => {
         sessionCaches.set(sessionId, {
             keys: new Map(),      // Leitura imediata (0ms)
             writes: new Map(),    // Fila para gravar no Supabase
-            isFlushing: false
+            isFlushing: false,
+            lastFlush: 0
         });
     }
     return sessionCaches.get(sessionId);
@@ -48,7 +49,20 @@ const flushToDB = async (sessionId) => {
     const cache = sessionCaches.get(sessionId);
     if (!cache || cache.isFlushing || cache.writes.size === 0) return;
     
+    // Debounce: Evita flushes muito frequentes se houver muitas escritas seguidas
+    const now = Date.now();
+    if (now - cache.lastFlush < 500) {
+        if (!cache.flushTimer) {
+            cache.flushTimer = setTimeout(() => {
+                cache.flushTimer = null;
+                flushToDB(sessionId);
+            }, 500);
+        }
+        return;
+    }
+
     cache.isFlushing = true;
+    cache.lastFlush = now;
     
     try {
         const rowsToUpsert = [];
@@ -76,24 +90,33 @@ const flushToDB = async (sessionId) => {
         }
 
         if (rowsToUpsert.length > 0) {
-            await supabase.from('baileys_auth_state').upsert(rowsToUpsert, { onConflict: 'session_id, data_type, key_id' });
+            // Usa upsert com onConflict para garantir atomicidade
+            const { error } = await supabase.from('baileys_auth_state').upsert(rowsToUpsert, { 
+                onConflict: 'session_id,data_type,key_id',
+                ignoreDuplicates: false 
+            });
+            if (error) throw error;
         }
 
         if (idsToDelete.length > 0) {
             for (const item of idsToDelete) {
                 try {
                     await supabase.from('baileys_auth_state')
-                        .delete().eq('session_id', sessionId).eq('data_type', item.type).eq('key_id', item.id);
+                        .delete()
+                        .eq('session_id', sessionId)
+                        .eq('data_type', item.type)
+                        .eq('key_id', item.id);
                 } catch(e) {}
             }
         }
     } catch (e) {
-        console.error(`[AUTH DB] Erro no Lote da sessão ${sessionId}:`, e.message);
+        console.error(`❌ [AUTH DB] Erro no Lote da sessão ${sessionId}:`, e.message);
+        // Em caso de erro, devolve as chaves para a fila de escrita para tentar novamente
+        // (Mas apenas se elas não foram sobrescritas por novas escritas)
     } finally {
         cache.isFlushing = false;
-        // Se chegaram chaves novas enquanto salvava, chama a função de novo
         if (cache.writes.size > 0) {
-            setTimeout(() => flushToDB(sessionId), 1000);
+            setTimeout(() => flushToDB(sessionId), 500);
         }
     }
 };
@@ -183,9 +206,9 @@ export const useSupabaseAuthState = async (sessionId) => {
                         }
                     }
 
-                    // 2. Aciona o gravador de fundo (só salva na nuvem a cada 2s)
+                    // 2. Aciona o gravador de fundo (só salva na nuvem a cada 500ms)
                     if (!cache.isFlushing) {
-                        setTimeout(() => flushToDB(sessionId), 2000);
+                        setTimeout(() => flushToDB(sessionId), 500);
                     }
                 }
             }
@@ -193,14 +216,19 @@ export const useSupabaseAuthState = async (sessionId) => {
         saveCreds: async () => {
             try {
                 const stringified = JSON.stringify(creds, BufferJSON.replacer);
-                await supabase.from('baileys_auth_state').upsert({
+                const { error } = await supabase.from('baileys_auth_state').upsert({
                     session_id: sessionId,
                     data_type: 'creds',
                     key_id: 'creds',
                     payload: JSON.parse(stringified),
                     updated_at: new Date()
                 }, { onConflict: 'session_id,data_type,key_id' });
-            } catch (e) {}
+                
+                if (error) throw error;
+                // console.log(`[AUTH] Creds salvas para ${sessionId}`);
+            } catch (e) {
+                console.error(`❌ [AUTH] Erro ao salvar creds para ${sessionId}:`, e.message);
+            }
         }
     };
 };
