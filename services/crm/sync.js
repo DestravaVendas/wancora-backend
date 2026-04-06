@@ -2,6 +2,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { normalizeJid } from "../../utils/wppParsers.js";
 import { Logger } from "../../utils/logger.js"; 
+import getRedisClient from "../redisClient.js"; 
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false },
@@ -11,6 +12,25 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 });
 
 const leadLock = new Set(); 
+
+// 🛡️ LOCK DE LEADS (ANTI-DUPLICIDADE)
+const isLeadLocked = async (companyId, phone) => {
+    const redis = getRedisClient();
+    const lockKey = `lead_lock:${companyId}:${phone}`;
+    
+    if (redis && redis.status === 'ready') {
+        const exists = await redis.get(lockKey);
+        if (exists) return true;
+        await redis.set(lockKey, '1', 'EX', 5); // Lock de 5 segundos
+        return false;
+    } else {
+        // Fallback em memória
+        if (leadLock.has(lockKey)) return true;
+        leadLock.add(lockKey);
+        setTimeout(() => leadLock.delete(lockKey), 5000);
+        return false;
+    }
+};
 
 const safeSupabaseCall = async (operation, retries = 3) => {
     for (let i = 0; i < retries; i++) {
@@ -143,12 +163,11 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
     if (purePhone.length < 8 || purePhone.length > 15) return null;
     
-    const lockKey = `${companyId}:${purePhone}`;
-    if (leadLock.has(lockKey)) return null;
+    // 🛡️ LOCK: Evita que duas mensagens do mesmo lead criem dois registros no Supabase
+    const locked = await isLeadLocked(companyId, purePhone);
+    if (locked) return null;
     
     try {
-        leadLock.add(lockKey);
-
         const { data: contact } = await safeSupabaseCall(() => 
             supabase.from('contacts').select('is_ignored, name, push_name, verified_name').eq('jid', cleanJid).eq('company_id', companyId).maybeSingle()
         );
@@ -208,8 +227,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     } catch (e) {
         Logger.error('baileys', `Erro ao criar lead ${purePhone}`, { error: e.message }, companyId);
         return null;
-    } finally {
-        setTimeout(() => leadLock.delete(lockKey), 2000);
     }
 };
 
