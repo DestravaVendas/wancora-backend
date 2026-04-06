@@ -31,11 +31,21 @@ const worker = new Worker('campaign-sender', async (job) => {
     try {
         console.log(`📤 [WORKER] Processando envio para ${phone} (Job: ${job.id})`);
 
-        // 1. Obter Sessão Ativa
+        // 1. Obter Dados da Campanha (Modo de Execução e Warmup)
+        const { data: campaign } = await supabase
+            .from('campaigns')
+            .select('execution_mode, warmup_config')
+            .eq('id', campaignId)
+            .single();
+
+        const isWarmup = campaign?.execution_mode === 'warmup';
+        const warmup = campaign?.warmup_config || {};
+
+        // 2. Obter Sessão Ativa
         const sessionId = await getSessionId(companyId);
         if (!sessionId) throw new Error("Sem conexão WhatsApp ativa para esta empresa.");
 
-        // 2. Processar Spintax e Variáveis
+        // 3. Processar Spintax e Variáveis
         let finalMessage = parseSpintax(messageTemplate);
         
         // Variáveis Dinâmicas
@@ -44,18 +54,25 @@ const worker = new Worker('campaign-sender', async (job) => {
         finalMessage = finalMessage.replace(/{{nome}}/g, firstName);
         finalMessage = finalMessage.replace(/{{phone}}/g, phone);
 
-        // 3. Delay de Segurança (Anti-Ban Humanizado)
-        // Gera um delay aleatório entre 15s e 45s
-        const waitTime = Math.floor(Math.random() * (45000 - 15000 + 1) + 15000);
-        console.log(`⏳ [WORKER] Aguardando ${waitTime}ms para humanização...`);
+        // 4. Delay de Segurança (Anti-Ban Humanizado)
+        // Se for Warmup, os delays são muito maiores (simulando comportamento humano lento)
+        let minWait = isWarmup ? (warmup.min_delay || 60) : 15;
+        let maxWait = isWarmup ? (warmup.max_delay || 180) : 45;
+
+        const waitTime = Math.floor(Math.random() * (maxWait * 1000 - minWait * 1000 + 1) + minWait * 1000);
+        console.log(`⏳ [WORKER] Modo: ${campaign?.execution_mode || 'standard'}. Aguardando ${waitTime/1000}s para humanização...`);
         await delay(waitTime);
 
-        // 4. Enviar Mensagem
+        // 5. Enviar Mensagem
         await sendMessage({
             sessionId,
             to: phone,
             type: 'text',
-            content: finalMessage
+            content: finalMessage,
+            timingConfig: {
+                min_delay_seconds: isWarmup ? 5 : 2,
+                max_delay_seconds: isWarmup ? 15 : 5
+            }
         });
 
         // 5. Atualizar Status no Banco e Stats da Campanha
