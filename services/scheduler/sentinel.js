@@ -315,31 +315,32 @@ const _internalProcessAI = async (messageData) => {
             toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }];
         }
 
-        const model = ai.getGenerativeModel({ 
-            model: activeModel,
-            systemInstruction,
-            tools: toolsConfig 
-        });
+        // 🧠 NOVA IMPLEMENTAÇÃO SDK ESTÁVEL
+        let contents = [...chatHistory, { role: 'user', parts: [{ text: userMessage }] }];
+        
+        console.log(`   🧠 [GEMINI] Pensando (Model: ${activeModel})...`);
 
-        const chat = model.startChat({
-            history: chatHistory,
-            generationConfig: {
-                temperature: 0.5,
-                maxOutputTokens: 1000
+        let result = await ai.models.generateContent({
+            model: activeModel,
+            contents,
+            config: {
+                systemInstruction,
+                tools: toolsConfig,
+                temperature: 0.5
             }
         });
 
-        console.log(`   🧠 [GEMINI] Pensando (Model: ${activeModel})...`);
-
-        let result = await chat.sendMessage(userMessage);
-        let response = result.response;
-        let functionCalls = response.functionCalls();
+        let response = result;
+        let functionCalls = response.functionCalls;
         let loopLimit = 0;
 
         // Loop de tratamento de Tools
         while (functionCalls && functionCalls.length > 0 && loopLimit < 3) {
             loopLimit++;
             const toolResults = [];
+
+            // Adiciona a resposta do modelo (que contém as chamadas de função) ao histórico
+            contents.push(response.candidates[0].content);
 
             for (const call of functionCalls) {
                 console.log(`   🛠️ Executando Tool: ${call.name} com args:`, call.args);
@@ -377,12 +378,23 @@ const _internalProcessAI = async (messageData) => {
                 });
             }
 
-            result = await chat.sendMessage(toolResults);
-            response = result.response;
-            functionCalls = response.functionCalls();
+            // Adiciona os resultados das funções ao histórico
+            contents.push({ role: 'user', parts: toolResults });
+
+            result = await ai.models.generateContent({
+                model: activeModel,
+                contents,
+                config: {
+                    systemInstruction,
+                    tools: toolsConfig,
+                    temperature: 0.5
+                }
+            });
+            response = result;
+            functionCalls = response.functionCalls;
         }
 
-        const finalReply = response.text();
+        const finalReply = response.text;
 
         // =========================================================================
         // 🧠 FLUXO DE COMPORTAMENTO HUMANO AVANÇADO (VISUALIZAR, PENSAR, DIGITAR E QUEBRAR)
