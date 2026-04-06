@@ -19,6 +19,7 @@
   "license": "ISC",
   "description": "Microsserviço de Automação WhatsApp e API - Versão Gaming Mode",
   "dependencies": {
+    "@google/genai": "^1.48.0",
     "@google/generative-ai": "^0.24.0",
     "@sentry/node": "^8.47.0",
     "@sentry/profiling-node": "^8.47.0",
@@ -43,6 +44,7 @@
     "rate-limiter-flexible": "^5.0.0",
     "sharp": "^0.33.5",
     "spintax": "^1.1.2",
+    "wa-sticker-formatter": "^4.4.4",
     "zod": "^3.24.1"
   },
   "overrides": {
