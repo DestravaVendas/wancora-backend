@@ -1,6 +1,7 @@
 
 import './instrument.js'; // Sentry deve ser o primeiro import
 import 'dotenv/config'; 
+import { Logger } from './utils/logger.js'; // MOVIDO PARA O TOPO
 import express from 'express';
 import cors from 'cors';
 import compression from 'compression'; 
@@ -12,7 +13,6 @@ import { startSession, shutdownAllSessions } from './services/baileys/connection
 import { startSentinel } from './services/scheduler/sentinel.js';
 import { startAgendaWorker } from './workers/agendaWorker.js';
 import { startRetentionWorker } from './workers/retentionWorker.js';
-import { Logger } from './utils/logger.js'; // NOVO: Logger
 import { errorHandler } from './middleware/errorHandler.js'; // NOVO: Middleware
 
 // --- CONSOLE HIJACKING (Interceptador Global de Logs) ---
