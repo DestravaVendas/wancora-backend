@@ -1,14 +1,13 @@
-# 1. Imagem Base (Node 20 no Linux Debian Slim - Leve e Seguro)
+# 1. Imagem Base (Node 20 no Linux Debian Slim - Estabilidade e Performance)
 FROM node:20-slim
 
-# 2. Instalação de Dependências do Sistema (Obrigatório para Baileys e Mídia)
-# - ffmpeg: Para converter áudio PTT (MP4/AAC -> OGG/Opus) e processar vídeos.
-# - libvips: Para processamento de imagem rápido (Sharp).
-# - ca-certificates: Para conexões SSL seguras.
-# - chromium: Para spoofing de navegador (Opcional, mas recomendado para estabilidade).
+# 2. Instalação de Dependências do Sistema (Obrigatório para Baileys, Sharp e Puppeteer)
+# ffmpeg: Conversão de áudio/vídeo.
+# libvips-dev: Processamento de imagem ultra-rápido (Sharp).
+# chromium e libs: Garante que o spoofing de navegador funcione sem crashar.
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    libvips \
+    libvips-dev \
     ca-certificates \
     chromium \
     fonts-liberation \
@@ -46,31 +45,35 @@ RUN apt-get update && apt-get install -y \
     lsb-release \
     wget \
     xdg-utils \
+    curl \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Definição do Diretório de Trabalho
 WORKDIR /app
 
-# 4. Copia os arquivos de dependência primeiro (Cache Layering)
+# 4. Copia arquivos de dependência (Cache Layering)
 COPY package*.json ./
 
 # 5. Instalação das Dependências Node.js
-# --production: Pula devDependencies para economizar espaço
+# --production: Pula devDependencies para economizar espaço e segurança
 RUN npm ci --production
 
 # 6. Copia o restante do código fonte
 COPY . .
 
-# 7. Configurações de Ambiente
+# 7. Configurações de Ambiente (CORRIGIDAS)
 ENV NODE_ENV=production
-ENV PORT=3001
+# IMPORTANTE: A porta deve ser 3000 para alinhar com o server.js
+ENV PORT=3000
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+# Otimização de Memória para evitar crash em instâncias pesadas
+ENV NODE_OPTIONS="--max-old-space-size=4096"
 
-# 8. Expõe a porta da API
-EXPOSE 3001
+# 8. Expõe a porta da API (Corrigida para 3000)
+EXPOSE 3000
 
-# 9. Comando de Inicialização (Usa PM2 se disponível ou node direto)
-# Recomendado usar node direto em contêineres simples, ou pm2-runtime
-CMD ["node", "--max-old-space-size=4096", "server.js"]
+# 9. Comando de Inicialização
+# Usamos node direto para maior controle de sinais do sistema (SIGTERM/SIGINT)
+CMD ["node", "server.js"]
