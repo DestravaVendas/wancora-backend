@@ -1,10 +1,8 @@
-# 1. Imagem Base (Node 20 no Linux Debian Slim - Estabilidade e Performance)
+# 1. Imagem Base (Node 20 no Linux Debian Slim)
 FROM node:20-slim
 
 # 2. Instalação de Dependências do Sistema (Obrigatório para Baileys, Sharp e Puppeteer)
-# ffmpeg: Conversão de áudio/vídeo.
-# libvips-dev: Processamento de imagem ultra-rápido (Sharp).
-# chromium e libs: Garante que o spoofing de navegador funcione sem crashar.
+# Mantendo TODAS as bibliotecas da sua versão anterior para garantir compatibilidade total.
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libvips-dev \
@@ -31,7 +29,6 @@ RUN apt-get update && apt-get install -y \
     libstdc++6 \
     libx11-6 \
     libx11-xcb1 \
-    libxcb1 \
     libxcomposite1 \
     libxcursor1 \
     libxdamage1 \
@@ -49,31 +46,29 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Definição do Diretório de Trabalho
+# 3. Diretório de Trabalho
 WORKDIR /app
 
-# 4. Copia arquivos de dependência (Cache Layering)
+# 4. Cache de Dependências
 COPY package*.json ./
 
 # 5. Instalação das Dependências Node.js
-# --production: Pula devDependencies para economizar espaço e segurança
 RUN npm ci --production
 
-# 6. Copia o restante do código fonte
+# 6. Copia o código fonte
 COPY . .
 
-# 7. Configurações de Ambiente (CORRIGIDAS)
+# 7. Configurações de Ambiente
 ENV NODE_ENV=production
-# IMPORTANTE: A porta deve ser 3000 para alinhar com o server.js
+# CORREÇÃO: Porta 3000 para alinhar com o server.js
 ENV PORT=3000
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-# Otimização de Memória para evitar crash em instâncias pesadas
+# Otimização de Memória para instâncias robustas
 ENV NODE_OPTIONS="--max-old-space-size=4096"
 
-# 8. Expõe a porta da API (Corrigida para 3000)
+# 8. Expõe a porta da API
 EXPOSE 3000
 
 # 9. Comando de Inicialização
-# Usamos node direto para maior controle de sinais do sistema (SIGTERM/SIGINT)
 CMD ["node", "server.js"]
