@@ -1,8 +1,8 @@
 import { createClient } from "@supabase/supabase-js";
-import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
-import { sendMessage, markMessageAsRead } from "../baileys/sender.js"; // 🔥 Módulo de Leitura Importado
+import { GoogleGenAI, Type } from "@google/genai";
+import { sendMessage, markMessageAsRead } from "../baileys/sender.js"; 
 import { getSessionId } from "../../controllers/whatsappController.js";
-import { scheduleMeeting, handoffAndReport, checkAvailability } from "../ai/agentTools.js";
+import { scheduleMeeting, handoffAndReport, checkAvailability, searchFiles, sendFile } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
 import { buildSystemPrompt } from "../../utils/promptBuilder.js"; 
 import { EventEmitter } from "events"; 
@@ -27,10 +27,10 @@ const ALL_TOOLS = [
         name: "transfer_to_human",
         description: "Transfere para humano. Use se cliente pedir, estiver irritado ou o assunto for complexo demais.",
         parameters: {
-            type: SchemaType.OBJECT,
+            type: Type.OBJECT,
             properties: {
-                summary: { type: SchemaType.STRING, description: "Resumo da conversa até agora." },
-                reason: { type: SchemaType.STRING, description: "Motivo da transferência." }
+                summary: { type: Type.STRING, description: "Resumo da conversa até agora." },
+                reason: { type: Type.STRING, description: "Motivo da transferência." }
             },
             required: ["summary", "reason"]
         }
@@ -39,9 +39,9 @@ const ALL_TOOLS = [
         name: "search_files",
         description: "Busca arquivos ou documentos no Google Drive da empresa para responder dúvidas.",
         parameters: {
-            type: SchemaType.OBJECT,
+            type: Type.OBJECT,
             properties: {
-                query: { type: SchemaType.STRING, description: "Termo de busca do arquivo." }
+                query: { type: Type.STRING, description: "Termo de busca do arquivo." }
             },
             required: ["query"]
         }
@@ -50,9 +50,9 @@ const ALL_TOOLS = [
         name: "send_file",
         description: "Envia um arquivo encontrado no Drive para o cliente.",
         parameters: {
-            type: SchemaType.OBJECT,
+            type: Type.OBJECT,
             properties: {
-                google_id: { type: SchemaType.STRING, description: "ID do arquivo no Google Drive (obtido via search_files)." }
+                google_id: { type: Type.STRING, description: "ID do arquivo no Google Drive (obtido via search_files)." }
             },
             required: ["google_id"]
         }
@@ -61,9 +61,9 @@ const ALL_TOOLS = [
         name: "check_availability",
         description: "ANTES de sugerir um horário para o cliente, use esta ferramenta para consultar a agenda e ver quais horários estão OCUPADOS em uma data específica.",
         parameters: {
-            type: SchemaType.OBJECT,
+            type: Type.OBJECT,
             properties: {
-                dateISO: { type: SchemaType.STRING, description: "A data desejada em formato ISO 8601 (ex: 2026-02-25T00:00:00Z)." }
+                dateISO: { type: Type.STRING, description: "A data desejada em formato ISO 8601 (ex: 2026-02-25T00:00:00Z)." }
             },
             required: ["dateISO"]
         }
@@ -72,11 +72,11 @@ const ALL_TOOLS = [
         name: "schedule_meeting",
         description: "Agenda uma reunião no calendário após confirmar o horário com o cliente.",
         parameters: {
-            type: SchemaType.OBJECT,
+            type: Type.OBJECT,
             properties: {
-                title: { type: SchemaType.STRING, description: "Título do evento." },
-                dateISO: { type: SchemaType.STRING, description: "Data e hora exata acordada em formato ISO 8601 (YYYY-MM-DDTHH:mm:ss)." },
-                description: { type: SchemaType.STRING, description: "Detalhes e pauta do agendamento." }
+                title: { type: Type.STRING, description: "Título do evento." },
+                dateISO: { type: Type.STRING, description: "Data e hora exata acordada em formato ISO 8601 (YYYY-MM-DDTHH:mm:ss)." },
+                description: { type: Type.STRING, description: "Detalhes e pauta do agendamento." }
             },
             required: ["title", "dateISO"]
         }
@@ -89,10 +89,10 @@ const getAIClient = (apiKey) => {
     
     if (!aiInstances.has(apiKey)) {
         try {
-            const instance = new GoogleGenerativeAI(apiKey);
+            const instance = new GoogleGenAI({ apiKey });
             aiInstances.set(apiKey, instance);
         } catch (e) {
-            console.error("❌ [SENTINEL] Erro ao instanciar GoogleGenerativeAI:", e.message);
+            console.error("❌ [SENTINEL] Erro ao instanciar GoogleGenAI:", e.message);
             return null;
         }
     }
@@ -177,6 +177,12 @@ const _internalProcessAI = async (messageData) => {
     
     console.log(`\n🔔 [RAIO-X SENTINEL] Processando:`, id);
 
+    // 🛡️ [ESTABILIDADE] Bloqueio de mensagens vazias ou não descriptografadas
+    if (!content && !transcription) {
+        console.log(`   ⚠️ [SENTINEL] Mensagem ${id} sem conteúdo ou transcrição. Ignorando.`);
+        return;
+    }
+
     const msgTime = new Date(created_at).getTime();
     if ((Date.now() - msgTime) / 1000 > 180) {
         console.log(`   ❌ Bloqueio: Mensagem muito antiga.`);
@@ -246,16 +252,17 @@ const _internalProcessAI = async (messageData) => {
             return;
         }
 
-        // MODEL FALLBACK: Força 2.0 Flash para escalar com velocidade e baixo custo
-        let activeModel = 'gemini-2.0-flash';
-        if (companyConfig?.model && companyConfig.model !== 'gemini-1.5-flash') {
+        // MODEL FALLBACK: Força 3 Flash para escalar com velocidade e baixo custo
+        let activeModel = 'gemini-3-flash-preview';
+        if (companyConfig?.model && companyConfig.model !== 'gemini-1.5-flash' && companyConfig.model !== 'gemini-2.0-flash') {
              activeModel = companyConfig.model;
         }
 
-        const genAI = getAIClient(activeApiKey);
-        if (!genAI) return;
+        const ai = getAIClient(activeApiKey);
+        if (!ai) return;
 
-        let contextLimit = agent.level === 'senior' ? 20 : 6;
+        // 🛡️ MEMÓRIA DE CURTO PRAZO: Busca as últimas 10 mensagens para contexto
+        const contextLimit = 10;
         const { data: chatHistoryData } = await supabase
             .from('messages')
             .select('content, from_me, message_type, transcription')
@@ -308,7 +315,7 @@ const _internalProcessAI = async (messageData) => {
             toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }];
         }
 
-        const model = genAI.getGenerativeModel({ 
+        const model = ai.getGenerativeModel({ 
             model: activeModel,
             systemInstruction,
             tools: toolsConfig 
@@ -352,27 +359,10 @@ const _internalProcessAI = async (messageData) => {
                         return; // Encerra a IA imediatamente, humano assumiu
                     }
                     else if (call.name === 'search_files') {
-                        const { data: files } = await supabase.rpc('search_drive_files', { 
-                            p_company_id: company_id, 
-                            p_query: call.args.query,
-                            p_limit: 5,
-                            p_folder_id: agent.tools_config?.drive_folder_id || null
-                        });
-                        output = { found: true, files: files || [] };
+                        output = await searchFiles(company_id, call.args.query);
                     } 
                     else if (call.name === 'send_file') {
-                        const sessionId = await getSessionId(company_id);
-                        if (sessionId) {
-                            sendMessage({
-                                sessionId,
-                                to: remote_jid,
-                                driveFileId: call.args.google_id,
-                                companyId: company_id
-                            }).catch(() => {});
-                            output = { success: true, message: "Arquivo enviado com sucesso." };
-                        } else {
-                            output = { success: false, message: "Sessão desconectada." };
-                        }
+                        output = await sendFile(company_id, remote_jid, call.args.google_id);
                     }
                 } catch (toolError) {
                     console.error("   ❌ Erro na Tool:", toolError.message);
@@ -400,16 +390,23 @@ const _internalProcessAI = async (messageData) => {
         if (finalReply) {
             console.log(`   💬 Resposta final gerada. Iniciando comportamento humano...`);
             
+            // 🕒 CONFIGURAÇÃO DE TIMING (ANTI-BAN)
+            const timing = agent.flow_config?.timing || { min_delay_seconds: 10, max_delay_seconds: 30 };
+            const minDelay = (timing.min_delay_seconds || 10) * 1000;
+            const maxDelay = (timing.max_delay_seconds || 30) * 1000;
+
             // 🔥 CORREÇÃO: Usa o sessionId da mensagem original se disponível, senão busca o padrão
             const sessionId = msgSessionId || await getSessionId(company_id);
             
             if (sessionId) {
                 // PASSO 1: Marcar como lida ("Visualizou")
-                await markMessageAsRead(sessionId, remote_jid, id); // Usa o id (whatsapp_id) mapeado no topo
-                console.log(`   👀 Visto Azul enviado. Agurdando ~10 segundos...`);
+                await markMessageAsRead(sessionId, remote_jid, id); 
+                console.log(`   👀 Visto Azul enviado. Aguardando delay humano configurado...`);
 
                 // PASSO 2: Ficar "olhando/pensando" por um tempo natural antes de começar a digitar
-                await delay(randomDelay(8000, 12000));
+                // O delay inicial respeita o min/max do agente
+                const initialDelay = randomDelay(minDelay * 0.4, minDelay * 0.8);
+                await delay(initialDelay);
 
                 // PASSO 3: Quebra Inteligente de Mensagem
                 // A IA agora envia a flag [SPLIT] quando ela mesma quer dividir a mensagem em balões diferentes
@@ -448,11 +445,11 @@ const _internalProcessAI = async (messageData) => {
                     const chunk = chunks[i];
                     
                     // PASSO 5: Definir o tempo do "Digitando..."
-                    // A primeira mensagem finge que está formulando a ideia (7 a 10s)
-                    // As partes seguintes digitam mais rápido com base no peso (simulando que já sabe o que vai dizer)
-                    let typingTime = randomDelay(7000, 10000); 
+                    // A primeira mensagem finge que está formulando a ideia
+                    // As partes seguintes digitam mais rápido com base no peso
+                    let typingTime = randomDelay(5000, 8000); 
                     if (i > 0) {
-                        typingTime = Math.min(Math.max(chunk.length * 40, 3000), 8000); 
+                        typingTime = Math.min(Math.max(chunk.length * 35, 2500), 7000); 
                     }
 
                     try {
@@ -462,9 +459,9 @@ const _internalProcessAI = async (messageData) => {
                             type: 'text',
                             content: chunk,
                             timingConfig: { 
-                                override_typing_time: typingTime, // Força o tempo exato do comando "digitando..."
-                                min_delay_seconds: 1, 
-                                max_delay_seconds: 2
+                                override_typing_time: typingTime, 
+                                min_delay_seconds: timing.min_delay_seconds / 4, 
+                                max_delay_seconds: timing.max_delay_seconds / 4
                             },
                             companyId: company_id
                         });
