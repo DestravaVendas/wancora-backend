@@ -135,41 +135,73 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
 // Garante que a IA não responda múltiplas vezes ao mesmo tempo para o mesmo lead
 // e que as mensagens sejam processadas em ordem.
 const conversationLocks = new Map();
+const messageBuffers = new Map(); // 📥 Buffer para acumular mensagens (Debounce)
 
 // 🛡️ ADAPTADO PARA RECEBER O PAYLOAD DIRETO DO EVENT BUS
 const processAIResponse = async (messageData) => {
     if (!messageData) return;
     
-    const { whatsapp_id: id, remote_jid, company_id, from_me } = messageData;
+    const { whatsapp_id: id, remote_jid, company_id, from_me, content } = messageData;
 
     if (from_me) return;
     if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter') || remote_jid === '0@s.whatsapp.net' || remote_jid === '12345678@broadcast') return;
 
-    // [FILA POR CONVERSA]
-    // Se já houver um processamento em curso para este lead, aguardamos ele terminar.
-    if (!conversationLocks.has(remote_jid)) {
-        conversationLocks.set(remote_jid, Promise.resolve());
+    // --- LÓGICA DE ACUMULAÇÃO (DEBOUNCE) ---
+    // Se o usuário mandar 3 mensagens seguidas, esperamos ele parar de digitar por 6s
+    // para processar tudo de uma vez só, evitando respostas múltiplas e robóticas.
+    
+    if (!messageBuffers.has(remote_jid)) {
+        messageBuffers.set(remote_jid, {
+            messages: [messageData],
+            timer: null
+        });
+    } else {
+        const buffer = messageBuffers.get(remote_jid);
+        buffer.messages.push(messageData);
+        if (buffer.timer) clearTimeout(buffer.timer);
     }
 
-    const currentLock = conversationLocks.get(remote_jid);
+    const buffer = messageBuffers.get(remote_jid);
     
-    // Enfileiramos o processamento desta mensagem
-    const nextTask = currentLock.then(async () => {
-        try {
-            await _internalProcessAI(messageData);
-        } catch (e) {
-            console.error(`❌ [SENTINEL] Erro na fila de ${remote_jid}:`, e.message);
-        }
-    });
+    buffer.timer = setTimeout(() => {
+        const finalMessages = [...buffer.messages];
+        messageBuffers.delete(remote_jid);
+        
+        // Consolidamos o conteúdo de todas as mensagens acumuladas
+        const combinedContent = finalMessages
+            .map(m => m.content || m.transcription || "")
+            .filter(t => t.length > 0)
+            .join("\n");
 
-    conversationLocks.set(remote_jid, nextTask);
+        if (!combinedContent) return;
 
-    // Limpeza da fila após o término para não vazar memória
-    nextTask.finally(() => {
-        if (conversationLocks.get(remote_jid) === nextTask) {
-            conversationLocks.delete(remote_jid);
+        // Usamos os metadados da ÚLTIMA mensagem, mas com o conteúdo combinado
+        const lastMsg = finalMessages[finalMessages.length - 1];
+        const consolidatedData = { ...lastMsg, content: combinedContent };
+
+        // [FILA POR CONVERSA]
+        if (!conversationLocks.has(remote_jid)) {
+            conversationLocks.set(remote_jid, Promise.resolve());
         }
-    });
+
+        const currentLock = conversationLocks.get(remote_jid);
+        
+        const nextTask = currentLock.then(async () => {
+            try {
+                await _internalProcessAI(consolidatedData);
+            } catch (e) {
+                console.error(`❌ [SENTINEL] Erro na fila de ${remote_jid}:`, e.message);
+            }
+        });
+
+        conversationLocks.set(remote_jid, nextTask);
+
+        nextTask.finally(() => {
+            if (conversationLocks.get(remote_jid) === nextTask) {
+                conversationLocks.delete(remote_jid);
+            }
+        });
+    }, 6000); // Aguarda 6 segundos de silêncio do usuário
 };
 
 const _internalProcessAI = async (messageData) => {
@@ -306,6 +338,16 @@ const _internalProcessAI = async (messageData) => {
         const horaCompleta = agora.toLocaleTimeString('pt-BR');
         
         systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nHoje é: ${dataCompleta} às ${horaCompleta}\n${filesKnowledge}`;
+        
+        // 🛡️ REGRAS DE OURO PARA HUMANIZAÇÃO (MANDATÓRIO)
+        systemInstruction += `
+\n[REGRAS CRÍTICAS DE HUMANIZAÇÃO E FLUXO]
+1. SAUDAÇÃO ÚNICA: Verifique o histórico de chat. Se você já deu "Olá" ou "Bom dia" recentemente (nas últimas 10 mensagens ou hoje), NÃO repita a saudação. Vá direto ao assunto ou responda ao que o cliente disse.
+2. QUEBRA DE MENSAGENS: Use [SPLIT] para separar a saudação/rapport da pergunta principal. Exemplo: "Olá, João! Tudo bem por aí?" [SPLIT] "Vi que você se interessou pelo nosso serviço. Como posso te ajudar hoje?"
+3. AFUNILAMENTO E OBJETIVO: Toda resposta sua DEVE terminar com uma única pergunta clara que leve o cliente em direção ao seu objetivo (agendamento ou venda).
+4. EVITE TEXTÃO: Nunca mande mais de 3 frases em um único balão. Se precisar explicar algo longo, use [SPLIT] para quebrar em partes menores e naturais.
+5. RAPPORT: Sempre valide o que o cliente disse antes de perguntar algo novo. Se ele fez uma brincadeira, responda à altura com bom humor antes de prosseguir.
+`;
 
         // Libera as tools com base no nível do agente
         let toolsConfig = [];
@@ -509,11 +551,10 @@ export const startSentinel = () => {
     
     aiBus.removeAllListeners('new_message_arrived');
     
-    // Ouve a mensagem localmente. O delay de 2.5s foi mantido para a segurança do Mutex.
+    // Ouve a mensagem localmente.
     aiBus.on('new_message_arrived', (messageData) => {
-        setTimeout(() => {
-            processAIResponse(messageData).catch(e => console.error("Erro interno no Sentinel:", e));
-        }, 2500); 
+        // Removemos o timeout fixo de 2.5s pois agora usamos a lógica de Debounce/Acumulação de 6s dentro de processAIResponse
+        processAIResponse(messageData).catch(e => console.error("Erro interno no Sentinel:", e));
     });
 
     console.log("🟢 [SENTINEL] IA Conectada na Memória RAM (Imune a quedas do Render e TIMED_OUT)!");
