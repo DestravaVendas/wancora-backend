@@ -1,4 +1,5 @@
 import { getContentType, normalizeJid, unwrapMessage, getBody } from '../../../utils/wppParsers.js';
+import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 import { upsertMessage, ensureLeadExists, upsertContact } from '../../crm/sync.js';
 import { handleMediaUpload } from './mediaHandler.js';
 import { refreshContactInfo } from './contactHandler.js'; 
@@ -7,11 +8,32 @@ import { transcribeAudio } from '../../ai/transcriber.js';
 import { createClient } from '@supabase/supabase-js';
 import { Logger } from '../../../utils/logger.js'; 
 import axios from 'axios';
-import { aiBus } from '../../scheduler/sentinel.js'; // 🛡️ NOVO: Importação do Event Bus Nativo
+import { aiBus } from '../../scheduler/sentinel.js'; 
+import getRedisClient from '../../redisClient.js'; // 🛡️ NOVO: Importação do Redis
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
+
+// 🛡️ DEDUPLICAÇÃO DE MENSAGENS (ANTI-DUPLO-PROCESSAMENTO)
+const processedMessages = new Set();
+const deduplicateMessage = async (msgId, companyId) => {
+    const redis = getRedisClient();
+    const key = `msg_proc:${companyId}:${msgId}`;
+    
+    if (redis && redis.status === 'ready') {
+        const exists = await redis.get(key);
+        if (exists) return true;
+        await redis.set(key, '1', 'EX', 300); // 5 minutos de cache
+        return false;
+    } else {
+        // Fallback em memória (LRU simples)
+        if (processedMessages.has(key)) return true;
+        processedMessages.add(key);
+        setTimeout(() => processedMessages.delete(key), 300000);
+        return false;
+    }
+};
 
 // --- 1. HANDLE NEW MESSAGE (UPSERT) ---
 export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime = true, forcedName = null, options = {}) => {
@@ -22,6 +44,14 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         if (msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid.includes('@newsletter')) return;
 
         const unwrapped = unwrapMessage(msg);
+        const msgId = unwrapped.key.id;
+
+        // 🛡️ DEDUPLICAÇÃO: Evita que a mesma mensagem dispare IA ou Webhook duas vezes
+        if (isRealtime && !unwrapped.key.fromMe) {
+            const isDuplicate = await deduplicateMessage(msgId, companyId);
+            if (isDuplicate) return;
+        }
+
         let jid = normalizeJid(unwrapped.key.remoteJid);
         
         // [REFINE] Block Official WhatsApp Messages
@@ -99,18 +129,15 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             mediaUrl = await handleMediaUpload(unwrapped, companyId);
         }
 
-        // Transcrição
+        let transcriptionText = null;
         if (isRealtime && mediaUrl && type === 'audioMessage') {
-             (async () => {
-                 try {
-                     const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
-                     const buffer = Buffer.from(response.data);
-                     const text = await transcribeAudio(buffer, 'audio/ogg', companyId);
-                     if (text) {
-                         await supabase.from('messages').update({ transcription: text }).eq('whatsapp_id', unwrapped.key.id).eq('company_id', companyId);
-                     }
-                 } catch (err) {}
-             })();
+             try {
+                 const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
+                 const buffer = Buffer.from(response.data);
+                 transcriptionText = await transcribeAudio(buffer, 'audio/ogg', companyId);
+             } catch (err) {
+                 console.error("❌ [HANDLER] Erro na transcrição:", err.message);
+             }
         }
 
         const messageData = {
@@ -122,11 +149,17 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             content: body,
             message_type: type?.replace('Message', '') || 'unknown',
             media_url: mediaUrl,
+            transcription: transcriptionText, // 🛡️ NOVO: Adiciona ao objeto para o Sentinel
             status: fromMe ? 'sent' : 'delivered',
             created_at: new Date( (unwrapped.messageTimestamp || Date.now() / 1000) * 1000 ),
             participant: participantJid, 
             lead_id: isGroup ? null : undefined 
         };
+
+        if (transcriptionText) {
+             // Atualiza no banco se houver transcrição
+             supabase.from('messages').update({ transcription: transcriptionText }).eq('whatsapp_id', unwrapped.key.id).eq('company_id', companyId).then(() => {});
+        }
         
         if (!isGroup && !fromMe) {
              const purePhone = jid.split('@')[0].replace(/\D/g, '');
@@ -191,19 +224,29 @@ export const handleMessageUpdate = async (updates, companyId) => {
 
                 if (originalMsg) {
                     try {
-                        let currentVotes = Array.isArray(originalMsg.poll_votes) ? originalMsg.poll_votes : [];
-                        currentVotes = currentVotes.filter(v => v.voterJid !== voterJid);
+                        // [NATIVO] Usa a função oficial do Baileys para agregar votos de forma segura e compatível
+                        const pollCreation = typeof originalMsg.content === 'string' ? JSON.parse(originalMsg.content) : originalMsg.content;
                         
-                        const selectedOptions = vote.selectedOptions.map(opt => Buffer.isBuffer(opt) ? opt.toString('hex') : opt);
-                        
-                        currentVotes.push({ voterJid, selectedOptions, ts: Date.now() });
-                        
+                        // Reconstrói a mensagem de criação para a função de agregação
+                        const pollCreationMessage = {
+                            pollCreationMessage: {
+                                name: pollCreation.name,
+                                options: pollCreation.options.map(o => ({ optionName: o })),
+                                selectableOptionsCount: pollCreation.selectableOptionsCount
+                            }
+                        };
+
+                        const aggregatedVotes = getAggregateVotesInPollMessage({
+                            message: pollCreationMessage,
+                            pollUpdates: update.pollUpdates,
+                        });
+
                         await supabase.from('messages')
-                            .update({ poll_votes: currentVotes })
+                            .update({ poll_votes: aggregatedVotes })
                             .eq('whatsapp_id', pollMsgId)
                             .eq('company_id', companyId);
                     } catch (e) {
-                        console.error("Erro ao atualizar enquete:", e);
+                        console.error("Erro ao atualizar enquete (Nativo):", e);
                     }
                 }
             }
