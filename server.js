@@ -159,15 +159,18 @@ const restoreSessions = async () => {
     }
 };
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-    console.log(`🚀 Wancora Backend v5.4.5 (Stability Patch) rodando na porta ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Wancora Backend v5.4.6 (Render Patch) rodando na porta ${PORT}`);
     
-    restoreSessions();     
-    startSentinel();       
-    startAgendaWorker();   
-    startRetentionWorker(); 
+    // Pequeno delay para garantir que o health check do Render passe antes do boot pesado
+    setTimeout(() => {
+        restoreSessions();     
+        startSentinel();       
+        startAgendaWorker();   
+        startRetentionWorker(); 
+    }, 2000);
 });
 
 export default app;
