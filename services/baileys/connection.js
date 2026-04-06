@@ -22,8 +22,38 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 export const sessions = new Map();
 const retries = new Map();
+const sessionLocks = new Map(); // 🛡️ [LOCK] Heartbeats das travas
+
+const BOOT_DELAY = 60000; // 60s para garantir que instâncias antigas do Render morram
 
 const logger = pino({ level: 'fatal' });
+
+// 🛡️ [LOCK] Funções de Gerenciamento de Travas de Sessão (Evita Duplicidade)
+const acquireLock = async (sessionId) => {
+    const redis = getRedisClient();
+    if (!redis) return true; // Se não tem redis, ignora (risco de duplicidade)
+    const lockKey = `lock:session:${sessionId}`;
+    // Tenta adquirir a trava por 45 segundos usando o PID do processo como valor
+    const acquired = await redis.set(lockKey, process.pid, 'NX', 'PX', 45000);
+    return acquired === 'OK';
+};
+
+const renewLock = async (sessionId) => {
+    const redis = getRedisClient();
+    if (!redis) return;
+    const lockKey = `lock:session:${sessionId}`;
+    await redis.pexpire(lockKey, 45000);
+};
+
+const releaseLock = async (sessionId) => {
+    const redis = getRedisClient();
+    if (!redis) return;
+    const lockKey = `lock:session:${sessionId}`;
+    const current = await redis.get(lockKey);
+    if (current == process.pid) {
+        await redis.del(lockKey);
+    }
+};
 
 const subscribeToRecentChats = async (sock, companyId) => {
     try {
@@ -59,9 +89,17 @@ const checkIsBusiness = async (sock) => {
     }
 };
 
-const killSession = (sessionId) => {
+const killSession = async (sessionId) => {
     if (sessions.has(sessionId)) {
         console.log(`💀 [CONNECTION] Matando sessão ${sessionId} (Hard Kill)...`);
+        
+        // Limpa o Heartbeat do Lock
+        if (sessionLocks.has(sessionId)) {
+            clearInterval(sessionLocks.get(sessionId));
+            sessionLocks.delete(sessionId);
+        }
+        await releaseLock(sessionId);
+
         const session = sessions.get(sessionId);
         try {
             // Remove listeners do Baileys
@@ -156,7 +194,14 @@ export const startSession = async (sessionId, companyId) => {
         return existing.sock;
     }
 
-    killSession(sessionId);
+    // 🛡️ [LOCK] Tenta adquirir a trava antes de iniciar
+    const locked = await acquireLock(sessionId);
+    if (!locked) {
+        console.warn(`🚫 [CONNECTION] Sessão ${sessionId} já está ativa em outra instância. Abortando.`);
+        return null;
+    }
+
+    await killSession(sessionId);
     await new Promise(r => setTimeout(r, 1000));
 
     try {
@@ -245,6 +290,10 @@ export const startSession = async (sessionId, companyId) => {
         });
 
         sessions.set(sessionId, { sock, companyId });
+
+        // 🛡️ [HEARTBEAT] Mantém a trava ativa enquanto a sessão existir
+        const lockInterval = setInterval(() => renewLock(sessionId), 20000);
+        sessionLocks.set(sessionId, lockInterval);
 
         setupListeners({ sock, sessionId, companyId });
 
