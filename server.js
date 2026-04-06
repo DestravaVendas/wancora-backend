@@ -16,43 +16,7 @@ import { Logger } from './utils/logger.js'; // NOVO: Logger
 import { errorHandler } from './middleware/errorHandler.js'; // NOVO: Middleware
 
 // --- CONSOLE HIJACKING (Interceptador Global de Logs) ---
-// Isso captura logs de bibliotecas (Baileys, Express) e try/catchs silenciosos
-const originalConsoleError = console.error;
-const originalConsoleWarn = console.warn;
-
-console.error = (...args) => {
-    // 1. Mantém o comportamento original (Terminal) para debug local
-    originalConsoleError.apply(console, args);
-    
-    // 2. Transforma argumentos em string para análise
-    const msg = args.map(a => (typeof a === 'object' ? (a.message || JSON.stringify(a)) : String(a))).join(' ');
-    
-    // --- FILTRO DE SEGURANÇA (ANTI-LOOP) ---
-    // Impede que erros do próprio Logger gerem novos logs, criando recursão infinita
-    if (
-        msg.includes('rate limit') || 
-        msg.includes('socket disconnect') ||
-        msg.includes('Falha ao escrever log') || // Loop Breaker 1
-        msg.includes('system_logs') ||           // Loop Breaker 2
-        msg.includes('violates check constraint')// Loop Breaker 3
-    ) return;
-
-    // Envia para o Supabase com source 'backend' (Válido no SQL Check)
-    // O erro anterior usava 'backend-console' que violava a constraint do banco
-    Logger.error('backend', 'Captured Console Error', { raw: msg, args });
-};
-
-console.warn = (...args) => {
-    originalConsoleWarn.apply(console, args);
-    const msg = args.map(a => String(a)).join(' ');
-    
-    if (
-        msg.includes('ExperimentalWarning') || 
-        msg.includes('Falha ao escrever log')
-    ) return;
-    
-    Logger.warn('backend', 'Captured Console Warn', { raw: msg });
-};
+Logger.initConsoleHijack();
 // --------------------------------------------------------
 
 // Rotas Modulares
@@ -64,41 +28,39 @@ import cloudRoutes from './routes/cloud.routes.js';
 
 // --- GESTÃO DE ERROS FATAIS (CRASH PREVENTION) ---
 process.on('uncaughtException', (err) => {
-    // Usa originalConsoleError para garantir que saia no terminal mesmo se o Logger falhar
-    originalConsoleError('Uncaught Exception:', err);
-    
-    Logger.fatal('backend', 'Uncaught Exception (Process Crash prevented)', {
-        message: err.message,
-        stack: err.stack
+    console.error('Uncaught Exception:', err);
+    Logger.fatal('backend', 'Uncaught Exception detectada!', { 
+        error: err.message, 
+        stack: err.stack 
     });
-    // Não encerra o processo para manter o serviço ativo para outros tenants, mas loga como FATAL
+    // Dá 1s para o log ser gravado antes de crashar
+    setTimeout(() => process.exit(1), 1000);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    Logger.error('backend', 'Unhandled Rejection', {
-        reason: reason instanceof Error ? reason.message : reason,
+    console.error('Unhandled Rejection:', reason);
+    Logger.error('backend', 'Unhandled Rejection detectada!', { 
+        reason: reason instanceof Error ? reason.message : String(reason),
         stack: reason instanceof Error ? reason.stack : null
     });
 });
 
-// --- GRACEFUL SHUTDOWN (RENDER DEPLOY FIX) ---
-// Quando o Render faz deploy, ele envia SIGTERM para o container antigo.
-// Precisamos desconectar o Baileys manualmente para evitar conflito 440.
-const handleGracefulShutdown = (signal) => {
-    console.log(`🛑 Recebido ${signal}. Iniciando desligamento gracioso...`);
+// --- GRACEFUL SHUTDOWN (Zero-Conflict Deploy) ---
+const handleShutdown = async (signal) => {
+    console.log(`\n🛑 [${signal}] Recebido. Iniciando encerramento limpo...`);
     
-    // 1. Encerra conexões do WhatsApp
-    shutdownAllSessions();
+    // 1. Fecha conexões do Baileys (Evita erro 440 Stream Conflict no próximo boot)
+    await shutdownAllSessions();
     
-    // 2. Aguarda um pouco para logs e DB terminarem
+    // 2. Aguarda um pouco para limpeza de buffers
     setTimeout(() => {
-        console.log('👋 Desligamento concluído. Bye.');
+        console.log('👋 Wancora Backend encerrado. Até logo!');
         process.exit(0);
     }, 1500);
 };
 
-process.on('SIGTERM', () => handleGracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => handleGracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('SIGINT', () => handleShutdown('SIGINT'));
 
 
 // PATCH: USER-AGENT SPOOFING
@@ -197,10 +159,10 @@ const restoreSessions = async () => {
     }
 };
 
-const PORT = process.env.PORT || 3001;
+const PORT = 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 Wancora Backend v5.4.4 (Stability Patch) rodando na porta ${PORT}`);
+    console.log(`🚀 Wancora Backend v5.4.5 (Stability Patch) rodando na porta ${PORT}`);
     
     restoreSessions();     
     startSentinel();       
