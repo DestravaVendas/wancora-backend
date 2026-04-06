@@ -34,14 +34,10 @@ const safeSanitize = (obj, seen = new WeakSet()) => {
     return cleanObj;
 };
 
-export const Logger = {
+// Objeto de Log Centralizado
+const LoggerInstance = {
     /**
      * Grava um log no banco de dados.
-     * @param {'info'|'warn'|'error'|'fatal'} level - Nível de severidade
-     * @param {string} source - Origem (backend, worker, baileys)
-     * @param {string} message - Mensagem descritiva
-     * @param {object} metadata - Dados técnicos adicionais (stack, payload, ids)
-     * @param {string} [companyId] - ID da empresa (opcional)
      */
     log: async (level, source, message, metadata = {}, companyId = null) => {
         // Em dev, mostra no console para debug rápido
@@ -56,17 +52,16 @@ export const Logger = {
             // Prepara payload seguro
             const safeMetadata = safeSanitize(metadata);
             
-            // Gravação Fire-and-Forget (Sem await para não travar a request principal)
+            // Gravação Fire-and-Forget
             supabase.from('system_logs').insert({
                 level,
                 source,
-                message: (message || '').substring(0, 1000), // Limite de tamanho na mensagem principal
+                message: (message || '').substring(0, 1000),
                 metadata: safeMetadata,
                 company_id: companyId,
                 created_at: new Date()
             }).then(({ error }) => {
                 if (error) {
-                    // Fallback final: se o banco falhar, joga no console original
                     console.error("FATAL LOGGER FAIL: Falha ao escrever log no Supabase:", error.message);
                 }
             });
@@ -75,8 +70,45 @@ export const Logger = {
         }
     },
 
-    info: (source, message, meta, companyId) => Logger.log('info', source, message, meta, companyId),
-    warn: (source, message, meta, companyId) => Logger.log('warn', source, message, meta, companyId),
-    error: (source, message, meta, companyId) => Logger.log('error', source, message, meta, companyId),
-    fatal: (source, message, meta, companyId) => Logger.log('fatal', source, message, meta, companyId),
+    info: (source, message, meta, companyId) => LoggerInstance.log('info', source, message, meta, companyId),
+    warn: (source, message, meta, companyId) => LoggerInstance.log('warn', source, message, meta, companyId),
+    error: (source, message, meta, companyId) => LoggerInstance.log('error', source, message, meta, companyId),
+    fatal: (source, message, meta, companyId) => LoggerInstance.log('fatal', source, message, meta, companyId),
+
+    /**
+     * Intercepta console.error e console.warn para gravar no Supabase.
+     */
+    initConsoleHijack: () => {
+        const originalConsoleError = console.error;
+        const originalConsoleWarn = console.warn;
+
+        console.error = (...args) => {
+            originalConsoleError.apply(console, args);
+            const msg = args.map(a => (typeof a === 'object' ? (a.message || JSON.stringify(a)) : String(a))).join(' ');
+            
+            if (
+                msg.includes('rate limit') || 
+                msg.includes('socket disconnect') ||
+                msg.includes('Falha ao escrever log') || 
+                msg.includes('system_logs') ||           
+                msg.includes('violates check constraint')
+            ) return;
+
+            LoggerInstance.error('backend', 'Captured Console Error', { raw: msg, args });
+        };
+
+        console.warn = (...args) => {
+            originalConsoleWarn.apply(console, args);
+            const msg = args.map(a => String(a)).join(' ');
+            
+            if (
+                msg.includes('ExperimentalWarning') || 
+                msg.includes('Falha ao escrever log')
+            ) return;
+            
+            LoggerInstance.warn('backend', 'Captured Console Warn', { raw: msg });
+        };
+    }
 };
+
+export const Logger = LoggerInstance;
