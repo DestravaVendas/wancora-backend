@@ -2,8 +2,100 @@ import { createClient } from "@supabase/supabase-js";
 import { sendMessage } from "../baileys/sender.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { normalizeJid } from "../../utils/wppParsers.js";
+import { getDriveClient } from "../../utils/googleDrive.js";
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+
+/**
+ * Ferramenta: Buscar Arquivos no Google Drive
+ */
+export const searchFiles = async (companyId, query) => {
+    try {
+        // 1. Tenta buscar no cache do Supabase primeiro (Fuzzy Search)
+        const { data: cachedFiles, error: rpcError } = await supabase.rpc('search_drive_files', {
+            p_company_id: companyId,
+            p_query: query,
+            p_limit: 5
+        });
+
+        if (!rpcError && cachedFiles && cachedFiles.length > 0) {
+            return { 
+                success: true, 
+                message: "Encontrei estes arquivos no Drive:",
+                files: cachedFiles.map(f => ({ id: f.google_id, name: f.name, type: f.mime_type }))
+            };
+        }
+
+        // 2. Fallback: Busca direta na API do Google Drive
+        const drive = await getDriveClient(companyId);
+        if (!drive) return { success: false, error: "Integração com Google Drive não configurada ou expirada." };
+
+        const res = await drive.files.list({
+            q: `name contains '${query}' and trashed = false`,
+            fields: 'files(id, name, mimeType, webViewLink)',
+            pageSize: 5
+        });
+
+        if (!res.data.files || res.data.files.length === 0) {
+            return { success: true, message: "Não encontrei nenhum arquivo com esse nome no Drive." };
+        }
+
+        return { 
+            success: true, 
+            message: "Encontrei estes arquivos no Drive:",
+            files: res.data.files.map(f => ({ id: f.id, name: f.name, type: f.mimeType }))
+        };
+
+    } catch (e) {
+        console.error("[TOOL] Erro ao buscar arquivos:", e);
+        return { success: false, error: "Falha técnica ao acessar o Google Drive." };
+    }
+};
+
+/**
+ * Ferramenta: Enviar Arquivo do Google Drive via WhatsApp
+ */
+export const sendFile = async (companyId, remoteJid, googleId) => {
+    try {
+        const drive = await getDriveClient(companyId);
+        if (!drive) return { success: false, error: "Integração com Google Drive não configurada." };
+
+        // 1. Busca metadados do arquivo
+        const fileMetadata = await drive.files.get({
+            fileId: googleId,
+            fields: 'id, name, mimeType'
+        });
+
+        const { name, mimeType } = fileMetadata.data;
+
+        // 2. Baixa o conteúdo do arquivo
+        const res = await drive.files.get(
+            { fileId: googleId, alt: 'media' },
+            { responseType: 'arraybuffer' }
+        );
+
+        const buffer = Buffer.from(res.data);
+
+        // 3. Envia via Baileys
+        const sessionId = await getSessionId(companyId);
+        if (!sessionId) return { success: false, error: "Sessão do WhatsApp não encontrada." };
+
+        await sendMessage({
+            sessionId,
+            to: remoteJid,
+            type: 'document',
+            content: buffer,
+            fileName: name,
+            mimetype: mimeType
+        });
+
+        return { success: true, message: `Arquivo '${name}' enviado com sucesso para o cliente.` };
+
+    } catch (e) {
+        console.error("[TOOL] Erro ao enviar arquivo:", e);
+        return { success: false, error: "Falha ao baixar ou enviar o arquivo do Google Drive." };
+    }
+};
 
 /**
  * Ferramenta: Agendar Reunião
