@@ -103,6 +103,11 @@ export const sendMessage = async ({
         let jid = normalizeJid(to);
 
         try {
+            // [ANTI-BAN] Verifica se a conexão ainda está ativa antes de simular comportamento
+            if (!sock || !sock.user) {
+                throw new Error("Conexão com WhatsApp perdida durante o processo de envio.");
+            }
+
             // [FIX BRASIL] Validação de existência para corrigir 9º dígito
             if (jid.startsWith('55') && jid.includes('@s.whatsapp.net')) {
                 try {
