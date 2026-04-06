@@ -339,16 +339,6 @@ const _internalProcessAI = async (messageData) => {
         
         systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nHoje é: ${dataCompleta} às ${horaCompleta}\n${filesKnowledge}`;
         
-        // 🛡️ REGRAS DE OURO PARA HUMANIZAÇÃO (MANDATÓRIO)
-        systemInstruction += `
-\n[REGRAS CRÍTICAS DE HUMANIZAÇÃO E FLUXO]
-1. SAUDAÇÃO ÚNICA: Verifique o histórico de chat. Se você já deu "Olá" ou "Bom dia" recentemente (nas últimas 10 mensagens ou hoje), NÃO repita a saudação. Vá direto ao assunto ou responda ao que o cliente disse.
-2. QUEBRA DE MENSAGENS: Use [SPLIT] para separar a saudação/rapport da pergunta principal. Exemplo: "Olá, João! Tudo bem por aí?" [SPLIT] "Vi que você se interessou pelo nosso serviço. Como posso te ajudar hoje?"
-3. AFUNILAMENTO E OBJETIVO: Toda resposta sua DEVE terminar com uma única pergunta clara que leve o cliente em direção ao seu objetivo (agendamento ou venda).
-4. EVITE TEXTÃO: Nunca mande mais de 3 frases em um único balão. Se precisar explicar algo longo, use [SPLIT] para quebrar em partes menores e naturais.
-5. RAPPORT: Sempre valide o que o cliente disse antes de perguntar algo novo. Se ele fez uma brincadeira, responda à altura com bom humor antes de prosseguir.
-`;
-
         // Libera as tools com base no nível do agente
         let toolsConfig = [];
         if (agent.level === 'senior' || agent.level === 'pleno') {
