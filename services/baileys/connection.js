@@ -104,21 +104,58 @@ export const shutdownAllSessions = () => {
     }
 };
 
-// [NOVO] Monitoramento de Performance Periódico
-setInterval(() => {
+// [NOVO] Monitoramento de Performance e Watchdog de Sessões
+setInterval(async () => {
     const activeSessions = sessions.size;
     const redis = getRedisClient();
     const redisStatus = redis ? redis.status : 'not_configured';
     
+    console.log(`📊 [WATCHDOG] Sessões em Memória: ${activeSessions} | Redis: ${redisStatus}`);
+
+    try {
+        // Busca sessões que deveriam estar conectadas no banco
+        const { data: dbSessions } = await supabase
+            .from('instances')
+            .select('session_id, company_id, status, updated_at')
+            .in('status', ['connected', 'connecting', 'qrcode']);
+
+        if (dbSessions) {
+            const now = Date.now();
+            for (const dbSess of dbSessions) {
+                const inMemory = sessions.get(dbSess.session_id);
+                
+                // 1. ZUMBI: Está no banco como conectado mas não está na memória do Node
+                if (!inMemory && dbSess.status === 'connected') {
+                    console.warn(`🧟 [WATCHDOG] Detectada Sessão Zumbi: ${dbSess.session_id}. Restaurando...`);
+                    startSession(dbSess.session_id, dbSess.company_id).catch(() => {});
+                } 
+                
+                // 2. TRAVADA: Está em 'connecting' ou 'qrcode' há mais de 10 minutos sem atualização
+                const lastUpdate = new Date(dbSess.updated_at).getTime();
+                if (['connecting', 'qrcode'].includes(dbSess.status) && (now - lastUpdate > 600000)) {
+                    console.warn(`⏳ [WATCHDOG] Sessão ${dbSess.session_id} travada em '${dbSess.status}'. Forçando reinício.`);
+                    killSession(dbSess.session_id);
+                    startSession(dbSess.session_id, dbSess.company_id).catch(() => {});
+                }
+
+                // 3. DESINCRONIZADO: Está na memória mas no banco diz que está desconectado (raro)
+                if (inMemory && dbSess.status === 'disconnected') {
+                     console.warn(`⚠️ [WATCHDOG] Sessão ${dbSess.session_id} ativa em memória mas 'disconnected' no banco. Sincronizando...`);
+                     updateInstanceStatus(dbSess.session_id, dbSess.company_id, { status: 'connected' }).catch(() => {});
+                }
+            }
+        }
+    } catch (e) {
+        console.error(`❌ [WATCHDOG] Erro ao verificar sessões zumbis:`, e.message);
+    }
+    
     if (activeSessions > 0) {
-        console.log(`📊 [MONITOR] Sessões Ativas: ${activeSessions} | Redis Status: ${redisStatus}`);
-        
-        // Se houver muitas sessões, logamos um aviso se o Redis estiver offline
-        if (activeSessions > 20 && redisStatus !== 'ready') {
-            console.warn(`🚨 [PERF] Alerta: ${activeSessions} sessões ativas mas Redis não está pronto! Risco de lentidão.`);
+        // Alerta de performance se Redis estiver offline com carga
+        if (activeSessions > 15 && redisStatus !== 'ready') {
+            Logger.warn('baileys', `Carga alta (${activeSessions} sessões) sem Redis! Risco de instabilidade.`, { redisStatus });
         }
     }
-}, 60000 * 5); // A cada 5 minutos
+}, 60000 * 2); // A cada 2 minutos
 
 export const startSession = async (sessionId, companyId) => {
     const existing = sessions.get(sessionId);
