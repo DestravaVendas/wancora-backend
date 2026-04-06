@@ -10,18 +10,17 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const fixBuffer = (data) => {
     if (!data) return null;
     try {
+        // Se já for Buffer, retorna direto (Otimização)
         if (Buffer.isBuffer(data)) return data;
-        if (typeof data === 'string') {
-            return JSON.parse(data, BufferJSON.reviver);
+        
+        // Se for objeto com estrutura de Buffer do JSON.stringify
+        if (typeof data === 'object' && data.type === 'Buffer' && Array.isArray(data.data)) {
+            return Buffer.from(data.data);
         }
-        if (typeof data === 'object') {
-            if (data.type === 'Buffer' && Array.isArray(data.data)) {
-                return Buffer.from(data.data);
-            }
-            const str = JSON.stringify(data);
-            return JSON.parse(str, BufferJSON.reviver);
-        }
-        return data;
+
+        // Fallback para reviver via BufferJSON (mais lento mas seguro)
+        const str = typeof data === 'string' ? data : JSON.stringify(data);
+        return JSON.parse(str, BufferJSON.reviver);
     } catch (e) {
         console.warn("[AUTH] Falha ao recuperar chave (Buffer Corrupto). Regenerando...", e.message);
         return null; 
@@ -49,14 +48,14 @@ const flushToDB = async (sessionId) => {
     const cache = sessionCaches.get(sessionId);
     if (!cache || cache.isFlushing || cache.writes.size === 0) return;
     
-    // Debounce: Evita flushes muito frequentes se houver muitas escritas seguidas
+    // Debounce Reduzido: 100ms (Mais agressivo para evitar Bad MAC em reconexões rápidas)
     const now = Date.now();
-    if (now - cache.lastFlush < 500) {
+    if (now - cache.lastFlush < 100) {
         if (!cache.flushTimer) {
             cache.flushTimer = setTimeout(() => {
                 cache.flushTimer = null;
                 flushToDB(sessionId);
-            }, 500);
+            }, 100);
         }
         return;
     }
@@ -76,14 +75,19 @@ const flushToDB = async (sessionId) => {
             const [type, id] = cacheKey.split('::');
             
             if (value) {
+                // Validação de Payload: Evita salvar objetos vazios que corrompem a sessão
                 const stringified = JSON.stringify(value, BufferJSON.replacer);
-                rowsToUpsert.push({
-                    session_id: sessionId,
-                    data_type: type,
-                    key_id: id,
-                    payload: JSON.parse(stringified),
-                    updated_at: new Date()
-                });
+                const payload = JSON.parse(stringified);
+                
+                if (payload && Object.keys(payload).length > 0) {
+                    rowsToUpsert.push({
+                        session_id: sessionId,
+                        data_type: type,
+                        key_id: id,
+                        payload: payload,
+                        updated_at: new Date()
+                    });
+                }
             } else {
                 idsToDelete.push({ type, id });
             }
