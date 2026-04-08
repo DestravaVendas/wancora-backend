@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
-import { sendMessage as sendService } from '../services/baileys/sender.js';
+import { sendMessage as sendService, executeLocked } from '../services/baileys/sender.js';
 import { 
     createGroup as createGroupService, 
     manageGroupParticipants as manageParticipantsService,
@@ -167,13 +167,15 @@ export const sendPollVote = async (sessionId, companyId, remoteJid, pollId, opti
 
         // ENVIO DO VOTO (Payload Limpo)
         // O Baileys precisa que a opção selecionada seja IDÊNTICA (case-sensitive, space-sensitive)
-        await session.sock.sendMessage(chatJid, {
-            poll: {
-                vote: {
-                    key: voteKey,
-                    selectedOptions: [selectedOptionText] 
+        await executeLocked(sessionId, async () => {
+            await session.sock.sendMessage(chatJid, {
+                poll: {
+                    vote: {
+                        key: voteKey,
+                        selectedOptions: [selectedOptionText] 
+                    }
                 }
-            }
+            });
         });
 
         console.log(`✅ [POLL DEBUG] Voto enviado ao socket.`);
@@ -209,7 +211,9 @@ export const sendReaction = async (sessionId, companyId, remoteJid, msgId, react
         const text = reaction || "";
 
         const key = { remoteJid: normalizeJid(remoteJid), id: targetMsg.whatsapp_id, fromMe: targetMsg.from_me };
-        await session.sock.sendMessage(normalizeJid(remoteJid), { react: { text: text, key: key } });
+        await executeLocked(sessionId, async () => {
+            await session.sock.sendMessage(normalizeJid(remoteJid), { react: { text: text, key: key } });
+        });
         return { success: true };
     } catch (error) {
         console.error(`[Controller] Erro ao reagir:`, error);
@@ -226,7 +230,9 @@ export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, ever
                 const { data: targetMsg } = await supabase.from('messages').select('whatsapp_id, from_me').eq('id', msgId).single();
                 if (targetMsg) {
                     const key = { remoteJid: normalizeJid(remoteJid), id: targetMsg.whatsapp_id, fromMe: targetMsg.from_me };
-                    await session.sock.sendMessage(normalizeJid(remoteJid), { delete: key });
+                    await executeLocked(sessionId, async () => {
+                        await session.sock.sendMessage(normalizeJid(remoteJid), { delete: key });
+                    });
                 }
             }
         }
