@@ -99,9 +99,15 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
                     .maybeSingle();
                 
                 if (contact?.jid) {
-                    jid = contact.jid;
-                    // Aproveita e salva no mapa para a próxima
-                    supabase.rpc('link_identities', { p_lid: unwrapped.key.remoteJid, p_phone: jid, p_company_id: companyId }).then(() => {});
+                    const resolvedJid = contact.jid;
+                    const lidPhone = unwrapped.key.remoteJid.split('@')[0].replace(/\D/g, '');
+                    const resolvedPhone = resolvedJid.split('@')[0].replace(/\D/g, '');
+
+                    if (lidPhone === resolvedPhone) {
+                        jid = resolvedJid;
+                        // Aproveita e salva no mapa para a próxima
+                        supabase.rpc('link_identities', { p_lid: unwrapped.key.remoteJid, p_phone: jid, p_company_id: companyId }).then(() => {});
+                    }
                 }
             }
         }
