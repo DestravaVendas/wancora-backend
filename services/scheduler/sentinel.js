@@ -379,6 +379,9 @@ const _internalProcessAI = async (messageData) => {
         
         // 🛡️ [ISOLAMENTO CRÍTICO] Instrução de Bolha: Garante que a IA saiba exatamente com quem fala
         systemInstruction += `\n\n[DIRETRIZ DE ISOLAMENTO]\nVocê está em uma conversa PRIVADA e ISOLADA com o cliente "${lead.name}".\nNUNCA mencione outros clientes ou misture contextos.\nTrate esta conversa como uma bolha única.`;
+        
+        systemInstruction += `\n\n[DIRETRIZ DE AGENDAMENTO]\n1. SEMPRE use 'check_availability' ANTES de confirmar um horário.\n2. Se 'check_availability' ou 'schedule_meeting' retornar erro, NÃO peça para o cliente usar o link. Tente corrigir o formato da data (YYYY-MM-DD) e tente novamente.\n3. O agendamento deve ser REAL no sistema, não apenas uma promessa na conversa.`;
+
         systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nHoje é: ${dataCompleta} às ${horaCompleta}\n${filesKnowledge}`;
         
         // Libera as tools com base no nível do agente
@@ -445,10 +448,20 @@ const _internalProcessAI = async (messageData) => {
 
                 try {
                     if (call.name === 'check_availability') {
-                        output = await checkAvailability(company_id, call.args.dateISO);
+                        // 🛡️ [FIX] Mapeia 'date' ou 'dateISO' para a função
+                        const dateArg = call.args.dateISO || call.args.date;
+                        output = await checkAvailability(company_id, dateArg);
                     }
                     else if (call.name === 'schedule_meeting') {
-                        output = await scheduleMeeting(company_id, lead.id, call.args.title, call.args.dateISO, call.args.description, lead.owner_id);
+                        // 🛡️ [FIX] Mapeia 'time' e 'date' se a IA enviar separado, ou usa 'dateISO'
+                        let dateArg = call.args.dateISO;
+                        if (!dateArg && call.args.date && call.args.time) {
+                            dateArg = `${call.args.date}T${call.args.time}:00`;
+                        } else if (!dateArg) {
+                            dateArg = call.args.date || call.args.time;
+                        }
+                        
+                        output = await scheduleMeeting(company_id, lead.id, call.args.title, dateArg, call.args.description, lead.owner_id);
                     }
                     else if (call.name === 'transfer_to_human') {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
