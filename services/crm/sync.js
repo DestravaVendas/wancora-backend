@@ -194,7 +194,7 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         }
 
         const { data: existing } = await safeSupabaseCall(() => 
-            supabase.from('leads').select('id, name').eq('phone', purePhone).eq('company_id', companyId).maybeSingle()
+            supabase.from('leads').select('id, name').eq('phone', purePhone).eq('company_id', companyId).limit(1).maybeSingle()
         );
 
         if (existing) {
