@@ -118,6 +118,11 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
                 push_name: pushName,
                 last_message_at: new Date()
             });
+            
+            // 🔥 [NOVO] Busca foto do perfil para novos contatos imediatamente
+            if (isRealtime) {
+                refreshContactInfo(sock, jid, companyId, pushName).catch(() => {});
+            }
         }
         // ----------------------------------------------
 
