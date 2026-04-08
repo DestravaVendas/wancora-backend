@@ -331,8 +331,13 @@ export const startSession = async (sessionId, companyId) => {
 
                 if (isConflict) {
                      // Adiciona um jitter significativo para evitar que as duas sessões reconectem sincronizadas
-                     const jitter = Math.floor(Math.random() * (30000 - 15000 + 1) + 15000);
-                     Logger.warn('baileys', `Conflito de Stream (440). Jitter: ${jitter}ms.`, { sessionId }, companyId);
+                     // Se for 515 (Stream Errored), o jitter pode ser menor pois geralmente é erro de rede, não conflito real.
+                     const is515 = statusCode === 515;
+                     const jitter = is515 
+                        ? Math.floor(Math.random() * (10000 - 5000 + 1) + 5000) // 5-10s para 515
+                        : Math.floor(Math.random() * (30000 - 15000 + 1) + 15000); // 15-30s para conflito real
+                     
+                     Logger.warn('baileys', `Conflito/Erro de Stream (${statusCode}). Jitter: ${jitter}ms.`, { sessionId }, companyId);
                      
                      // Mata esta instância para dar chance à outra (se for o caso)
                      killSession(sessionId); 
