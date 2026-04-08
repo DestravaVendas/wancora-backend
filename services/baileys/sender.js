@@ -19,15 +19,40 @@ const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + m
 // Garante que uma sessão nunca envie duas mensagens simultaneamente, mesmo vindo de fontes diferentes (IA, Agenda, Manual).
 const sendLocks = new Map();
 
+/**
+ * 🛡️ [ESTABILIDADE] Executa uma função garantindo que a sessão esteja travada.
+ * Evita erros de "Bad MAC" e conflitos de estado no socket.
+ */
+export const executeLocked = async (sessionId, task) => {
+    if (!sendLocks.has(sessionId)) {
+        sendLocks.set(sessionId, Promise.resolve());
+    }
+
+    const currentLock = sendLocks.get(sessionId);
+    const nextTask = currentLock.then(async () => {
+        try {
+            return await task();
+        } catch (e) {
+            console.error(`❌ [SENDER] Erro em tarefa travada (${sessionId}):`, e.message);
+            throw e;
+        }
+    });
+
+    sendLocks.set(sessionId, nextTask.catch(() => {}));
+    return nextTask;
+};
+
 // 🛡️ NOVO: Função para forçar a visualização (visto azul) antes de responder
 export const markMessageAsRead = async (sessionId, jid, messageId) => {
-    const session = sessions.get(sessionId);
-    if (!session || !session.sock) return;
-    try {
-        await session.sock.readMessages([{ remoteJid: jid, id: messageId }]);
-    } catch (e) {
-        console.error("[SENDER] Erro ao marcar como lido:", e.message);
-    }
+    return executeLocked(sessionId, async () => {
+        const session = sessions.get(sessionId);
+        if (!session || !session.sock) return;
+        try {
+            await session.sock.readMessages([{ remoteJid: jid, id: messageId }]);
+        } catch (e) {
+            console.error("[SENDER] Erro ao marcar como lido:", e.message);
+        }
+    });
 };
 
 // Helper para converter imagem em Sticker WebP (512x512) com Metadados EXIF
@@ -86,21 +111,13 @@ export const sendMessage = async ({
     companyId,
     timingConfig // [NOVO] Configuração de tempo { min_delay, max_delay, override_typing_time }
 }) => {
-    const session = sessions.get(sessionId);
-    if (!session || !session.sock) throw new Error(`Sessão ${sessionId} não encontrada.`);
+    return executeLocked(sessionId, async () => {
+        const session = sessions.get(sessionId);
+        if (!session || !session.sock) throw new Error(`Sessão ${sessionId} não encontrada.`);
 
-    // 🛡️ [ANTI-BAN] Gerenciamento de Fila de Saída
-    // Se já houver um envio em curso para esta sessão, aguardamos ele terminar.
-    if (!sendLocks.has(sessionId)) {
-        sendLocks.set(sessionId, Promise.resolve());
-    }
-
-    const currentLock = sendLocks.get(sessionId);
-    
-    // Criamos a próxima promessa na corrente
-    const nextTask = currentLock.then(async () => {
         const sock = session.sock;
         let jid = normalizeJid(to);
+        // ... rest of the logic inside the task
 
         try {
             // [ANTI-BAN] Verifica se a conexão ainda está ativa antes de simular comportamento
@@ -364,9 +381,4 @@ export const sendMessage = async ({
             throw err;
         }
     });
-
-    // Atualizamos o lock para a próxima tarefa
-    sendLocks.set(sessionId, nextTask.catch(() => {})); // .catch para não travar a fila se um envio falhar
-
-    return nextTask;
 };
