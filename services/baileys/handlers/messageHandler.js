@@ -82,10 +82,28 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         // Permite sticker passar mesmo sem body
         if (!body && !isMedia && type !== 'stickerMessage') return;
 
-        // LID RESOLVER
+        // LID RESOLVER (Hard & Soft)
         if (jid.includes('@lid')) {
+            // 1. Hard Resolution (Identity Map)
             const { data: mapping } = await supabase.from('identity_map').select('phone_jid').eq('lid_jid', jid).eq('company_id', companyId).maybeSingle();
-            if (mapping?.phone_jid) jid = mapping.phone_jid; 
+            if (mapping?.phone_jid) {
+                jid = mapping.phone_jid;
+            } else {
+                // 2. Soft Resolution (Phone Match)
+                const purePhone = jid.split('@')[0].replace(/\D/g, '');
+                const { data: contact } = await supabase.from('contacts')
+                    .select('jid')
+                    .eq('company_id', companyId)
+                    .eq('phone', purePhone)
+                    .like('jid', '%@s.whatsapp.net')
+                    .maybeSingle();
+                
+                if (contact?.jid) {
+                    jid = contact.jid;
+                    // Aproveita e salva no mapa para a próxima
+                    supabase.rpc('link_identities', { p_lid: unwrapped.key.remoteJid, p_phone: jid, p_company_id: companyId }).then(() => {});
+                }
+            }
         }
 
         // --- CORREÇÃO CRÍTICA: GARANTIA DE CONTATO ---
