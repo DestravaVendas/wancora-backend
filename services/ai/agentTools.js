@@ -102,14 +102,22 @@ export const sendFile = async (companyId, remoteJid, googleId) => {
  */
 export const scheduleMeeting = async (companyId, leadId, title, dateISO, description, userId) => {
     try {
+        // 🛡️ [FIX] Sanitização de Data para evitar RangeError: Invalid time value
+        const cleanDate = dateISO.includes('T') ? dateISO : dateISO.replace(' ', 'T');
+        const startDate = new Date(cleanDate);
+        
+        if (isNaN(startDate.getTime())) {
+            throw new Error(`Data inválida recebida: ${dateISO}`);
+        }
+
         const { data, error } = await supabase.from('appointments').insert({
             company_id: companyId,
             user_id: userId, // Dono do lead ou admin
             lead_id: leadId,
             title: title || 'Reunião Agendada via IA',
             description: description || 'Agendamento automático.',
-            start_time: dateISO,
-            end_time: new Date(new Date(dateISO).getTime() + 30 * 60000).toISOString(), // Padrão 30min
+            start_time: startDate.toISOString(),
+            end_time: new Date(startDate.getTime() + 30 * 60000).toISOString(), // Padrão 30min
             status: 'confirmed',
             is_task: false,
             origin: 'ai_agent'
@@ -176,10 +184,18 @@ export const handoffAndReport = async (companyId, leadId, remoteJid, summary, re
  */
 export const checkAvailability = async (companyId, dateISO) => {
     try {
-        const startOfDay = new Date(dateISO);
+        // 🛡️ [FIX] Sanitização de Data
+        const cleanDate = dateISO.includes('T') ? dateISO : dateISO.replace(' ', 'T');
+        const baseDate = new Date(cleanDate);
+        
+        if (isNaN(baseDate.getTime())) {
+            throw new Error(`Data inválida para consulta: ${dateISO}`);
+        }
+
+        const startOfDay = new Date(baseDate);
         startOfDay.setHours(0, 0, 0, 0);
         
-        const endOfDay = new Date(dateISO);
+        const endOfDay = new Date(baseDate);
         endOfDay.setHours(23, 59, 59, 999);
 
         const { data, error } = await supabase
