@@ -252,11 +252,35 @@ const _internalProcessAI = async (messageData) => {
     }
 
     if (!lead) {
-        console.log("   ❌ Bloqueio: Lead não existe no banco.");
-        return;
+        console.log(`   🆕 [SENTINEL] Lead não encontrado para ${phone}. Criando automaticamente...`);
+        
+        // Busca o estágio inicial do funil
+        const { data: stage } = await supabase.from('pipeline_stages')
+            .select('id')
+            .eq('company_id', company_id)
+            .order('position', { ascending: true })
+            .limit(1)
+            .maybeSingle();
+
+        const { data: newLead, error: createError } = await supabase.from('leads').insert({
+            company_id: company_id,
+            phone: phone,
+            name: `Novo Lead (${phone})`,
+            status: 'new',
+            bot_status: 'active',
+            pipeline_stage_id: stage?.id,
+            position: Date.now()
+        }).select('id, name, bot_status, owner_id, pipeline_stage_id').single();
+
+        if (createError) {
+            console.error(`   ❌ [SENTINEL] Erro ao criar lead automático:`, createError.message);
+            return;
+        }
+        lead = newLead;
     }
-    if (lead.bot_status !== 'active') {
-        console.log(`   ❌ Bloqueio: Status do bot é '${lead.bot_status}'.`);
+
+    if (lead.bot_status === 'off') {
+        console.log(`   ❌ Bloqueio: Status do bot é 'off'.`);
         return;
     }
 
@@ -380,10 +404,19 @@ const _internalProcessAI = async (messageData) => {
                     }
                 });
             } catch (err) {
-                if (err.message?.includes('503') && retryCount < 3) {
-                    const waitTime = Math.pow(2, retryCount) * 2000;
-                    console.warn(`   ⚠️ [GEMINI] Erro 503. Tentativa ${retryCount + 1}/3 em ${waitTime}ms...`);
+                const is503 = err.message?.includes('503') || err.status === 503;
+                
+                if (is503 && retryCount < 5) {
+                    const waitTime = Math.pow(2, retryCount) * 3000; // Aumentado para 3s base
+                    console.warn(`   ⚠️ [GEMINI] Erro 503 (Alta Demanda). Tentativa ${retryCount + 1}/5 em ${waitTime}ms...`);
                     await delay(waitTime);
+                    
+                    // Se estiver na 3ª tentativa e falhando, tenta trocar o modelo para o Flash Lite (mais leve)
+                    if (retryCount === 2 && activeModel === 'gemini-3-flash-preview') {
+                        console.warn(`   🔄 [GEMINI] Trocando para modelo de fallback (Flash Lite) devido à alta demanda.`);
+                        activeModel = 'gemini-3.1-flash-lite-preview';
+                    }
+
                     return generateWithRetry(currentContents, retryCount + 1);
                 }
                 throw err;
