@@ -53,8 +53,12 @@ export { normalizeJid };
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
-    if (cleanName.length < 1) return true;
+    if (cleanName.length < 2) return true; // Nomes de 1 letra são suspeitos
     if (/^[\d\s\+\-\(\)]*$/.test(cleanName)) return true; // Só números/símbolos
+    
+    // Se o nome contém "@lid", é um ID técnico, não um nome
+    if (cleanName.includes('@lid')) return true;
+
     if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true; // Nome igual telefone
     return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName); // Sem letras
 };
@@ -185,8 +189,8 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         // Auto-Healing: Se o nome atual é ruim e temos um pushName novo bom, usa ele
         if ((!finalName || isGenericName(finalName, purePhone)) && pushName && !isGenericName(pushName, purePhone)) {
             finalName = pushName;
-            // Persiste o novo nome descoberto no contato
-            await supabase.from('contacts').update({ push_name: pushName }).eq('jid', cleanJid).eq('company_id', companyId);
+            // Persiste o novo nome descoberto no contato apenas se for realmente melhor
+            await supabase.from('contacts').update({ push_name: pushName, updated_at: new Date() }).eq('jid', cleanJid).eq('company_id', companyId);
         }
 
         const { data: existing } = await safeSupabaseCall(() => 
