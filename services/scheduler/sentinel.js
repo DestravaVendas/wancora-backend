@@ -230,10 +230,26 @@ const _internalProcessAI = async (messageData) => {
     // 🛡️ Aumentamos a tranca para 60s, pois agora a IA vai "demorar" muito tempo agindo como humano
     setTimeout(() => processingLock.delete(lockKey), 60000);
 
-    const phone = remote_jid.split('@')[0];
+    const phone = remote_jid.split('@')[0].replace(/\D/g, '');
     console.log(`   🔍 Buscando Lead: ${phone}...`);
 
-    const { data: lead } = await supabase.from('leads').select('id, name, bot_status, owner_id, pipeline_stage_id').eq('company_id', company_id).ilike('phone', `%${phone}%`).maybeSingle();
+    // 🛡️ [SEGURANÇA] Busca exata para evitar match parcial de números (Ex: 123 matching 55123)
+    // Tentamos primeiro com o número completo (com DDI) e depois sem DDI se necessário
+    let { data: lead } = await supabase.from('leads')
+        .select('id, name, bot_status, owner_id, pipeline_stage_id')
+        .eq('company_id', company_id)
+        .eq('phone', phone)
+        .maybeSingle();
+
+    if (!lead && phone.startsWith('55')) {
+        const phoneWithoutDDI = phone.substring(2);
+        const { data: fallbackLead } = await supabase.from('leads')
+            .select('id, name, bot_status, owner_id, pipeline_stage_id')
+            .eq('company_id', company_id)
+            .eq('phone', phoneWithoutDDI)
+            .maybeSingle();
+        lead = fallbackLead;
+    }
 
     if (!lead) {
         console.log("   ❌ Bloqueio: Lead não existe no banco.");
@@ -347,20 +363,34 @@ const _internalProcessAI = async (messageData) => {
             toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }];
         }
 
-        // 🧠 NOVA IMPLEMENTAÇÃO SDK ESTÁVEL
+        // 🧠 NOVA IMPLEMENTAÇÃO SDK ESTÁVEL COM RETRY (503)
         let contents = [...chatHistory, { role: 'user', parts: [{ text: userMessage }] }];
         
         console.log(`   🧠 [GEMINI] Pensando (Model: ${activeModel})...`);
 
-        let result = await ai.models.generateContent({
-            model: activeModel,
-            contents,
-            config: {
-                systemInstruction,
-                tools: toolsConfig,
-                temperature: 0.5
+        const generateWithRetry = async (currentContents, retryCount = 0) => {
+            try {
+                return await ai.models.generateContent({
+                    model: activeModel,
+                    contents: currentContents,
+                    config: {
+                        systemInstruction,
+                        tools: toolsConfig,
+                        temperature: 0.5
+                    }
+                });
+            } catch (err) {
+                if (err.message?.includes('503') && retryCount < 3) {
+                    const waitTime = Math.pow(2, retryCount) * 2000;
+                    console.warn(`   ⚠️ [GEMINI] Erro 503. Tentativa ${retryCount + 1}/3 em ${waitTime}ms...`);
+                    await delay(waitTime);
+                    return generateWithRetry(currentContents, retryCount + 1);
+                }
+                throw err;
             }
-        });
+        };
+
+        let result = await generateWithRetry(contents);
 
         let response = result;
         let functionCalls = response.functionCalls;
@@ -413,15 +443,7 @@ const _internalProcessAI = async (messageData) => {
             // Adiciona os resultados das funções ao histórico
             contents.push({ role: 'user', parts: toolResults });
 
-            result = await ai.models.generateContent({
-                model: activeModel,
-                contents,
-                config: {
-                    systemInstruction,
-                    tools: toolsConfig,
-                    temperature: 0.5
-                }
-            });
+            result = await generateWithRetry(contents);
             response = result;
             functionCalls = response.functionCalls;
         }
