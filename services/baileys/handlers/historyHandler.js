@@ -64,10 +64,11 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 const jid = normalizeJid(c.id);
                 if (!jid || jid === 'status@broadcast') continue;
 
-                // Coleta mapeamentos LID -> Phone
-                if (c.lid) {
+                // Coleta mapeamentos LID -> Phone (Suporte a múltiplas variações de propriedade do Baileys)
+                const lid = c.lid || c.lidJid || c.externalId;
+                if (lid) {
                     identityPayload.push({
-                        lid_jid: normalizeJid(c.lid),
+                        lid_jid: normalizeJid(lid),
                         phone_jid: jid,
                         company_id: companyId,
                         created_at: new Date()
