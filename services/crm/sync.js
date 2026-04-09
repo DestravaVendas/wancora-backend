@@ -234,7 +234,6 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         } else {
             // Se não conseguimos resolver o LID para um telefone real, 
             // NÃO criamos o lead ainda para evitar duplicidade.
-            // O sistema aguardará o mapeamento de identidade do Baileys.
             console.log(`⚠️ [SYNC] Ignorando criação de lead para LID não resolvido: ${cleanJid}`);
             return null;
         }
