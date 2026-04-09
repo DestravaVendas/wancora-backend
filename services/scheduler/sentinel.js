@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI, Type } from "@google/genai";
 import { sendMessage, markMessageAsRead, sendReaction } from "../baileys/sender.js"; 
+import { resolveJid, ensureLeadExists } from "../crm/sync.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport, checkAvailability, searchFiles, sendFile } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
@@ -307,69 +308,40 @@ const _internalProcessAI = async (messageData) => {
     // 🛡️ Aumentamos a tranca para 60s, pois agora a IA vai "demorar" muito tempo agindo como humano
     setTimeout(() => processingLock.delete(lockKey), 60000);
 
-    // 🛡️ [FIX] Resolve LID para Phone JID antes de buscar o lead
-    let finalRemoteJid = remote_jid;
-    if (remote_jid.includes('@lid')) {
-        const { data: mapData } = await supabase
-            .from('identity_map')
-            .select('phone_jid')
-            .eq('lid_jid', remote_jid)
-            .eq('company_id', company_id)
-            .maybeSingle();
-        
-        if (mapData?.phone_jid) {
-            finalRemoteJid = mapData.phone_jid;
-            console.log(`   🔗 [SENTINEL] LID ${remote_jid} resolvido para ${finalRemoteJid}`);
-        }
+    // 🛡️ [FIX] Resolve LID para Phone JID centralizado antes de qualquer lógica
+    const finalRemoteJid = await resolveJid(remote_jid, company_id);
+    
+    if (finalRemoteJid !== remote_jid) {
+        console.log(`   🔗 [SENTINEL] LID ${remote_jid} resolvido para ${finalRemoteJid}`);
     }
 
     const phone = finalRemoteJid.split('@')[0].replace(/\D/g, '');
     console.log(`   🔍 Buscando Lead: ${phone}...`);
 
-    // 🛡️ [SEGURANÇA] Busca exata para evitar match parcial de números (Ex: 123 matching 55123)
-    // Tentamos primeiro com o número completo (com DDI) e depois sem DDI se necessário
+    // 🛡️ [SEGURANÇA] Busca exata para evitar match parcial de números
     let { data: lead } = await supabase.from('leads')
         .select('id, name, bot_status, owner_id, pipeline_stage_id')
         .eq('company_id', company_id)
         .eq('phone', phone)
         .maybeSingle();
 
-    if (!lead && phone.startsWith('55')) {
-        const phoneWithoutDDI = phone.substring(2);
-        const { data: fallbackLead } = await supabase.from('leads')
-            .select('id, name, bot_status, owner_id, pipeline_stage_id')
-            .eq('company_id', company_id)
-            .eq('phone', phoneWithoutDDI)
-            .maybeSingle();
-        lead = fallbackLead;
+    if (!lead) {
+        console.log(`   🆕 [SENTINEL] Lead não encontrado para ${phone}. Criando via ensureLeadExists...`);
+        const myJid = await getSessionId(company_id); // Fallback JID
+        const leadId = await ensureLeadExists(finalRemoteJid, company_id, `Novo Lead (${phone})`, myJid);
+        
+        if (leadId) {
+            const { data: createdLead } = await supabase.from('leads')
+                .select('id, name, bot_status, owner_id, pipeline_stage_id')
+                .eq('id', leadId)
+                .single();
+            lead = createdLead;
+        }
     }
 
     if (!lead) {
-        console.log(`   🆕 [SENTINEL] Lead não encontrado para ${phone}. Criando automaticamente...`);
-        
-        // Busca o estágio inicial do funil
-        const { data: stage } = await supabase.from('pipeline_stages')
-            .select('id')
-            .eq('company_id', company_id)
-            .order('position', { ascending: true })
-            .limit(1)
-            .maybeSingle();
-
-        const { data: newLead, error: createError } = await supabase.from('leads').insert({
-            company_id: company_id,
-            phone: phone,
-            name: `Novo Lead (${phone})`,
-            status: 'new',
-            bot_status: 'active',
-            pipeline_stage_id: stage?.id,
-            position: Date.now()
-        }).select('id, name, bot_status, owner_id, pipeline_stage_id').single();
-
-        if (createError) {
-            console.error(`   ❌ [SENTINEL] Erro ao criar lead automático:`, createError.message);
-            return;
-        }
-        lead = newLead;
+        console.error(`   ❌ [SENTINEL] Falha crítica ao obter/criar lead para ${phone}`);
+        return;
     }
 
     if (lead.bot_status === 'off') {
