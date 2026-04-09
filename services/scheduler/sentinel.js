@@ -21,6 +21,53 @@ const aiInstances = new Map();
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
 
+/**
+ * 🛡️ [NOVO] Marca a mensagem como processada pela IA no banco
+ */
+const markAsProcessed = async (whatsappId, companyId, error = null) => {
+    try {
+        await supabase.from('messages')
+            .update({ 
+                ai_processed: true, 
+                ai_error: error 
+            })
+            .eq('whatsapp_id', whatsappId)
+            .eq('company_id', companyId);
+    } catch (e) {
+        console.error(`❌ [SENTINEL] Erro ao marcar processamento:`, e.message);
+    }
+};
+
+/**
+ * 🤖 [RECOVERY BOT] Busca mensagens pendentes de resposta (offline ou erro)
+ */
+export const recoverPendingMessages = async (companyId = null) => {
+    console.log(`🤖 [RECOVERY] Iniciando varredura de mensagens pendentes...`);
+    try {
+        let query = supabase.from('messages')
+            .select('*')
+            .eq('from_me', false)
+            .eq('ai_processed', false)
+            .order('created_at', { ascending: true });
+
+        if (companyId) query = query.eq('company_id', companyId);
+
+        const { data: pending } = await query;
+
+        if (pending && pending.length > 0) {
+            console.log(`   🔎 Encontradas ${pending.length} mensagens pendentes.`);
+            for (const msg of pending) {
+                // Re-emite para o barramento de IA processar
+                aiBus.emit('new_message_arrived', msg);
+                // Pequeno delay para não sobrecarregar a fila
+                await delay(500);
+            }
+        }
+    } catch (e) {
+        console.error(`❌ [RECOVERY] Erro na recuperação:`, e.message);
+    }
+};
+
 // --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL - COMPLETO) ---
 const ALL_TOOLS = [
     {
@@ -211,8 +258,16 @@ const processAIResponse = async (messageData) => {
         const nextTask = currentLock.then(async () => {
             try {
                 await _internalProcessAI(consolidatedData);
+                // Marca todas as mensagens do buffer como processadas
+                for (const m of finalMessages) {
+                    await markAsProcessed(m.whatsapp_id, m.company_id);
+                }
             } catch (e) {
                 console.error(`❌ [SENTINEL] Erro na fila de ${remote_jid}:`, e.message);
+                // Marca com erro para auditoria
+                for (const m of finalMessages) {
+                    await markAsProcessed(m.whatsapp_id, m.company_id, e.message);
+                }
             }
         });
 
@@ -673,6 +728,11 @@ export const startSentinel = () => {
         // Removemos o timeout fixo de 2.5s pois agora usamos a lógica de Debounce/Acumulação de 6s dentro de processAIResponse
         processAIResponse(messageData).catch(e => console.error("Erro interno no Sentinel:", e));
     });
+
+    // 🤖 [RECOVERY] Varredura periódica a cada 10 minutos para garantir 100% de entrega
+    setInterval(() => {
+        recoverPendingMessages().catch(() => {});
+    }, 10 * 60 * 1000);
 
     console.log("🟢 [SENTINEL] IA Conectada na Memória RAM (Imune a quedas do Render e TIMED_OUT)!");
 };
