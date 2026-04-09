@@ -95,8 +95,8 @@ export const handleContactsUpsert = async (contacts, companyId) => {
                 }).then(() => {});
             }
 
-            if (jid.includes('@lid')) continue;
-
+            // [FIX] Não pula mais @lid, pois o upsertContact agora resolve o LID internamente
+            // se o mapa de identidade já existir.
             const bestName = c.name || c.notify || c.verifiedName;
             const isFromBook = !!c.name;
 
@@ -109,8 +109,9 @@ export const handleContactsUpsert = async (contacts, companyId) => {
         
         for (const c of contacts) {
             const jid = normalizeJid(c.id);
-            if (!jid || jid.includes('@lid')) continue;
+            if (!jid) continue;
 
+            // [FIX] Permitimos @lid no bulk, o upsertContactsBulk tratará de normalizar
             const isFromBook = !!c.name;
             const bestName = c.name || c.notify || c.verifiedName;
             
