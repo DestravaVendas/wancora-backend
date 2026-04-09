@@ -1,6 +1,6 @@
 import { getContentType, normalizeJid, unwrapMessage, getBody } from '../../../utils/wppParsers.js';
 import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
-import { upsertMessage, ensureLeadExists, upsertContact } from '../../crm/sync.js';
+import { upsertMessage, ensureLeadExists, upsertContact, resolveJid } from '../../crm/sync.js';
 import { handleMediaUpload } from './mediaHandler.js';
 import { refreshContactInfo } from './contactHandler.js'; 
 import { dispatchWebhook } from '../../integrations/webhook.js';
@@ -54,6 +54,11 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         let jid = normalizeJid(unwrapped.key.remoteJid);
         
+        // 🛡️ [FIX] Resolve LID para Phone JID centralizado
+        if (jid.includes('@lid')) {
+            jid = await resolveJid(jid, companyId);
+        }
+
         // [REFINE] Block Official WhatsApp Messages
         if (jid === '0@s.whatsapp.net') return;
 
@@ -81,36 +86,6 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         
         // Permite sticker passar mesmo sem body
         if (!body && !isMedia && type !== 'stickerMessage') return;
-
-        // LID RESOLVER (Hard & Soft)
-        if (jid.includes('@lid')) {
-            // 1. Hard Resolution (Identity Map)
-            const { data: mapping } = await supabase.from('identity_map').select('phone_jid').eq('lid_jid', jid).eq('company_id', companyId).maybeSingle();
-            if (mapping?.phone_jid) {
-                jid = mapping.phone_jid;
-            } else {
-                // 2. Soft Resolution (Phone Match)
-                const purePhone = jid.split('@')[0].replace(/\D/g, '');
-                const { data: contact } = await supabase.from('contacts')
-                    .select('jid')
-                    .eq('company_id', companyId)
-                    .eq('phone', purePhone)
-                    .like('jid', '%@s.whatsapp.net')
-                    .maybeSingle();
-                
-                if (contact?.jid) {
-                    const resolvedJid = contact.jid;
-                    const lidPhone = unwrapped.key.remoteJid.split('@')[0].replace(/\D/g, '');
-                    const resolvedPhone = resolvedJid.split('@')[0].replace(/\D/g, '');
-
-                    if (lidPhone === resolvedPhone) {
-                        jid = resolvedJid;
-                        // Aproveita e salva no mapa para a próxima
-                        supabase.rpc('link_identities', { p_lid: unwrapped.key.remoteJid, p_phone: jid, p_company_id: companyId }).then(() => {});
-                    }
-                }
-            }
-        }
 
         // --- CORREÇÃO CRÍTICA: GARANTIA DE CONTATO ---
         if (!fromMe && !isGroup) {
