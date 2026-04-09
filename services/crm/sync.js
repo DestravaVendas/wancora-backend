@@ -246,16 +246,14 @@ export const upsertMessage = async (msgData) => {
 
             // 2. [GARANTIA] Upsert do Contato para garantir que apareça na Inbox
             // O gatilho de banco 'trigger_update_chat_stats' cuidará do unread_count e last_message_at
-            // Mas aqui garantimos que o registro do contato exista.
-            if (!msgData.from_me) {
-                const phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
-                await supabase.from('contacts').upsert({
-                    jid: cleanRemoteJid,
-                    company_id: msgData.company_id,
-                    phone: phone,
-                    last_message_at: msgData.created_at || new Date()
-                }, { onConflict: 'jid, company_id' });
-            }
+            // Mas aqui garantimos que o registro do contato exista, independente de quem enviou.
+            const phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
+            await supabase.from('contacts').upsert({
+                jid: cleanRemoteJid,
+                company_id: msgData.company_id,
+                phone: phone,
+                last_message_at: msgData.created_at || new Date()
+            }, { onConflict: 'jid, company_id' });
         });
     } catch (e) {
         console.error(`❌ [SYNC] Erro upsertMessage:`, e.message);
