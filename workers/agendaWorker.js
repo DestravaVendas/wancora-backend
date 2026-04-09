@@ -171,14 +171,33 @@ const processReminders = async () => {
                      for (const r of recipients) {
                          const phone = cleanPhone(r.phone);
                          if(phone) {
+                             // 🛡️ [FIX] Resolve JID se o telefone for um LID
+                             let targetJid = `${phone}@s.whatsapp.net`;
+                             if (phone.length > 13) {
+                                 // Pode ser um LID. Tenta resolver via identity_map
+                                 const { data: mapData } = await supabase
+                                     .from('identity_map')
+                                     .select('phone_jid')
+                                     .eq('lid_jid', `${phone}@lid`)
+                                     .eq('company_id', app.company_id)
+                                     .maybeSingle();
+                                 
+                                 if (mapData?.phone_jid) {
+                                     targetJid = mapData.phone_jid;
+                                 } else {
+                                     // Se não resolveu, tenta enviar como @lid se parecer um LID
+                                     targetJid = `${phone}@lid`;
+                                 }
+                             }
+
                              const msg = formatMessage(leadTrigger.template, app, ruleData, r.name, r.phone);
                              await sendMessage({ 
                                  sessionId, 
-                                 to: `${phone}@s.whatsapp.net`, 
+                                 to: targetJid, 
                                  type: 'text', 
                                  content: msg, 
                                  companyId: app.company_id 
-                             }).catch(e => console.error(`[Agenda] Falha envio para ${phone}:`, e.message));
+                             }).catch(e => console.error(`[Agenda] Falha envio para ${targetJid}:`, e.message));
                          }
                      }
                 }
@@ -188,16 +207,33 @@ const processReminders = async () => {
                 if (adminTrigger && config.admin_phone) {
                     const adminPhone = cleanPhone(config.admin_phone);
                     if (adminPhone) {
+                        // 🛡️ [FIX] Resolve JID se o telefone do admin for um LID
+                        let adminJid = `${adminPhone}@s.whatsapp.net`;
+                        if (adminPhone.length > 13) {
+                            const { data: mapData } = await supabase
+                                .from('identity_map')
+                                .select('phone_jid')
+                                .eq('lid_jid', `${adminPhone}@lid`)
+                                .eq('company_id', app.company_id)
+                                .maybeSingle();
+                            
+                            if (mapData?.phone_jid) {
+                                adminJid = mapData.phone_jid;
+                            } else {
+                                adminJid = `${adminPhone}@lid`;
+                            }
+                        }
+
                         const mainLeadName = app.leads?.name || recipients[0]?.name || 'Cliente';
                         const msg = formatMessage(adminTrigger.template, app, ruleData, mainLeadName, app.leads?.phone || '');
                         
                         await sendMessage({ 
                             sessionId, 
-                            to: `${adminPhone}@s.whatsapp.net`, 
+                            to: adminJid, 
                             type: 'text', 
                             content: msg, 
                             companyId: app.company_id 
-                        }).catch(e => console.error(`[Agenda] Falha envio admin:`, e.message));
+                        }).catch(e => console.error(`[Agenda] Falha envio admin para ${adminJid}:`, e.message));
                     }
                 }
 
@@ -286,12 +322,29 @@ const processReminders = async () => {
                             const leadPhone = cleanPhone(r.phone);
                             if (!leadPhone) continue;
 
+                            // 🛡️ [FIX] Resolve JID se o telefone for um LID
+                            let targetJid = `${leadPhone}@s.whatsapp.net`;
+                            if (leadPhone.length > 13) {
+                                const { data: mapData } = await supabase
+                                    .from('identity_map')
+                                    .select('phone_jid')
+                                    .eq('lid_jid', `${leadPhone}@lid`)
+                                    .eq('company_id', app.company_id)
+                                    .maybeSingle();
+                                
+                                if (mapData?.phone_jid) {
+                                    targetJid = mapData.phone_jid;
+                                } else {
+                                    targetJid = `${leadPhone}@lid`;
+                                }
+                            }
+
                             const msg = formatMessage(rule.template, app, ruleData, r.name, r.phone);
                             
                             try {
                                 await sendMessage({
                                     sessionId,
-                                    to: `${leadPhone}@s.whatsapp.net`,
+                                    to: targetJid,
                                     type: 'text',
                                     content: msg,
                                     companyId: app.company_id
@@ -299,7 +352,7 @@ const processReminders = async () => {
                                 // 🛡️ Pequena pausa entre lembretes do mesmo minuto para não "metralhar" a fila
                                 await new Promise(res => setTimeout(res, Math.random() * 2000 + 1000));
                             } catch (sendError) {
-                                console.error(`❌ [Agenda] Falha envio lembrete ${leadPhone}:`, sendError.message);
+                                console.error(`❌ [Agenda] Falha envio lembrete para ${targetJid}:`, sendError.message);
                             }
                         }
 
