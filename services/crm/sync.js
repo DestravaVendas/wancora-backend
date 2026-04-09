@@ -301,23 +301,27 @@ export const upsertMessage = async (msgData) => {
         
         // 🛡️ [FIX] Resolve LID antes de salvar a mensagem para unificar o chat
         let cleanRemoteJid = normalizeJid(msgData.remote_jid);
+        let phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
+
         if (cleanRemoteJid.includes('@lid')) {
             const resolved = await resolveJid(cleanRemoteJid, msgData.company_id);
             if (resolved && !resolved.includes('@lid')) {
                 cleanRemoteJid = resolved;
+                phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
             }
         }
 
-        const finalData = { ...msgData, remote_jid: cleanRemoteJid };
+        const finalData = { 
+            ...msgData, 
+            remote_jid: cleanRemoteJid,
+            phone: phone // 📱 [NOVO] Salva o telefone para unificação no Frontend
+        };
 
         await safeSupabaseCall(async () => {
             // 1. Upsert da Mensagem
             await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
 
             // 2. [GARANTIA] Upsert do Contato para garantir que apareça na Inbox
-            // O gatilho de banco 'trigger_update_chat_stats' cuidará do unread_count e last_message_at
-            // Mas aqui garantimos que o registro do contato exista, independente de quem enviou.
-            const phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
             await supabase.from('contacts').upsert({
                 jid: cleanRemoteJid,
                 company_id: msgData.company_id,
