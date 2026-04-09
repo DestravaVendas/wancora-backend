@@ -80,6 +80,28 @@ const ALL_TOOLS = [
             },
             required: ["title", "dateISO"]
         }
+    },
+    {
+        name: "react_to_message",
+        description: "Reage à última mensagem do cliente com um emoji para parecer mais humano (ex: risada, coração, joinha). Use com moderação.",
+        parameters: {
+            type: Type.OBJECT,
+            properties: {
+                emoji: { type: Type.STRING, description: "O emoji da reação (ex: 😂, ❤️, 👍)." }
+            },
+            required: ["emoji"]
+        }
+    },
+    {
+        name: "send_sticker",
+        description: "Envia uma figurinha (sticker) divertida ou temática para o cliente.",
+        parameters: {
+            type: Type.OBJECT,
+            properties: {
+                url: { type: Type.STRING, description: "URL da imagem para converter em figurinha." }
+            },
+            required: ["url"]
+        }
     }
 ];
 
@@ -451,6 +473,25 @@ const _internalProcessAI = async (messageData) => {
                         // 🛡️ [FIX] Mapeia 'date' ou 'dateISO' para a função
                         const dateArg = call.args.dateISO || call.args.date;
                         output = await checkAvailability(company_id, dateArg);
+                    }
+                    else if (call.name === 'react_to_message') {
+                        const sessionId = await getSessionId(company_id);
+                        if (sessionId) {
+                            await sendReaction(sessionId, company_id, remote_jid, message.id, call.args.emoji);
+                            output = { success: true, message: `Reagido com ${call.args.emoji}` };
+                        }
+                    }
+                    else if (call.name === 'send_sticker') {
+                        const sessionId = await getSessionId(company_id);
+                        if (sessionId) {
+                            await sendMessage({
+                                sessionId,
+                                to: remote_jid,
+                                type: 'sticker',
+                                url: call.args.url
+                            });
+                            output = { success: true, message: "Figurinha enviada." };
+                        }
                     }
                     else if (call.name === 'schedule_meeting') {
                         // 🛡️ [FIX] Mapeia 'time' e 'date' se a IA enviar separado, ou usa 'dateISO'
