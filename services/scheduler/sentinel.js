@@ -252,7 +252,23 @@ const _internalProcessAI = async (messageData) => {
     // 🛡️ Aumentamos a tranca para 60s, pois agora a IA vai "demorar" muito tempo agindo como humano
     setTimeout(() => processingLock.delete(lockKey), 60000);
 
-    const phone = remote_jid.split('@')[0].replace(/\D/g, '');
+    // 🛡️ [FIX] Resolve LID para Phone JID antes de buscar o lead
+    let finalRemoteJid = remote_jid;
+    if (remote_jid.includes('@lid')) {
+        const { data: mapData } = await supabase
+            .from('identity_map')
+            .select('phone_jid')
+            .eq('lid_jid', remote_jid)
+            .eq('company_id', company_id)
+            .maybeSingle();
+        
+        if (mapData?.phone_jid) {
+            finalRemoteJid = mapData.phone_jid;
+            console.log(`   🔗 [SENTINEL] LID ${remote_jid} resolvido para ${finalRemoteJid}`);
+        }
+    }
+
+    const phone = finalRemoteJid.split('@')[0].replace(/\D/g, '');
     console.log(`   🔍 Buscando Lead: ${phone}...`);
 
     // 🛡️ [SEGURANÇA] Busca exata para evitar match parcial de números (Ex: 123 matching 55123)
