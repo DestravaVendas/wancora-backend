@@ -53,14 +53,35 @@ export { normalizeJid };
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
-    if (cleanName.length < 2) return true; // Nomes de 1 letra são suspeitos
-    if (/^[\d\s\+\-\(\)]*$/.test(cleanName)) return true; // Só números/símbolos
+    if (cleanName.length < 2) return true; 
+    if (/^[\d\s\+\-\(\)]*$/.test(cleanName)) return true; 
     
-    // Se o nome contém "@lid", é um ID técnico, não um nome
+    // Se o nome contém "@lid" ou é apenas um número longo (LID), é técnico
     if (cleanName.includes('@lid')) return true;
+    if (cleanName.length > 13 && /^\d+$/.test(cleanName)) return true;
 
-    if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true; // Nome igual telefone
-    return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName); // Sem letras
+    if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true; 
+    return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName); 
+};
+
+/**
+ * 🛡️ [NOVO] Resolve JID LID para JID de Telefone usando o mapa de identidade
+ */
+const resolveJid = async (jid, companyId) => {
+    if (!jid || !jid.includes('@lid')) return normalizeJid(jid);
+
+    try {
+        const { data } = await supabase
+            .from('identity_map')
+            .select('phone_jid')
+            .eq('lid_jid', normalizeJid(jid))
+            .eq('company_id', companyId)
+            .maybeSingle();
+
+        return data?.phone_jid ? normalizeJid(data.phone_jid) : normalizeJid(jid);
+    } catch (e) {
+        return normalizeJid(jid);
+    }
 };
 
 export const updateInstanceStatus = async (sessionId, companyId, data) => {
@@ -87,13 +108,22 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
 export const upsertContactsBulk = async (contactsArray) => {
     if (!contactsArray || contactsArray.length === 0) return;
     
-    const validContacts = contactsArray
-        .filter(c => c.jid && c.company_id)
-        .map(c => {
-            const cleanJid = normalizeJid(c.jid);
-            const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
-            return { ...c, jid: cleanJid, phone: purePhone };
-        });
+    const validContacts = [];
+    for (const c of contactsArray) {
+        if (!c.jid || !c.company_id) continue;
+        
+        let cleanJid = normalizeJid(c.jid);
+        // Tenta resolver LID se for o caso
+        if (cleanJid.includes('@lid')) {
+            const resolved = await resolveJid(cleanJid, c.company_id);
+            if (resolved && !resolved.includes('@lid')) {
+                cleanJid = resolved;
+            }
+        }
+
+        const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
+        validContacts.push({ ...c, jid: cleanJid, phone: purePhone });
+    }
 
     if (validContacts.length === 0) return;
 
@@ -115,7 +145,15 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
     try {
         if (!jid || !companyId || jid.includes('status@broadcast') || jid.includes('@newsletter')) return;
 
-        const cleanJid = normalizeJid(jid);
+        // 🛡️ [FIX] Resolve LID antes de salvar
+        let cleanJid = normalizeJid(jid);
+        if (cleanJid.includes('@lid')) {
+            const resolved = await resolveJid(cleanJid, companyId);
+            if (resolved && !resolved.includes('@lid')) {
+                cleanJid = resolved;
+            }
+        }
+
         const purePhone = cleanJid.split('@')[0].replace(/\D/g, ''); 
         
         const updateData = { jid: cleanJid, phone: purePhone, company_id: companyId, updated_at: new Date(), ...extraData };
@@ -237,7 +275,16 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 export const upsertMessage = async (msgData) => {
     try {
         if (msgData.remote_jid.includes('status@broadcast')) return;
-        const cleanRemoteJid = normalizeJid(msgData.remote_jid);
+        
+        // 🛡️ [FIX] Resolve LID antes de salvar a mensagem para unificar o chat
+        let cleanRemoteJid = normalizeJid(msgData.remote_jid);
+        if (cleanRemoteJid.includes('@lid')) {
+            const resolved = await resolveJid(cleanRemoteJid, msgData.company_id);
+            if (resolved && !resolved.includes('@lid')) {
+                cleanRemoteJid = resolved;
+            }
+        }
+
         const finalData = { ...msgData, remote_jid: cleanRemoteJid };
 
         await safeSupabaseCall(async () => {
