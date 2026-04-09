@@ -43,6 +43,25 @@ export const executeLocked = async (sessionId, task) => {
     return nextTask;
 };
 
+// 🛡️ NOVO: Função para enviar reações (Emojis)
+export const sendReaction = async (sessionId, companyId, jid, messageId, emoji) => {
+    return executeLocked(sessionId, async () => {
+        const session = sessions.get(sessionId);
+        if (!session || !session.sock) return;
+
+        await session.sock.sendMessage(jid, {
+            react: {
+                text: emoji,
+                key: {
+                    remoteJid: jid,
+                    id: messageId,
+                    fromMe: false // Reage à mensagem do cliente
+                }
+            }
+        });
+    });
+};
+
 // 🛡️ NOVO: Função para forçar a visualização (visto azul) antes de responder
 export const markMessageAsRead = async (sessionId, jid, messageId) => {
     return executeLocked(sessionId, async () => {
@@ -231,11 +250,11 @@ export const sendMessage = async ({
                     break;
 
                 case 'image':
-                    sentMsg = await sock.sendMessage(jid, { image: url, caption: caption });
+                    sentMsg = await sock.sendMessage(jid, { image: { url: url }, caption: caption });
                     break;
 
                 case 'video':
-                    sentMsg = await sock.sendMessage(jid, { video: url, caption: caption, gifPlayback: false });
+                    sentMsg = await sock.sendMessage(jid, { video: { url: url }, caption: caption, gifPlayback: false });
                     break;
 
                 case 'audio':
@@ -259,15 +278,15 @@ export const sendMessage = async ({
                                 });
                             }
                         } catch (conversionError) {
-                            sentMsg = await sock.sendMessage(jid, { audio: { url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
+                            sentMsg = await sock.sendMessage(jid, { audio: { url: url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
                         }
                     } else {
-                        sentMsg = await sock.sendMessage(jid, { audio: url, ptt: false, mimetype: mimetype || 'audio/mp4' });
+                        sentMsg = await sock.sendMessage(jid, { audio: { url: url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
                     }
                     break;
 
                 case 'document':
-                    sentMsg = await sock.sendMessage(jid, { document: url, mimetype: mimetype || 'application/pdf', fileName: fileName || 'documento', caption: caption });
+                    sentMsg = await sock.sendMessage(jid, { document: { url: url }, mimetype: mimetype || 'application/pdf', fileName: fileName || 'documento', caption: caption });
                     break;
 
                 case 'sticker':
