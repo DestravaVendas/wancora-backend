@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI, Type } from "@google/genai";
-import { sendMessage, markMessageAsRead } from "../baileys/sender.js"; 
+import { sendMessage, markMessageAsRead, sendReaction } from "../baileys/sender.js"; 
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport, checkAvailability, searchFiles, sendFile } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
@@ -548,7 +548,7 @@ const _internalProcessAI = async (messageData) => {
                     else if (call.name === 'react_to_message') {
                         const sessionId = await getSessionId(company_id);
                         if (sessionId) {
-                            await sendReaction(sessionId, company_id, remote_jid, message.id, call.args.emoji);
+                            await sendReaction(sessionId, company_id, remote_jid, id, call.args.emoji);
                             output = { success: true, message: `Reagido com ${call.args.emoji}` };
                         }
                     }
