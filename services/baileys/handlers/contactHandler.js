@@ -88,15 +88,14 @@ export const handleContactsUpsert = async (contacts, companyId) => {
             if (!jid) continue;
 
             if (c.lid) {
-                supabase.rpc('link_identities', {
+                await supabase.rpc('link_identities', {
                     p_lid: normalizeJid(c.lid),
                     p_phone: jid,
                     p_company_id: companyId
-                }).then(() => {});
+                });
             }
 
             // [FIX] Não pula mais @lid, pois o upsertContact agora resolve o LID internamente
-            // se o mapa de identidade já existir.
             const bestName = c.name || c.notify || c.verifiedName;
             const isFromBook = !!c.name;
 
@@ -106,12 +105,22 @@ export const handleContactsUpsert = async (contacts, companyId) => {
     } else {
         // BULK PROCESSING PARA A LISTA COMPLETA
         const bulkPayload = [];
+        const identityPayload = [];
         
         for (const c of contacts) {
             const jid = normalizeJid(c.id);
             if (!jid) continue;
 
-            // [FIX] Permitimos @lid no bulk, o upsertContactsBulk tratará de normalizar
+            // Coleta mapeamentos LID -> Phone
+            if (c.lid) {
+                identityPayload.push({
+                    lid_jid: normalizeJid(c.lid),
+                    phone_jid: jid,
+                    company_id: companyId,
+                    created_at: new Date()
+                });
+            }
+
             const isFromBook = !!c.name;
             const bestName = c.name || c.notify || c.verifiedName;
             
@@ -136,6 +145,15 @@ export const handleContactsUpsert = async (contacts, companyId) => {
             bulkPayload.push(contactData);
         }
 
+        // 1. Primeiro salva os mapeamentos de identidade (Crucial para o resolveJid funcionar no bulk de contatos)
+        if (identityPayload.length > 0) {
+            const ID_CHUNK = 500;
+            for (let i = 0; i < identityPayload.length; i += ID_CHUNK) {
+                await supabase.from('identity_map').upsert(identityPayload.slice(i, i + ID_CHUNK), { onConflict: 'lid_jid, company_id' });
+            }
+        }
+
+        // 2. Depois salva os contatos
         const CHUNK_SIZE = 500;
         for (let i = 0; i < bulkPayload.length; i += CHUNK_SIZE) {
             await upsertContactsBulk(bulkPayload.slice(i, i + CHUNK_SIZE));
