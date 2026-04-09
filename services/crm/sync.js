@@ -68,7 +68,7 @@ const isGenericName = (name, phone) => {
  * 🛡️ [NOVO] Resolve JID LID para JID de Telefone usando o mapa de identidade
  * Fallback: Se não houver no mapa, tenta buscar um contato com o mesmo número de telefone
  */
-const resolveJid = async (jid, companyId) => {
+export const resolveJid = async (jid, companyId) => {
     if (!jid || !jid.includes('@lid')) return normalizeJid(jid);
 
     const cleanLid = normalizeJid(jid);
