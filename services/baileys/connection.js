@@ -10,6 +10,7 @@ import makeWASocket, {
 import { useSupabaseAuthState, clearSessionCache } from '../../auth/supabaseAuth.js';
 import { setupListeners } from './listener.js';
 import { deleteSessionData, updateInstanceStatus, normalizeJid } from '../crm/sync.js';
+import { recoverPendingMessages } from '../scheduler/sentinel.js'; // 🤖 [NOVO] Importa o Bot de Recuperação
 import { createClient } from "@supabase/supabase-js";
 import getRedisClient from '../redisClient.js'; 
 import pino from 'pino';
@@ -31,27 +32,43 @@ const logger = pino({ level: 'fatal' });
 // 🛡️ [LOCK] Funções de Gerenciamento de Travas de Sessão (Evita Duplicidade)
 const acquireLock = async (sessionId) => {
     const redis = getRedisClient();
-    if (!redis) return true; // Se não tem redis, ignora (risco de duplicidade)
+    if (!redis) return true; 
     const lockKey = `lock:session:${sessionId}`;
-    // Tenta adquirir a trava por 45 segundos usando o PID do processo como valor
-    const acquired = await redis.set(lockKey, process.pid, 'NX', 'PX', 45000);
-    return acquired === 'OK';
+    
+    // Tenta adquirir a trava por 60 segundos
+    // Usamos o PID + um timestamp para garantir unicidade mesmo se o PID repetir
+    const lockValue = `${process.pid}-${Date.now()}`;
+    const acquired = await redis.set(lockKey, lockValue, 'NX', 'PX', 60000);
+    
+    if (acquired === 'OK') {
+        process.env[`LOCK_VAL_${sessionId}`] = lockValue;
+        return true;
+    }
+    return false;
 };
 
 const renewLock = async (sessionId) => {
     const redis = getRedisClient();
     if (!redis) return;
     const lockKey = `lock:session:${sessionId}`;
-    await redis.pexpire(lockKey, 45000);
+    const myVal = process.env[`LOCK_VAL_${sessionId}`];
+    
+    const current = await redis.get(lockKey);
+    if (current === myVal) {
+        await redis.pexpire(lockKey, 60000);
+    }
 };
 
 const releaseLock = async (sessionId) => {
     const redis = getRedisClient();
     if (!redis) return;
     const lockKey = `lock:session:${sessionId}`;
+    const myVal = process.env[`LOCK_VAL_${sessionId}`];
+    
     const current = await redis.get(lockKey);
-    if (current == process.pid) {
+    if (current === myVal) {
         await redis.del(lockKey);
+        delete process.env[`LOCK_VAL_${sessionId}`];
     }
 };
 
@@ -331,18 +348,14 @@ export const startSession = async (sessionId, companyId) => {
 
                 if (isConflict) {
                      // Adiciona um jitter significativo para evitar que as duas sessões reconectem sincronizadas
-                     // Se for 515 (Stream Errored), o jitter pode ser menor pois geralmente é erro de rede, não conflito real.
-                     const is515 = statusCode === 515;
-                     const jitter = is515 
-                        ? Math.floor(Math.random() * (10000 - 5000 + 1) + 5000) // 5-10s para 515
-                        : Math.floor(Math.random() * (30000 - 15000 + 1) + 15000); // 15-30s para conflito real
+                     const jitter = Math.floor(Math.random() * (45000 - 20000 + 1) + 20000); // 20-45s para conflito real
                      
                      Logger.warn('baileys', `Conflito/Erro de Stream (${statusCode}). Jitter: ${jitter}ms.`, { sessionId }, companyId);
                      
-                     // Mata esta instância para dar chance à outra (se for o caso)
-                     killSession(sessionId); 
+                     // Mata esta instância IMEDIATAMENTE e limpa locks
+                     await killSession(sessionId); 
                      
-                     // Tenta reconectar depois do jitter
+                     // Tenta reconectar depois do jitter longo
                      handleReconnect(sessionId, companyId, jitter); 
                      return;
                 }
@@ -363,6 +376,9 @@ export const startSession = async (sessionId, companyId) => {
                 console.log(`✅ [CONECTADO] Sessão ${sessionId} online!`);
                 retries.delete(sessionId); 
                 
+                // 🤖 [RECOVERY] Aciona o bot para responder mensagens que chegaram enquanto estava offline
+                recoverPendingMessages(companyId).catch(() => {});
+
                 const isBiz = await checkIsBusiness(sock);
                 
                 const { data: prev } = await supabase
