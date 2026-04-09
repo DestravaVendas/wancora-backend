@@ -6,6 +6,7 @@ import { convertAudioToOpus } from '../../utils/audioConverter.js';
 import { transcribeAudio } from '../../services/ai/transcriber.js';
 import { getFileBuffer } from '../../services/google/driveService.js';
 import { createClient } from "@supabase/supabase-js";
+import { resolveJid } from '../crm/sync.js'; // 🛡️ [NOVO] Importa o resolvedor de LID
 import sharp from 'sharp';
 import axios from 'axios';
 
@@ -117,7 +118,14 @@ export const sendMessage = async ({
 
         const sock = session.sock;
         let jid = normalizeJid(to);
-        // ... rest of the logic inside the task
+
+        // 🛡️ [FIX] Resolve LID antes de enviar para garantir que use o JID canônico se disponível
+        if (jid.includes('@lid')) {
+            const resolved = await resolveJid(jid, companyId);
+            if (resolved && !resolved.includes('@lid')) {
+                jid = resolved;
+            }
+        }
 
         try {
             // [ANTI-BAN] Verifica se a conexão ainda está ativa antes de simular comportamento
