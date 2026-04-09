@@ -83,19 +83,19 @@ export const resolveJid = async (jid, companyId) => {
 
         if (data?.phone_jid) return normalizeJid(data.phone_jid);
 
-        // 2. Soft Resolution (Phone Match fallback)
+        // 2. Soft Resolution (Check contacts table for existing JID with same phone)
         const purePhone = cleanLid.split('@')[0].replace(/\D/g, '');
         if (purePhone.length >= 8) {
+            // Busca se já existe um contato @s.whatsapp.net que tenha esse mesmo número (extraído do LID)
             const { data: contact } = await supabase.from('contacts')
                 .select('jid')
                 .eq('company_id', companyId)
                 .eq('phone', purePhone)
                 .like('jid', '%@s.whatsapp.net')
-                .limit(1)
                 .maybeSingle();
             
             if (contact?.jid) {
-                // Aproveita e salva no mapa para a próxima vez ser instantâneo
+                // Linka para futuras consultas
                 supabase.rpc('link_identities', { p_lid: cleanLid, p_phone: contact.jid, p_company_id: companyId }).then(() => {});
                 return normalizeJid(contact.jid);
             }
@@ -215,8 +215,22 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     if (!jid) return null;
     
-    const cleanJid = normalizeJid(jid);
+    // 🛡️ [FIX] Resolve LID antes de qualquer operação de Lead
+    let cleanJid = normalizeJid(jid);
     if (!cleanJid) return null;
+
+    if (cleanJid.includes('@lid')) {
+        const resolved = await resolveJid(cleanJid, companyId);
+        if (resolved && !resolved.includes('@lid')) {
+            cleanJid = resolved;
+        } else {
+            // Se não conseguimos resolver o LID para um telefone real, 
+            // NÃO criamos o lead ainda para evitar duplicidade.
+            // O sistema aguardará o mapeamento de identidade do Baileys.
+            console.log(`⚠️ [SYNC] Ignorando criação de lead para LID não resolvido: ${cleanJid}`);
+            return null;
+        }
+    }
 
     if (cleanJid.includes('@g.us') || cleanJid.includes('@newsletter') || cleanJid.includes('status@broadcast')) return null; 
     
