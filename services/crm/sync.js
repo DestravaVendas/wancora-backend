@@ -66,21 +66,44 @@ const isGenericName = (name, phone) => {
 
 /**
  * 🛡️ [NOVO] Resolve JID LID para JID de Telefone usando o mapa de identidade
+ * Fallback: Se não houver no mapa, tenta buscar um contato com o mesmo número de telefone
  */
 const resolveJid = async (jid, companyId) => {
     if (!jid || !jid.includes('@lid')) return normalizeJid(jid);
 
+    const cleanLid = normalizeJid(jid);
     try {
+        // 1. Hard Resolution (Identity Map)
         const { data } = await supabase
             .from('identity_map')
             .select('phone_jid')
-            .eq('lid_jid', normalizeJid(jid))
+            .eq('lid_jid', cleanLid)
             .eq('company_id', companyId)
             .maybeSingle();
 
-        return data?.phone_jid ? normalizeJid(data.phone_jid) : normalizeJid(jid);
+        if (data?.phone_jid) return normalizeJid(data.phone_jid);
+
+        // 2. Soft Resolution (Phone Match fallback)
+        const purePhone = cleanLid.split('@')[0].replace(/\D/g, '');
+        if (purePhone.length >= 8) {
+            const { data: contact } = await supabase.from('contacts')
+                .select('jid')
+                .eq('company_id', companyId)
+                .eq('phone', purePhone)
+                .like('jid', '%@s.whatsapp.net')
+                .limit(1)
+                .maybeSingle();
+            
+            if (contact?.jid) {
+                // Aproveita e salva no mapa para a próxima vez ser instantâneo
+                supabase.rpc('link_identities', { p_lid: cleanLid, p_phone: contact.jid, p_company_id: companyId }).then(() => {});
+                return normalizeJid(contact.jid);
+            }
+        }
+
+        return cleanLid;
     } catch (e) {
-        return normalizeJid(jid);
+        return cleanLid;
     }
 };
 
