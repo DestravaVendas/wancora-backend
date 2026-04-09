@@ -332,8 +332,8 @@ export const upsertMessage = async (msgData) => {
         };
 
         await safeSupabaseCall(async () => {
-            // 1. Upsert da Mensagem
-            await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
+            // 1. Upsert da Mensagem (Agora usando a restrição unificada por whatsapp_id)
+            await supabase.from('messages').upsert(finalData, { onConflict: 'company_id, whatsapp_id' });
 
             // 2. [GARANTIA] Upsert do Contato para garantir que apareça na Inbox
             await supabase.from('contacts').upsert({
