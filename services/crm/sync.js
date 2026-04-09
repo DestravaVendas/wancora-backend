@@ -83,10 +83,11 @@ export const resolveJid = async (jid, companyId) => {
 
         if (data?.phone_jid) return normalizeJid(data.phone_jid);
 
-        // 2. Soft Resolution (Check contacts table for existing JID with same phone)
+        // 2. Soft Resolution (Aprimorada)
+        // Se o LID contém o número de telefone (comum em migrações)
         const purePhone = cleanLid.split('@')[0].replace(/\D/g, '');
         if (purePhone.length >= 8) {
-            // Busca se já existe um contato @s.whatsapp.net que tenha esse mesmo número (extraído do LID)
+            // Busca se já existe um contato @s.whatsapp.net com esse número
             const { data: contact } = await supabase.from('contacts')
                 .select('jid')
                 .eq('company_id', companyId)
@@ -95,9 +96,16 @@ export const resolveJid = async (jid, companyId) => {
                 .maybeSingle();
             
             if (contact?.jid) {
-                // Linka para futuras consultas
-                supabase.rpc('link_identities', { p_lid: cleanLid, p_phone: contact.jid, p_company_id: companyId }).then(() => {});
-                return normalizeJid(contact.jid);
+                const phoneJid = normalizeJid(contact.jid);
+                // 🔥 CRÍTICO: Registra proativamente no identity_map
+                supabase.from('identity_map').upsert({
+                    lid_jid: cleanLid,
+                    phone_jid: phoneJid,
+                    company_id: companyId,
+                    created_at: new Date()
+                }, { onConflict: 'lid_jid, company_id' }).then(() => {});
+
+                return phoneJid;
             }
         }
 
