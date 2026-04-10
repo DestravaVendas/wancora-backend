@@ -85,6 +85,15 @@ export const resolveJid = async (jid, companyId) => {
 
         // 2. Soft Resolution (Check contacts table for existing JID with same phone)
         const purePhone = cleanLid.split('@')[0].replace(/\D/g, '');
+        
+        // Se o "número" no LID tiver cara de telefone (ex: 5511...)
+        if (purePhone.length >= 10 && !purePhone.startsWith('0')) {
+            const phoneJid = `${purePhone}@s.whatsapp.net`;
+            // Linka preventivamente se o número for válido
+            supabase.rpc('link_identities', { p_lid: cleanLid, p_phone: phoneJid, p_company_id: companyId }).then(() => {});
+            return phoneJid;
+        }
+
         if (purePhone.length >= 8) {
             // Busca se já existe um contato @s.whatsapp.net que tenha esse mesmo número (extraído do LID)
             const { data: contact } = await supabase.from('contacts')
@@ -336,6 +345,7 @@ export const upsertMessage = async (msgData) => {
             await supabase.from('messages').upsert(finalData, { onConflict: 'company_id, whatsapp_id' });
 
             // 2. [GARANTIA] Upsert do Contato para garantir que apareça na Inbox
+            // Se for from_me, o remote_jid é o destinatário. Se não, é o remetente.
             await supabase.from('contacts').upsert({
                 jid: cleanRemoteJid,
                 company_id: msgData.company_id,
