@@ -334,3 +334,29 @@ export const triggerAITest = async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 };
+
+// --- GESTÃO DE CONTATOS ---
+export const refreshContactPic = async (req, res) => {
+    const { jid, sessionId } = req.body;
+    
+    try {
+        const session = sessions.get(sessionId);
+        if (!session || !session.sock) {
+            return res.status(404).json({ error: "Sessão não encontrada ou desconectada" });
+        }
+
+        const normalizedJid = normalizeJid(jid);
+        const ppUrl = await session.sock.profilePictureUrl(normalizedJid, 'image');
+        
+        // Atualiza no banco de dados para persistência
+        await supabase
+            .from('contacts')
+            .update({ profile_pic_url: ppUrl })
+            .eq('jid', normalizedJid);
+
+        res.json({ success: true, profilePicUrl: ppUrl });
+    } catch (error) {
+        console.error("Erro refreshContactPic:", error);
+        res.status(500).json({ error: "Erro ao buscar foto de perfil no WhatsApp" });
+    }
+};
