@@ -361,9 +361,9 @@ export const refreshContactPic = async (req, res) => {
         }
 
         try {
-            // 🛡️ [FIX] Timeout real para evitar travamento do frontend se o Baileys demorar
+            // 🛡️ [FIX] Timeout real aumentado para 15s para dar tempo ao Baileys em conexões lentas
             const ppUrlPromise = session.sock.profilePictureUrl(normalizedJid, 'image');
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timed Out')), 10000));
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timed Out')), 15000));
             
             const ppUrl = await Promise.race([ppUrlPromise, timeoutPromise]);
             
@@ -371,14 +371,15 @@ export const refreshContactPic = async (req, res) => {
             await supabase
                 .from('contacts')
                 .update({ profile_pic_url: ppUrl, profile_pic_updated_at: new Date() })
-                .eq('jid', normalizedJid);
+                .eq('jid', normalizedJid)
+                .eq('company_id', session.companyId); // Segurança extra
 
-            res.json({ success: true, profilePicUrl: ppUrl });
+            return res.json({ success: true, profilePicUrl: ppUrl });
         } catch (picError) {
-            // Se der erro de autorização ou não encontrado, retorna sucesso mas com null
-            // para evitar que o frontend trave ou mostre erro 500
-            console.warn(`⚠️ [REFRESH PIC] Não autorizado ou sem foto para ${normalizedJid}:`, picError.message);
-            res.json({ success: true, profilePicUrl: null, message: "Foto não disponível ou privada" });
+            // Se der erro de autorização, timeout ou não encontrado, retorna sucesso mas com null
+            // para evitar que o frontend trave no spinner infinito
+            console.warn(`⚠️ [REFRESH PIC] Falha para ${normalizedJid}:`, picError.message);
+            return res.json({ success: true, profilePicUrl: null, message: "Foto não disponível ou privada" });
         }
     } catch (error) {
         console.error("Erro refreshContactPic:", error);
