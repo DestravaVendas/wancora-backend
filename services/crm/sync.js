@@ -49,6 +49,22 @@ const safeSupabaseCall = async (operation, retries = 3) => {
 
 export { normalizeJid };
 
+// 🛡️ [NOVO] Resolvedor de Identidade (LID -> Phone)
+export const resolveJid = async (jid, companyId) => {
+    if (!jid || !jid.includes('@lid')) return jid;
+    try {
+        const { data } = await supabase
+            .from('identity_map')
+            .select('phone_jid')
+            .eq('lid_jid', jid)
+            .eq('company_id', companyId)
+            .maybeSingle();
+        return data?.phone_jid || jid;
+    } catch (e) {
+        return jid;
+    }
+};
+
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
