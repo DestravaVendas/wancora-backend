@@ -345,18 +345,39 @@ export const refreshContactPic = async (req, res) => {
             return res.status(404).json({ error: "Sessão não encontrada ou desconectada" });
         }
 
-        const normalizedJid = normalizeJid(jid);
-        const ppUrl = await session.sock.profilePictureUrl(normalizedJid, 'image');
+        let normalizedJid = normalizeJid(jid);
         
-        // Atualiza no banco de dados para persistência
-        await supabase
-            .from('contacts')
-            .update({ profile_pic_url: ppUrl })
-            .eq('jid', normalizedJid);
+        // 🛡️ [FIX] Se for LID, tenta resolver antes de pedir a foto
+        if (normalizedJid.includes('@lid')) {
+            const { data: mapping } = await supabase
+                .from('identity_map')
+                .select('phone_jid')
+                .eq('lid_jid', normalizedJid)
+                .maybeSingle();
+            
+            if (mapping?.phone_jid) {
+                normalizedJid = mapping.phone_jid;
+            }
+        }
 
-        res.json({ success: true, profilePicUrl: ppUrl });
+        try {
+            const ppUrl = await session.sock.profilePictureUrl(normalizedJid, 'image');
+            
+            // Atualiza no banco de dados para persistência
+            await supabase
+                .from('contacts')
+                .update({ profile_pic_url: ppUrl, profile_pic_updated_at: new Date() })
+                .eq('jid', normalizedJid);
+
+            res.json({ success: true, profilePicUrl: ppUrl });
+        } catch (picError) {
+            // Se der erro de autorização ou não encontrado, retorna sucesso mas com null
+            // para evitar que o frontend trave ou mostre erro 500
+            console.warn(`⚠️ [REFRESH PIC] Não autorizado ou sem foto para ${normalizedJid}:`, picError.message);
+            res.json({ success: true, profilePicUrl: null, message: "Foto não disponível ou privada" });
+        }
     } catch (error) {
         console.error("Erro refreshContactPic:", error);
-        res.status(500).json({ error: "Erro ao buscar foto de perfil no WhatsApp" });
+        res.status(500).json({ error: "Erro interno ao processar atualização de foto" });
     }
 };
