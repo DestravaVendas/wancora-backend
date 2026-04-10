@@ -161,6 +161,29 @@ export const handleContactsUpsert = async (contacts, companyId) => {
     }
 };
 
+/**
+ * 🛡️ [NOVO] Processa mapeamento de identidade (LID -> Phone) emitido pelo Baileys
+ */
+export const handleIdentityMapUpdate = async (update, companyId) => {
+    try {
+        const { jid, lid } = update;
+        if (!jid || !lid) return;
+
+        const cleanLid = normalizeJid(lid);
+        const cleanPhone = normalizeJid(jid);
+
+        await supabase.rpc('link_identities', {
+            p_lid: cleanLid,
+            p_phone: cleanPhone,
+            p_company_id: companyId
+        });
+        
+        console.log(`🔗 [IDENTITY] Vinculado: ${cleanLid} -> ${cleanPhone}`);
+    } catch (e) {
+        console.error("❌ [IDENTITY] Erro ao vincular identidade:", e.message);
+    }
+};
+
 export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
     if (!jid || jid.includes('status@broadcast')) return;
     const cleanJid = normalizeJid(jid);
