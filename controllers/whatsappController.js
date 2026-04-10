@@ -361,7 +361,11 @@ export const refreshContactPic = async (req, res) => {
         }
 
         try {
-            const ppUrl = await session.sock.profilePictureUrl(normalizedJid, 'image');
+            // 🛡️ [FIX] Timeout real para evitar travamento do frontend se o Baileys demorar
+            const ppUrlPromise = session.sock.profilePictureUrl(normalizedJid, 'image');
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timed Out')), 10000));
+            
+            const ppUrl = await Promise.race([ppUrlPromise, timeoutPromise]);
             
             // Atualiza no banco de dados para persistência
             await supabase
