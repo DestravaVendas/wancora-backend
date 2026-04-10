@@ -330,8 +330,7 @@ export const startSession = async (sessionId, companyId) => {
                 const isConflict = errorMsg.includes('Stream Errored (conflict)') || statusCode === 440 || statusCode === 515;
                 const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 403;
 
-                // [REPARO] Se for erro de criptografia mas não for logout real, tentamos apenas reconectar
-                // Deletar a sessão (deleteSession) obriga o usuário a ler o QR Code de novo.
+                // [REPARO] Se for erro de criptografia mas não for logout real, tentamos reparar limpando as chaves
                 if (isLoggedOut) {
                     Logger.fatal('baileys', `Sessão encerrada permanentemente (Logout).`, { sessionId, error: errorMsg }, companyId);
                     await deleteSession(sessionId, companyId);
@@ -339,8 +338,21 @@ export const startSession = async (sessionId, companyId) => {
                 }
 
                 if (isCryptoError && !isConflict) {
-                    Logger.error('baileys', `Erro de Criptografia (Bad MAC/Signal). Tentando reparar...`, { sessionId, error: errorMsg }, companyId);
-                    // Não deletamos os dados, apenas matamos a instância na RAM e forçamos reconexão limpa
+                    Logger.error('baileys', `Erro de Criptografia (Bad MAC/Signal). Iniciando Auto-Reparo...`, { sessionId, error: errorMsg }, companyId);
+                    
+                    // 🛡️ [AUTO-REPARO] Deleta as chaves corrompidas mas mantém as credenciais (creds)
+                    // Isso força o Baileys a re-negociar os segredos sem precisar ler QR Code de novo.
+                    try {
+                        await supabase.from('baileys_auth_state')
+                            .delete()
+                            .eq('session_id', sessionId)
+                            .neq('data_type', 'creds');
+                        
+                        console.log(`🛠️ [REPARO] Chaves limpas para ${sessionId}. Reiniciando...`);
+                    } catch (e) {
+                        console.error(`❌ [REPARO] Falha ao limpar chaves:`, e.message);
+                    }
+
                     killSession(sessionId);
                     handleReconnect(sessionId, companyId, 5000);
                     return;
