@@ -67,7 +67,7 @@ router.post("/send", async (req, res) => {
             media_url: url,
             status: "sent",
             created_at: new Date()
-        }, { onConflict: 'remote_jid, whatsapp_id' });
+        }, { onConflict: 'company_id, whatsapp_id' });
     }
 
     res.json({ success: true, id: sentMsg?.key?.id });
