@@ -369,7 +369,14 @@ const _internalProcessAI = async (messageData) => {
         supabase.from('messages').select('content, from_me, message_type, transcription, created_at').eq('company_id', company_id).eq('remote_jid', remote_jid).eq('from_me', false).neq('whatsapp_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
-    const activeAgents = agentsRes.data || [];
+    const activeAgents = (agentsRes.data || []).filter(agent => {
+        // 🛡️ [FILTRO DE INSTÂNCIA]
+        // Se instance_ids for nulo ou vazio, o agente responde por todas as instâncias da empresa
+        if (!agent.instance_ids || agent.instance_ids.length === 0) return true;
+        // Caso contrário, verifica se a instância da mensagem (msgSessionId) está na lista permitida
+        return agent.instance_ids.includes(msgSessionId);
+    });
+
     const lastMsgDate = historyRes.data?.created_at || null;
     const companyConfig = companyRes.data?.ai_config;
 
