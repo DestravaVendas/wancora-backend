@@ -341,17 +341,29 @@ export const upsertMessage = async (msgData) => {
         };
 
         await safeSupabaseCall(async () => {
+            // 🛡️ [DEBUG] Log para rastrear mensagens fromMe que não aparecem
+            if (msgData.from_me) {
+                console.log(`💾 [SYNC] Tentando salvar mensagem fromMe: ${msgData.whatsapp_id} para ${cleanRemoteJid}`);
+            }
+
             // 1. Upsert da Mensagem (Agora usando a restrição unificada por whatsapp_id)
-            await supabase.from('messages').upsert(finalData, { onConflict: 'company_id, whatsapp_id' });
+            const { error: msgError } = await supabase.from('messages').upsert(finalData, { onConflict: 'company_id, whatsapp_id' });
+            if (msgError) {
+                console.error(`❌ [SYNC] Erro ao salvar mensagem (${msgData.whatsapp_id}):`, msgError.message, finalData);
+                throw msgError;
+            }
 
             // 2. [GARANTIA] Upsert do Contato para garantir que apareça na Inbox
-            // Se for from_me, o remote_jid é o destinatário. Se não, é o remetente.
-            await supabase.from('contacts').upsert({
+            const { error: contactError } = await supabase.from('contacts').upsert({
                 jid: cleanRemoteJid,
                 company_id: msgData.company_id,
                 phone: phone,
                 last_message_at: msgData.created_at || new Date()
             }, { onConflict: 'jid, company_id' });
+
+            if (contactError) {
+                console.error(`❌ [SYNC] Erro ao atualizar contato da mensagem:`, contactError.message);
+            }
         });
     } catch (e) {
         console.error(`❌ [SYNC] Erro upsertMessage:`, e.message);
