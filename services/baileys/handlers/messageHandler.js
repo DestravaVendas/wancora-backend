@@ -1,6 +1,6 @@
 import { getContentType, normalizeJid, unwrapMessage, getBody } from '../../../utils/wppParsers.js';
 import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
-import { upsertMessage, ensureLeadExists, upsertContact } from '../../crm/sync.js';
+import { upsertMessage, ensureLeadExists, upsertContact, resolveJid } from '../../crm/sync.js';
 import { handleMediaUpload } from './mediaHandler.js';
 import { refreshContactInfo } from './contactHandler.js'; 
 import { dispatchWebhook } from '../../integrations/webhook.js';
@@ -54,6 +54,11 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         let jid = normalizeJid(unwrapped.key.remoteJid);
         
+        // 🛡️ [FIX] Resolve LID para Phone JID centralizado
+        if (jid.includes('@lid')) {
+            jid = await resolveJid(jid, companyId);
+        }
+
         // [REFINE] Block Official WhatsApp Messages
         if (jid === '0@s.whatsapp.net') return;
 
@@ -82,18 +87,17 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         // Permite sticker passar mesmo sem body
         if (!body && !isMedia && type !== 'stickerMessage') return;
 
-        // LID RESOLVER
-        if (jid.includes('@lid')) {
-            const { data: mapping } = await supabase.from('identity_map').select('phone_jid').eq('lid_jid', jid).eq('company_id', companyId).maybeSingle();
-            if (mapping?.phone_jid) jid = mapping.phone_jid; 
-        }
-
         // --- CORREÇÃO CRÍTICA: GARANTIA DE CONTATO ---
         if (!fromMe && !isGroup) {
             await upsertContact(jid, companyId, pushName, null, false, null, false, null, { 
                 push_name: pushName,
                 last_message_at: new Date()
             });
+            
+            // 🔥 [NOVO] Busca foto do perfil para novos contatos imediatamente
+            if (isRealtime) {
+                refreshContactInfo(sock, jid, companyId, pushName).catch(() => {});
+            }
         }
         // ----------------------------------------------
 
