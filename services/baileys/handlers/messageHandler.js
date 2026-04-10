@@ -81,6 +81,10 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const fromMe = unwrapped.key.fromMe;
         const pushName = forcedName || unwrapped.pushName;
         
+        if (fromMe) {
+            console.log(`[HANDLER] Mensagem enviada por mim (Outro Dispositivo). ID: ${msgId}, Para: ${jid}`);
+        }
+        
         const body = getBody(unwrapped.message);
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
@@ -88,14 +92,14 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         if (!body && !isMedia && type !== 'stickerMessage') return;
 
         // --- CORREÇÃO CRÍTICA: GARANTIA DE CONTATO ---
-        if (!fromMe && !isGroup) {
+        if (!isGroup) {
             await upsertContact(jid, companyId, pushName, null, false, null, false, null, { 
                 push_name: pushName,
                 last_message_at: new Date()
             });
             
             // 🔥 [NOVO] Busca foto do perfil para novos contatos imediatamente
-            if (isRealtime) {
+            if (isRealtime && !fromMe) {
                 refreshContactInfo(sock, jid, companyId, pushName).catch(() => {});
             }
         }
