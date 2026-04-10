@@ -324,15 +324,22 @@ export const upsertMessage = async (msgData) => {
         
         // 🛡️ [FIX] Resolve LID antes de salvar a mensagem para unificar o chat
         let cleanRemoteJid = normalizeJid(msgData.remote_jid);
-        let phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
-
+        
         if (cleanRemoteJid.includes('@lid')) {
-            const resolved = await resolveJid(cleanRemoteJid, msgData.company_id);
-            if (resolved && !resolved.includes('@lid')) {
-                cleanRemoteJid = resolved;
-                phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
+            const { data: map } = await supabase
+                .from('identity_map')
+                .select('phone_jid')
+                .eq('lid_jid', cleanRemoteJid)
+                .eq('company_id', msgData.company_id)
+                .maybeSingle();
+            
+            if (map?.phone_jid) {
+                console.log(`🔗 [SYNC] Convertendo LID ${cleanRemoteJid} -> ${map.phone_jid}`);
+                cleanRemoteJid = map.phone_jid;
             }
         }
+
+        const phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
 
         const finalData = { 
             ...msgData, 
