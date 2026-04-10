@@ -56,7 +56,19 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         
         // 🛡️ [FIX] Resolve LID para Phone JID centralizado
         if (jid.includes('@lid')) {
-            jid = await resolveJid(jid, companyId);
+            const resolved = await resolveJid(jid, companyId);
+            if (resolved && !resolved.includes('@lid')) {
+                jid = resolved;
+            } else {
+                // [HEURÍSTICA] Se o LID parece um número de telefone, tenta vincular agora mesmo
+                const purePhone = jid.split('@')[0].replace(/\D/g, '');
+                if (purePhone.length >= 10 && !purePhone.startsWith('0')) {
+                    const phoneJid = `${purePhone}@s.whatsapp.net`;
+                    jid = phoneJid;
+                    // Linka preventivamente
+                    supabase.rpc('link_identities', { p_lid: normalizeJid(unwrapped.key.remoteJid), p_phone: phoneJid, p_company_id: companyId }).then(() => {});
+                }
+            }
         }
 
         // [REFINE] Block Official WhatsApp Messages
