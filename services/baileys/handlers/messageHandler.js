@@ -177,7 +177,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             status: fromMe ? 'sent' : 'delivered',
             created_at: new Date( (unwrapped.messageTimestamp || Date.now() / 1000) * 1000 ),
             participant: participantJid, 
-            lead_id: isGroup ? null : undefined 
+            lead_id: null 
         };
 
         if (transcriptionText) {
