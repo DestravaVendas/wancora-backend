@@ -182,13 +182,21 @@ export const handleIdentityMapUpdate = async (update, companyId) => {
         const cleanLid = normalizeJid(lid);
         const cleanPhone = normalizeJid(jid);
 
+        // 1. Salva o vínculo (Isso disparará o Trigger SQL de unificação de mensagens)
         await supabase.rpc('link_identities', {
             p_lid: cleanLid,
             p_phone: cleanPhone,
             p_company_id: companyId
         });
         
-        console.log(`🔗 [IDENTITY] Vinculado: ${cleanLid} -> ${cleanPhone}`);
+        console.log(`🔗 [IDENTITY] Vínculo detectado e unificado: ${cleanLid} -> ${cleanPhone}`);
+
+        // 2. Força o refresh do contato agora que sabemos o telefone real
+        // Isso garante que o nome e foto apareçam no chat unificado
+        setTimeout(() => {
+            refreshContactInfo(null, cleanPhone, companyId, null).catch(() => {});
+        }, 1000);
+
     } catch (e) {
         console.error("❌ [IDENTITY] Erro ao vincular identidade:", e.message);
     }
