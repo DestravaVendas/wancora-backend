@@ -88,11 +88,17 @@ export const handleContactsUpsert = async (contacts, companyId) => {
             if (!jid) continue;
 
             if (c.lid) {
-                await supabase.rpc('link_identities', {
-                    p_lid: normalizeJid(c.lid),
-                    p_phone: jid,
-                    p_company_id: companyId
-                });
+                const cleanLid = normalizeJid(c.lid);
+                const cleanPhone = jid;
+                
+                if (cleanLid !== cleanPhone) {
+                    await supabase.rpc('link_identities', {
+                        p_lid: cleanLid,
+                        p_phone: cleanPhone,
+                        p_company_id: companyId
+                    });
+                    console.log(`🔗 [CONTACT] Heurística: ${cleanLid} -> ${cleanPhone}`);
+                }
             }
 
             // [FIX] Não pula mais @lid, pois o upsertContact agora resolve o LID internamente
@@ -113,12 +119,16 @@ export const handleContactsUpsert = async (contacts, companyId) => {
 
             // Coleta mapeamentos LID -> Phone
             if (c.lid) {
-                identityPayload.push({
-                    lid_jid: normalizeJid(c.lid),
-                    phone_jid: jid,
-                    company_id: companyId,
-                    created_at: new Date()
-                });
+                const cleanLid = normalizeJid(c.lid);
+                if (cleanLid !== jid) {
+                    identityPayload.push({
+                        lid_jid: cleanLid,
+                        phone_jid: jid,
+                        company_id: companyId,
+                        created_at: new Date()
+                    });
+                    console.log(`🔗 [BULK] Coletando vínculo: ${cleanLid} -> ${jid}`);
+                }
             }
 
             const isFromBook = !!c.name;
