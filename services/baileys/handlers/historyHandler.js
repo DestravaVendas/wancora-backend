@@ -219,17 +219,17 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 for (const msg of topMessages) {
                     try {
                         const options = { 
-                            downloadMedia: false, // ❌ Desativado para acelerar o histórico inicial
+                            // [ATIVAÇÃO] Download de mídia ativado para TODAS as 10 mensagens do histórico conforme solicitado
+                            downloadMedia: true, 
                             fetchProfilePic: false, 
                             createLead: true 
                         };
                         
-                        // 🚀 PROCESSAMENTO ASSÍNCRONO: Não espera o download de mídia para continuar
-                        handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options).catch(() => {});
+                        await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
                     } catch (msgError) {}
                 }
-                // Pequena pausa apenas para não sobrecarregar o Event Loop
-                await sleep(10); 
+                // [OTIMIZAÇÃO] Delay ligeiramente maior entre chats para dar tempo ao download de mídia
+                await sleep(50); 
             }
         }
 
