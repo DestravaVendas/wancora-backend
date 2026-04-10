@@ -53,20 +53,24 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
 
         let jid = normalizeJid(unwrapped.key.remoteJid);
+        let lid = jid.includes('@lid') ? jid : null;
         
-        // 🛡️ [FIX] Resolve LID para Phone JID centralizado
-        if (jid.includes('@lid')) {
-            const resolved = await resolveJid(jid, companyId);
+        if (lid) {
+            const resolved = await resolveJid(lid, companyId);
             if (resolved && !resolved.includes('@lid')) {
                 jid = resolved;
             } else {
                 // [HEURÍSTICA] Se o LID parece um número de telefone, tenta vincular agora mesmo
-                const purePhone = jid.split('@')[0].replace(/\D/g, '');
+                const purePhone = lid.split('@')[0].replace(/\D/g, '');
                 if (purePhone.length >= 10 && !purePhone.startsWith('0')) {
                     const phoneJid = `${purePhone}@s.whatsapp.net`;
                     jid = phoneJid;
-                    // Linka preventivamente
-                    supabase.rpc('link_identities', { p_lid: normalizeJid(unwrapped.key.remoteJid), p_phone: phoneJid, p_company_id: companyId }).then(() => {});
+                    // Salva no mapa para o Trigger unificar o resto
+                    supabase.rpc('link_identities', { 
+                        p_lid: lid, 
+                        p_phone: phoneJid, 
+                        p_company_id: companyId 
+                    }).then(() => {});
                 }
             }
         }
