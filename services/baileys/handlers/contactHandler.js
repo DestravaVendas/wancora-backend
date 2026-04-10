@@ -166,7 +166,8 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
     if (!jid || jid.includes('status@broadcast')) return;
     const cleanJid = normalizeJid(jid);
     
-    if (cleanJid.includes('@lid') || cleanJid.includes('@g.us') || cleanJid.includes('@newsletter')) return;
+    // Grupos e Newsletters também podem ter foto, mas focamos em contatos individuais primeiro
+    if (cleanJid.includes('@newsletter')) return;
 
     try {
         const { data: contact } = await supabase
@@ -178,12 +179,17 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
 
         const now = new Date();
         const lastUpdate = contact?.profile_pic_updated_at ? new Date(contact.profile_pic_updated_at) : new Date(0);
-        const diffHours = (now - lastUpdate) / 1000 / 60 / 60;
+        const diffHours = (now.getTime() - lastUpdate.getTime()) / 1000 / 60 / 60;
 
         let newPicUrl = null;
         let isBusiness = contact?.is_business || false;
         let verifiedName = contact?.verified_name || null;
         let shouldUpdate = false;
+
+        // 🛡️ [LAZY LOAD] Se não tem foto, tenta buscar imediatamente independente do tempo
+        // Se tem foto, respeita o cache de 24h para evitar ban
+        const needsPic = !contact?.profile_pic_url;
+        const cacheExpired = diffHours >= 24;
 
         if (pushName && pushName.trim() !== '') {
             if (!contact?.push_name || contact.push_name !== pushName) {
@@ -191,6 +197,22 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
             }
         }
 
+        // Tenta buscar foto se necessário
+        if (needsPic || cacheExpired) {
+            try {
+                newPicUrl = await sock.profilePictureUrl(cleanJid, 'image');
+                if (newPicUrl && newPicUrl !== contact?.profile_pic_url) {
+                    shouldUpdate = true;
+                }
+            } catch (e) {
+                // Se der erro (ex: sem foto ou bloqueado), marcamos como atualizado para não tentar de novo em loop
+                if (needsPic) {
+                    shouldUpdate = true; // Força o upsert para atualizar o profile_pic_updated_at
+                }
+            }
+        }
+
+        // Busca perfil business se for muito antigo
         if (!contact || diffHours > 48) { 
              try {
                  const businessProfile = await sock.getBusinessProfile(cleanJid);
@@ -200,16 +222,6 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
                      shouldUpdate = true;
                  }
              } catch (e) {}
-        }
-
-        // Tenta buscar foto se não tiver ou se for velha
-        if (!contact?.profile_pic_url || diffHours >= 24) {
-            try {
-                newPicUrl = await sock.profilePictureUrl(cleanJid, 'image');
-                if (newPicUrl !== contact?.profile_pic_url) {
-                    shouldUpdate = true;
-                }
-            } catch (e) {}
         }
 
         if (shouldUpdate) {
@@ -229,6 +241,6 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
         }
 
     } catch (e) {
-        console.error(`⚠️ [CONTACT] Erro no refresh info para ${jid}:`, e.message);
+        // Silencioso para não travar o fluxo
     }
 };
