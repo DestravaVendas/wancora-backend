@@ -1,4 +1,3 @@
-
 import { upsertContactsBulk, updateSyncStatus, normalizeJid, upsertContact } from '../../crm/sync.js'; 
 import { handleMessage } from './messageHandler.js';
 import { unwrapMessage } from '../../../utils/wppParsers.js';
@@ -6,7 +5,7 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// [AJUSTE] Definido para 10 mensagens conforme solicitado pelo usuário
+// [AJUSTE] Reduzido para 10 para permitir download seguro de mídia
 const HISTORY_MSG_LIMIT = 10; 
 const HISTORY_MONTHS_LIMIT = 6;
 const processedHistoryChunks = new Set();
@@ -58,22 +57,10 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         const contactsToFetchPic = [];
 
         // --- FASE 1: CARREGAR DADOS DA AGENDA ---
-        const identityPayload = [];
         if (contacts && contacts.length > 0) {
             for (const c of contacts) {
                 const jid = normalizeJid(c.id);
-                if (!jid || jid === 'status@broadcast') continue;
-
-                // Coleta mapeamentos LID -> Phone (Suporte a múltiplas variações de propriedade do Baileys)
-                const lid = c.lid || c.lidJid || c.externalId;
-                if (lid) {
-                    identityPayload.push({
-                        lid_jid: normalizeJid(lid),
-                        phone_jid: jid,
-                        company_id: companyId,
-                        created_at: new Date()
-                    });
-                }
+                if (!jid || jid.includes('@lid') || jid === 'status@broadcast') continue;
 
                 const phoneName = c.name || c.notify || c.verifiedName;
                 const isFromBook = !!(c.name && c.name.trim().length > 0);
@@ -85,14 +72,14 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     imgUrl: c.imgUrl,
                     verifiedName: c.verifiedName
                 });
-            }
-        }
 
-        // 🛡️ [NOVO] Salva mapeamentos de identidade antes de processar contatos/mensagens
-        if (identityPayload.length > 0) {
-            const ID_CHUNK = 500;
-            for (let i = 0; i < identityPayload.length; i += ID_CHUNK) {
-                await supabase.from('identity_map').upsert(identityPayload.slice(i, i + ID_CHUNK), { onConflict: 'lid_jid, company_id' });
+                if (c.lid) {
+                     supabase.rpc('link_identities', {
+                        p_lid: normalizeJid(c.lid),
+                        p_phone: jid,
+                        p_company_id: companyId
+                    }).then(() => {});
+                }
             }
         }
 
@@ -215,11 +202,10 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
                 }
 
-                // [OTIMIZAÇÃO] Processa mensagens do chat
                 for (const msg of topMessages) {
                     try {
                         const options = { 
-                            // [ATIVAÇÃO] Download de mídia ativado para TODAS as 10 mensagens do histórico conforme solicitado
+                            // [ATIVAÇÃO] Download de mídia ativado para histórico RECENTE
                             downloadMedia: true, 
                             fetchProfilePic: false, 
                             createLead: true 
