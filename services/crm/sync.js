@@ -7,8 +7,7 @@ import getRedisClient from "../redisClient.js";
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false },
     db: { schema: 'public' },
-    global: { headers: { 'x-my-custom-header': 'wancora-backend' } },
-    options: { timeout: 60000 }
+    global: { headers: { 'x-my-custom-header': 'wancora-backend' } }
 });
 
 const leadLock = new Set(); 
@@ -154,7 +153,12 @@ export const upsertContactsBulk = async (contactsArray) => {
         }
 
         const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
-        validContacts.push({ ...c, jid: cleanJid, phone: purePhone });
+        const contactData = { ...c, jid: cleanJid, phone: purePhone };
+        
+        // 🛡️ [FIX] Remove undefined values
+        Object.keys(contactData).forEach(key => contactData[key] === undefined && delete contactData[key]);
+        
+        validContacts.push(contactData);
     }
 
     if (validContacts.length === 0) return;
@@ -207,6 +211,9 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             updateData.profile_pic_url = profilePicUrl;
             updateData.profile_pic_updated_at = new Date(); 
         }
+
+        // 🛡️ [FIX] Remove undefined values to prevent Supabase client issues (fetch failed)
+        Object.keys(updateData).forEach(key => updateData[key] === undefined && delete updateData[key]);
 
         await safeSupabaseCall(async () => {
             await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
@@ -299,15 +306,20 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
         const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
 
+        const leadPayload = {
+            company_id: companyId,
+            phone: purePhone,
+            name: finalName, 
+            status: 'new',
+            pipeline_stage_id: stage?.id || null,
+            position: Date.now()
+        };
+
+        // 🛡️ [FIX] Remove undefined values
+        Object.keys(leadPayload).forEach(key => leadPayload[key] === undefined && delete leadPayload[key]);
+
         const { data: newLead } = await safeSupabaseCall(() => 
-            supabase.from('leads').insert({
-                company_id: companyId,
-                phone: purePhone,
-                name: finalName, 
-                status: 'new',
-                pipeline_stage_id: stage?.id,
-                position: Date.now()
-            }).select('id').single()
+            supabase.from('leads').insert(leadPayload).select('id').single()
         );
 
         return newLead?.id;
@@ -354,6 +366,9 @@ export const upsertMessage = async (msgData) => {
             phone: purePhone             // Apenas números reais para busca e CRM
         };
 
+        // 🛡️ [FIX] Remove undefined values to prevent Supabase client issues (fetch failed)
+        Object.keys(finalData).forEach(key => finalData[key] === undefined && delete finalData[key]);
+
         await safeSupabaseCall(async () => {
             // 🛡️ [DEBUG] Log para rastrear mensagens fromMe que não aparecem
             if (msgData.from_me) {
@@ -363,7 +378,11 @@ export const upsertMessage = async (msgData) => {
             // 1. Upsert da Mensagem (Agora usando a restrição unificada por whatsapp_id)
             const { error: msgError } = await supabase.from('messages').upsert(finalData, { onConflict: 'company_id, whatsapp_id' });
             if (msgError) {
-                console.error(`❌ [SYNC] Erro ao salvar mensagem (${msgData.whatsapp_id}):`, msgError.message, finalData);
+                console.error(`❌ [SYNC] Erro Supabase ao salvar mensagem (${msgData.whatsapp_id}):`, msgError.message, {
+                    code: msgError.code,
+                    details: msgError.details,
+                    hint: msgError.hint
+                });
                 throw msgError;
             }
 
@@ -376,7 +395,7 @@ export const upsertMessage = async (msgData) => {
             }, { onConflict: 'jid, company_id' });
 
             if (contactError) {
-                console.error(`❌ [SYNC] Erro ao atualizar contato da mensagem:`, contactError.message);
+                console.error(`❌ [SYNC] Erro Supabase ao atualizar contato:`, contactError.message);
             }
         });
     } catch (e) {
