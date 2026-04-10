@@ -1,4 +1,3 @@
-
 import { upsertContact, upsertContactsBulk, normalizeJid } from '../../crm/sync.js';
 import { createClient } from '@supabase/supabase-js';
 
@@ -88,14 +87,15 @@ export const handleContactsUpsert = async (contacts, companyId) => {
             if (!jid) continue;
 
             if (c.lid) {
-                await supabase.rpc('link_identities', {
+                supabase.rpc('link_identities', {
                     p_lid: normalizeJid(c.lid),
                     p_phone: jid,
                     p_company_id: companyId
-                });
+                }).then(() => {});
             }
 
-            // [FIX] Não pula mais @lid, pois o upsertContact agora resolve o LID internamente
+            if (jid.includes('@lid')) continue;
+
             const bestName = c.name || c.notify || c.verifiedName;
             const isFromBook = !!c.name;
 
@@ -105,22 +105,10 @@ export const handleContactsUpsert = async (contacts, companyId) => {
     } else {
         // BULK PROCESSING PARA A LISTA COMPLETA
         const bulkPayload = [];
-        const identityPayload = [];
         
         for (const c of contacts) {
             const jid = normalizeJid(c.id);
-            if (!jid) continue;
-
-            // Coleta mapeamentos LID -> Phone (Suporte a múltiplas variações de propriedade do Baileys)
-            const lid = c.lid || c.lidJid || c.externalId;
-            if (lid) {
-                identityPayload.push({
-                    lid_jid: normalizeJid(lid),
-                    phone_jid: jid,
-                    company_id: companyId,
-                    created_at: new Date()
-                });
-            }
+            if (!jid || jid.includes('@lid')) continue;
 
             const isFromBook = !!c.name;
             const bestName = c.name || c.notify || c.verifiedName;
@@ -146,15 +134,6 @@ export const handleContactsUpsert = async (contacts, companyId) => {
             bulkPayload.push(contactData);
         }
 
-        // 1. Primeiro salva os mapeamentos de identidade (Crucial para o resolveJid funcionar no bulk de contatos)
-        if (identityPayload.length > 0) {
-            const ID_CHUNK = 500;
-            for (let i = 0; i < identityPayload.length; i += ID_CHUNK) {
-                await supabase.from('identity_map').upsert(identityPayload.slice(i, i + ID_CHUNK), { onConflict: 'lid_jid, company_id' });
-            }
-        }
-
-        // 2. Depois salva os contatos
         const CHUNK_SIZE = 500;
         for (let i = 0; i < bulkPayload.length; i += CHUNK_SIZE) {
             await upsertContactsBulk(bulkPayload.slice(i, i + CHUNK_SIZE));
@@ -166,8 +145,7 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
     if (!jid || jid.includes('status@broadcast')) return;
     const cleanJid = normalizeJid(jid);
     
-    // Grupos e Newsletters também podem ter foto, mas focamos em contatos individuais primeiro
-    if (cleanJid.includes('@newsletter')) return;
+    if (cleanJid.includes('@lid') || cleanJid.includes('@g.us') || cleanJid.includes('@newsletter')) return;
 
     try {
         const { data: contact } = await supabase
@@ -179,17 +157,12 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
 
         const now = new Date();
         const lastUpdate = contact?.profile_pic_updated_at ? new Date(contact.profile_pic_updated_at) : new Date(0);
-        const diffHours = (now.getTime() - lastUpdate.getTime()) / 1000 / 60 / 60;
+        const diffHours = (now - lastUpdate) / 1000 / 60 / 60;
 
         let newPicUrl = null;
         let isBusiness = contact?.is_business || false;
         let verifiedName = contact?.verified_name || null;
         let shouldUpdate = false;
-
-        // 🛡️ [LAZY LOAD] Se não tem foto, tenta buscar imediatamente independente do tempo
-        // Se tem foto, respeita o cache de 24h para evitar ban
-        const needsPic = !contact?.profile_pic_url;
-        const cacheExpired = diffHours >= 24;
 
         if (pushName && pushName.trim() !== '') {
             if (!contact?.push_name || contact.push_name !== pushName) {
@@ -197,22 +170,6 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
             }
         }
 
-        // Tenta buscar foto se necessário
-        if (needsPic || cacheExpired) {
-            try {
-                newPicUrl = await sock.profilePictureUrl(cleanJid, 'image');
-                if (newPicUrl && newPicUrl !== contact?.profile_pic_url) {
-                    shouldUpdate = true;
-                }
-            } catch (e) {
-                // Se der erro (ex: sem foto ou bloqueado), marcamos como atualizado para não tentar de novo em loop
-                if (needsPic) {
-                    shouldUpdate = true; // Força o upsert para atualizar o profile_pic_updated_at
-                }
-            }
-        }
-
-        // Busca perfil business se for muito antigo
         if (!contact || diffHours > 48) { 
              try {
                  const businessProfile = await sock.getBusinessProfile(cleanJid);
@@ -222,6 +179,16 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
                      shouldUpdate = true;
                  }
              } catch (e) {}
+        }
+
+        // Tenta buscar foto se não tiver ou se for velha
+        if (!contact?.profile_pic_url || diffHours >= 24) {
+            try {
+                newPicUrl = await sock.profilePictureUrl(cleanJid, 'image');
+                if (newPicUrl !== contact?.profile_pic_url) {
+                    shouldUpdate = true;
+                }
+            } catch (e) {}
         }
 
         if (shouldUpdate) {
@@ -241,6 +208,6 @@ export const refreshContactInfo = async (sock, jid, companyId, pushName) => {
         }
 
     } catch (e) {
-        // Silencioso para não travar o fluxo
+        console.error(`⚠️ [CONTACT] Erro no refresh info para ${jid}:`, e.message);
     }
 };
