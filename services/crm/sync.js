@@ -322,35 +322,42 @@ export const upsertMessage = async (msgData) => {
     try {
         if (msgData.remote_jid.includes('status@broadcast')) return;
         
-        // 🛡️ [FIX] Resolve LID antes de salvar a mensagem para unificar o chat
-        let cleanRemoteJid = normalizeJid(msgData.remote_jid);
+        // 🛡️ [FIX] Arquitetura de Unificação Retroativa
+        let originalJid = normalizeJid(msgData.remote_jid);
+        let lidJid = originalJid.includes('@lid') ? originalJid : null;
+        let canonicalJid = originalJid;
         
-        if (cleanRemoteJid.includes('@lid')) {
+        // Tenta resolver o JID real se for um LID usando o mapa de identidade
+        if (lidJid) {
             const { data: map } = await supabase
                 .from('identity_map')
                 .select('phone_jid')
-                .eq('lid_jid', cleanRemoteJid)
+                .eq('lid_jid', lidJid)
                 .eq('company_id', msgData.company_id)
                 .maybeSingle();
             
             if (map?.phone_jid) {
-                console.log(`🔗 [SYNC] Convertendo LID ${cleanRemoteJid} -> ${map.phone_jid}`);
-                cleanRemoteJid = map.phone_jid;
+                console.log(`🔗 [SYNC] Unificando LID ${lidJid} -> ${map.phone_jid}`);
+                canonicalJid = map.phone_jid;
             }
         }
 
-        const phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
+        const purePhone = canonicalJid.includes('@s.whatsapp.net') 
+            ? canonicalJid.split('@')[0].replace(/\D/g, '') 
+            : null;
 
         const finalData = { 
             ...msgData, 
-            remote_jid: cleanRemoteJid,
-            phone: phone // 📱 [NOVO] Salva o telefone para unificação no Frontend
+            remote_jid: originalJid,     // Mantém o ID original do Baileys para integridade
+            lid_jid: lidJid,             // Armazena o LID para o Trigger de unificação retroativa
+            canonical_jid: canonicalJid, // O ID unificado (Telefone se soubermos)
+            phone: purePhone             // Apenas números reais para busca e CRM
         };
 
         await safeSupabaseCall(async () => {
             // 🛡️ [DEBUG] Log para rastrear mensagens fromMe que não aparecem
             if (msgData.from_me) {
-                console.log(`💾 [SYNC] Tentando salvar mensagem fromMe: ${msgData.whatsapp_id} para ${cleanRemoteJid}`);
+                console.log(`💾 [SYNC] Salvando mensagem fromMe: ${msgData.whatsapp_id} para ${canonicalJid}`);
             }
 
             // 1. Upsert da Mensagem (Agora usando a restrição unificada por whatsapp_id)
@@ -360,11 +367,11 @@ export const upsertMessage = async (msgData) => {
                 throw msgError;
             }
 
-            // 2. [GARANTIA] Upsert do Contato para garantir que apareça na Inbox
+            // 2. [GARANTIA] Upsert do Contato (Sempre usando o JID Canônico para evitar duplicidade na Inbox)
             const { error: contactError } = await supabase.from('contacts').upsert({
-                jid: cleanRemoteJid,
+                jid: canonicalJid,
                 company_id: msgData.company_id,
-                phone: phone,
+                phone: purePhone,
                 last_message_at: msgData.created_at || new Date()
             }, { onConflict: 'jid, company_id' });
 
