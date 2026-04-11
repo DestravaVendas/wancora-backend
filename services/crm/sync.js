@@ -64,55 +64,67 @@ const isGenericName = (name, phone) => {
 };
 
 /**
- * 🛡️ [NOVO] Resolve JID LID para JID de Telefone usando o mapa de identidade
- * Fallback: Se não houver no mapa, tenta buscar um contato com o mesmo número de telefone
+ * 🛡️ [NORMALIZER SERVICE] Resolve JID LID para JID de Telefone usando o mapa de identidade
+ * Detecta também IDs técnicos (LIDs) mascarados como números de telefone.
  */
 export const resolveJid = async (jid, companyId) => {
-    if (!jid || !jid.includes('@lid')) return normalizeJid(jid);
+    if (!jid) return null;
+    
+    let cleanJid = normalizeJid(jid);
+    const pureId = cleanJid.split('@')[0];
+    
+    // 🛡️ [DETECÇÃO AVANÇADA] 
+    // Se o ID for muito longo (> 13 dígitos) ou contiver @lid, é um identificador técnico
+    const isTechnicalId = cleanJid.includes('@lid') || (pureId.length > 13 && /^\d+$/.test(pureId));
+    
+    if (!isTechnicalId) return cleanJid;
 
-    const cleanLid = normalizeJid(jid);
     try {
-        // 1. Hard Resolution (Identity Map)
+        // 1. Busca no Mapa de Identidade (Hard Resolution)
         const { data } = await supabase
             .from('identity_map')
             .select('phone_jid')
-            .eq('lid_jid', cleanLid)
+            .eq('lid_jid', cleanJid)
             .eq('company_id', companyId)
             .maybeSingle();
 
         if (data?.phone_jid) return normalizeJid(data.phone_jid);
 
-        // 2. Soft Resolution (Check contacts table for existing JID with same phone)
-        const purePhone = cleanLid.split('@')[0].replace(/\D/g, '');
-        
-        // Se o "número" no LID tiver cara de telefone (ex: 5511...)
+        // 2. Se for um LID mascarado em @s.whatsapp.net, tenta buscar o inverso no mapa
+        if (cleanJid.includes('@s.whatsapp.net')) {
+             const lidEquivalent = cleanJid.replace('@s.whatsapp.net', '@lid');
+             const { data: inverseMap } = await supabase
+                .from('identity_map')
+                .select('phone_jid')
+                .eq('lid_jid', lidEquivalent)
+                .eq('company_id', companyId)
+                .maybeSingle();
+             if (inverseMap?.phone_jid) return normalizeJid(inverseMap.phone_jid);
+        }
+
+        // 3. Soft Resolution (Heurística baseada em contatos existentes)
+        const purePhone = pureId.replace(/\D/g, '');
         if (purePhone.length >= 10 && !purePhone.startsWith('0')) {
             const phoneJid = `${purePhone}@s.whatsapp.net`;
-            // Linka preventivamente se o número for válido
-            supabase.rpc('link_identities', { p_lid: cleanLid, p_phone: phoneJid, p_company_id: companyId }).then(() => {});
+            // Linka preventivamente se o número parecer válido
+            supabase.rpc('link_identities', { p_lid: cleanJid, p_phone: phoneJid, p_company_id: companyId }).then(() => {});
             return phoneJid;
         }
 
-        if (purePhone.length >= 8) {
-            // Busca se já existe um contato @s.whatsapp.net que tenha esse mesmo número (extraído do LID)
-            const { data: contact } = await supabase.from('contacts')
-                .select('jid')
-                .eq('company_id', companyId)
-                .eq('phone', purePhone)
-                .like('jid', '%@s.whatsapp.net')
-                .maybeSingle();
-            
-            if (contact?.jid) {
-                // Linka para futuras consultas
-                supabase.rpc('link_identities', { p_lid: cleanLid, p_phone: contact.jid, p_company_id: companyId }).then(() => {});
-                return normalizeJid(contact.jid);
-            }
-        }
-
-        return cleanLid;
+        return cleanJid;
     } catch (e) {
-        return cleanLid;
+        return cleanJid;
     }
+};
+
+export const notifyActivity = (companyId, sessionId, type) => {
+    // 🛡️ [BROADCAST] Notifica o frontend via Realtime para manter o indicador de sync ativo
+    // Usamos o sessionId como canal, o frontend se inscreve nele.
+    supabase.channel(`sync-activity-${sessionId}`).send({
+        type: 'broadcast',
+        event: 'activity',
+        payload: { type, timestamp: Date.now() }
+    }).catch(() => {});
 };
 
 export const updateInstanceStatus = async (sessionId, companyId, data) => {
@@ -162,6 +174,11 @@ export const upsertContactsBulk = async (contactsArray) => {
     }
 
     if (validContacts.length === 0) return;
+
+    // Notifica atividade para o indicador visual
+    if (validContacts[0].session_id) {
+        notifyActivity(validContacts[0].company_id, validContacts[0].session_id, 'bulk_contacts');
+    }
 
     try {
         await safeSupabaseCall(async () => {
@@ -214,6 +231,10 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
         // 🛡️ [FIX] Remove undefined values to prevent Supabase client issues (fetch failed)
         Object.keys(updateData).forEach(key => updateData[key] === undefined && delete updateData[key]);
+
+        if (extraData.session_id) {
+            notifyActivity(companyId, extraData.session_id, 'contact_upsert');
+        }
 
         await safeSupabaseCall(async () => {
             await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
@@ -334,23 +355,21 @@ export const upsertMessage = async (msgData) => {
     try {
         if (msgData.remote_jid.includes('status@broadcast')) return;
         
-        // 🛡️ [FIX] Arquitetura de Unificação Retroativa
+        // 🛡️ [NORMALIZER] Arquitetura de Unificação Retroativa
         let originalJid = normalizeJid(msgData.remote_jid);
-        let lidJid = originalJid.includes('@lid') ? originalJid : null;
+        const pureId = originalJid.split('@')[0];
+        
+        // Detecta se é um ID técnico (LID)
+        const isTechnical = originalJid.includes('@lid') || (pureId.length > 13 && /^\d+$/.test(pureId));
+        let lidJid = isTechnical ? originalJid : null;
         let canonicalJid = originalJid;
         
-        // Tenta resolver o JID real se for um LID usando o mapa de identidade
-        if (lidJid) {
-            const { data: map } = await supabase
-                .from('identity_map')
-                .select('phone_jid')
-                .eq('lid_jid', lidJid)
-                .eq('company_id', msgData.company_id)
-                .maybeSingle();
-            
-            if (map?.phone_jid) {
-                console.log(`🔗 [SYNC] Unificando LID ${lidJid} -> ${map.phone_jid}`);
-                canonicalJid = map.phone_jid;
+        // Tenta resolver o JID real se for um identificador técnico
+        if (isTechnical) {
+            const resolved = await resolveJid(originalJid, msgData.company_id);
+            if (resolved && resolved !== originalJid) {
+                console.log(`🔗 [SYNC] Unificando ID Técnico ${originalJid} -> ${resolved}`);
+                canonicalJid = resolved;
             }
         }
 
@@ -358,16 +377,21 @@ export const upsertMessage = async (msgData) => {
             ? canonicalJid.split('@')[0].replace(/\D/g, '') 
             : null;
 
+        // 🛡️ [FIX] Se o "telefone" ainda for um LID mascarado (longo), não salva na coluna phone
+        const finalPhone = (purePhone && purePhone.length <= 13) ? purePhone : null;
+
         const finalData = { 
             ...msgData, 
             remote_jid: originalJid,     // Mantém o ID original do Baileys para integridade
             lid_jid: lidJid,             // Armazena o LID para o Trigger de unificação retroativa
             canonical_jid: canonicalJid, // O ID unificado (Telefone se soubermos)
-            phone: purePhone             // Apenas números reais para busca e CRM
+            phone: finalPhone            // Apenas números reais para busca e CRM
         };
 
         // 🛡️ [FIX] Remove undefined values to prevent Supabase client issues (fetch failed)
         Object.keys(finalData).forEach(key => finalData[key] === undefined && delete finalData[key]);
+
+        notifyActivity(msgData.company_id, msgData.session_id, 'message_upsert');
 
         await safeSupabaseCall(async () => {
             // 🛡️ [DEBUG] Log para rastrear mensagens fromMe que não aparecem
