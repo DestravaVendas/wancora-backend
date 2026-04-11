@@ -214,17 +214,6 @@ export const startSession = async (sessionId, companyId) => {
     // 🛡️ [LOCK] Tenta adquirir a trava antes de iniciar
     const locked = await acquireLock(sessionId);
     if (!locked) {
-        // Se não conseguiu o lock, verifica se a sessão no banco está 'disconnected'
-        // Se estiver 'disconnected' no banco mas o lock existir, pode ser um lock órfão de um crash
-        const { data: inst } = await supabase.from('instances').select('status').eq('session_id', sessionId).maybeSingle();
-        if (inst?.status === 'disconnected') {
-            console.warn(`⚠️ [CONNECTION] Lock detectado para ${sessionId} mas status é 'disconnected'. Forçando liberação.`);
-            const redis = getRedisClient();
-            if (redis) await redis.del(`lock:session:${sessionId}`);
-            // Tenta de novo após limpar
-            return startSession(sessionId, companyId);
-        }
-
         console.warn(`🚫 [CONNECTION] Sessão ${sessionId} já está ativa em outra instância. Abortando.`);
         return null;
     }
@@ -337,9 +326,9 @@ export const startSession = async (sessionId, companyId) => {
 
                 resetHistoryState(sessionId);
 
-                const isCryptoError = errorMsg.includes('authenticate data') || errorMsg.includes('Signal') || errorMsg.includes('Bad MAC') || errorMsg.includes('invalid character');
-                const isConflict = errorMsg.includes('Stream Errored (conflict)') || statusCode === 440 || statusCode === 515 || errorMsg.includes('replaced');
-                const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 403 || errorMsg.includes('logged out');
+                const isCryptoError = errorMsg.includes('authenticate data') || errorMsg.includes('Signal') || errorMsg.includes('Bad MAC');
+                const isConflict = errorMsg.includes('Stream Errored (conflict)') || statusCode === 440 || statusCode === 515;
+                const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 403;
 
                 // [REPARO] Se for erro de criptografia mas não for logout real, tentamos reparar limpando as chaves
                 if (isLoggedOut) {
@@ -349,18 +338,11 @@ export const startSession = async (sessionId, companyId) => {
                 }
 
                 if (isCryptoError && !isConflict) {
-                    const retryCount = retries.get(sessionId) || 0;
-                    Logger.error('baileys', `Erro de Criptografia (Bad MAC/Signal). Tentativa ${retryCount}. Iniciando Auto-Reparo...`, { sessionId, error: errorMsg }, companyId);
+                    Logger.error('baileys', `Erro de Criptografia (Bad MAC/Signal). Iniciando Auto-Reparo...`, { sessionId, error: errorMsg }, companyId);
                     
                     // 🛡️ [AUTO-REPARO] Deleta as chaves corrompidas mas mantém as credenciais (creds)
+                    // Isso força o Baileys a re-negociar os segredos sem precisar ler QR Code de novo.
                     try {
-                        // Se já tentamos reparar 3 vezes e continua dando Bad MAC, limpamos TUDO (inclusive creds) como último recurso
-                        if (retryCount > 3) {
-                            console.warn(`🚨 [REPARO] Falha persistente de criptografia em ${sessionId}. Limpando sessão completa.`);
-                            await deleteSession(sessionId, companyId);
-                            return;
-                        }
-
                         await supabase.from('baileys_auth_state')
                             .delete()
                             .eq('session_id', sessionId)
@@ -371,7 +353,7 @@ export const startSession = async (sessionId, companyId) => {
                         console.error(`❌ [REPARO] Falha ao limpar chaves:`, e.message);
                     }
 
-                    await killSession(sessionId);
+                    killSession(sessionId);
                     handleReconnect(sessionId, companyId, 5000);
                     return;
                 }
