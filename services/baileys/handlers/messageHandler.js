@@ -53,25 +53,26 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
 
         let jid = normalizeJid(unwrapped.key.remoteJid);
-        let lid = jid.includes('@lid') ? jid : null;
+        const pureId = jid.split('@')[0];
         
-        if (lid) {
-            const resolved = await resolveJid(lid, companyId);
-            if (resolved && !resolved.includes('@lid')) {
+        // 🛡️ [NORMALIZER] Detecta se é um identificador técnico (LID)
+        const isTechnical = jid.includes('@lid') || (pureId.length > 13 && /^\d+$/.test(pureId));
+        
+        if (isTechnical) {
+            const resolved = await resolveJid(jid, companyId);
+            if (resolved && resolved !== jid) {
+                console.log(`🔗 [HANDLER] ID Técnico ${jid} resolvido para ${resolved}`);
                 jid = resolved;
-            } else {
-                // [HEURÍSTICA] Se o LID parece um número de telefone, tenta vincular agora mesmo
-                const purePhone = lid.split('@')[0].replace(/\D/g, '');
-                if (purePhone.length >= 10 && !purePhone.startsWith('0')) {
-                    const phoneJid = `${purePhone}@s.whatsapp.net`;
-                    jid = phoneJid;
-                    // Salva no mapa para o Trigger unificar o resto
-                    supabase.rpc('link_identities', { 
-                        p_lid: lid, 
-                        p_phone: phoneJid, 
-                        p_company_id: companyId 
-                    }).then(() => {});
-                }
+            } else if (pureId.length >= 10 && !pureId.startsWith('0')) {
+                // [HEURÍSTICA] Se o ID técnico parece um número de telefone, tenta vincular agora mesmo
+                const phoneJid = `${pureId.replace(/\D/g, '')}@s.whatsapp.net`;
+                jid = phoneJid;
+                // Salva no mapa para o Trigger unificar o resto
+                supabase.rpc('link_identities', { 
+                    p_lid: normalizeJid(unwrapped.key.remoteJid), 
+                    p_phone: phoneJid, 
+                    p_company_id: companyId 
+                }).then(() => {});
             }
         }
 
