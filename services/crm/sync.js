@@ -115,6 +115,16 @@ export const resolveJid = async (jid, companyId) => {
     }
 };
 
+export const notifyActivity = (companyId, sessionId, type) => {
+    // 🛡️ [BROADCAST] Notifica o frontend via Realtime para manter o indicador de sync ativo
+    // Usamos o sessionId como canal, o frontend se inscreve nele.
+    supabase.channel(`sync-activity-${sessionId}`).send({
+        type: 'broadcast',
+        event: 'activity',
+        payload: { type, timestamp: Date.now() }
+    }).catch(() => {});
+};
+
 export const updateInstanceStatus = async (sessionId, companyId, data) => {
     try {
         await safeSupabaseCall(() => supabase.from('instances')
@@ -162,6 +172,11 @@ export const upsertContactsBulk = async (contactsArray) => {
     }
 
     if (validContacts.length === 0) return;
+
+    // Notifica atividade para o indicador visual
+    if (validContacts[0].session_id) {
+        notifyActivity(validContacts[0].company_id, validContacts[0].session_id, 'bulk_contacts');
+    }
 
     try {
         await safeSupabaseCall(async () => {
@@ -214,6 +229,10 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 
         // 🛡️ [FIX] Remove undefined values to prevent Supabase client issues (fetch failed)
         Object.keys(updateData).forEach(key => updateData[key] === undefined && delete updateData[key]);
+
+        if (extraData.session_id) {
+            notifyActivity(companyId, extraData.session_id, 'contact_upsert');
+        }
 
         await safeSupabaseCall(async () => {
             await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
@@ -368,6 +387,8 @@ export const upsertMessage = async (msgData) => {
 
         // 🛡️ [FIX] Remove undefined values to prevent Supabase client issues (fetch failed)
         Object.keys(finalData).forEach(key => finalData[key] === undefined && delete finalData[key]);
+
+        notifyActivity(msgData.company_id, msgData.session_id, 'message_upsert');
 
         await safeSupabaseCall(async () => {
             // 🛡️ [DEBUG] Log para rastrear mensagens fromMe que não aparecem
