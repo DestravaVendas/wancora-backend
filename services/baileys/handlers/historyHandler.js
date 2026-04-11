@@ -66,12 +66,26 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 // Coleta mapeamentos LID -> Phone
                 if (c.lid) {
-                    identityPayload.push({
-                        lid_jid: normalizeJid(c.lid),
-                        phone_jid: jid,
-                        company_id: companyId,
-                        created_at: new Date()
-                    });
+                    const cleanLid = normalizeJid(c.lid);
+                    const cleanPhone = jid;
+                    if (cleanLid !== cleanPhone) {
+                        identityPayload.push({
+                            lid_jid: cleanLid,
+                            phone_jid: cleanPhone,
+                            company_id: companyId,
+                            created_at: new Date()
+                        });
+                        
+                        // [NOVO] Se o LID for mascarado em @s.whatsapp.net, salva também a versão @lid
+                        if (cleanLid.includes('@s.whatsapp.net')) {
+                            identityPayload.push({
+                                lid_jid: cleanLid.replace('@s.whatsapp.net', '@lid'),
+                                phone_jid: cleanPhone,
+                                company_id: companyId,
+                                created_at: new Date()
+                            });
+                        }
+                    }
                 }
 
                 const phoneName = c.name || c.notify || c.verifiedName;
