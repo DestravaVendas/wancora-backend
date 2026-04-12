@@ -74,11 +74,12 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 });
 
                 if (c.lid) {
-                     supabase.rpc('link_identities', {
+                     // 🛡️ MUDANÇA: Await garante que o banco reconheça o LID antes de processar mensagens
+                     await supabase.rpc('link_identities', {
                         p_lid: normalizeJid(c.lid),
                         p_phone: jid,
                         p_company_id: companyId
-                    }).then(() => {});
+                    }).catch(() => {});
                 }
             }
         }
