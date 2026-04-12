@@ -9,7 +9,8 @@ import { createClient } from '@supabase/supabase-js';
 import { Logger } from '../../../utils/logger.js'; 
 import axios from 'axios';
 import { aiBus } from '../../scheduler/sentinel.js'; 
-import getRedisClient from '../../redisClient.js'; // 🛡️ NOVO: Importação do Redis
+import getRedisClient from '../../redisClient.js'; 
+import { Normalizer } from '../normalizer.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -53,28 +54,9 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
 
         let jid = normalizeJid(unwrapped.key.remoteJid);
-        const pureId = jid.split('@')[0];
         
-        // 🛡️ [NORMALIZER] Detecta se é um identificador técnico (LID)
-        const isTechnical = jid.includes('@lid') || (pureId.length > 13 && /^\d+$/.test(pureId));
-        
-        if (isTechnical) {
-            const resolved = await resolveJid(jid, companyId);
-            if (resolved && resolved !== jid) {
-                console.log(`🔗 [HANDLER] ID Técnico ${jid} resolvido para ${resolved}`);
-                jid = resolved;
-            } else if (pureId.length >= 10 && !pureId.startsWith('0')) {
-                // [HEURÍSTICA] Se o ID técnico parece um número de telefone, tenta vincular agora mesmo
-                const phoneJid = `${pureId.replace(/\D/g, '')}@s.whatsapp.net`;
-                jid = phoneJid;
-                // Salva no mapa para o Trigger unificar o resto
-                supabase.rpc('link_identities', { 
-                    p_lid: normalizeJid(unwrapped.key.remoteJid), 
-                    p_phone: phoneJid, 
-                    p_company_id: companyId 
-                }).then(() => {});
-            }
-        }
+        // 🛡️ [NORMALIZER] Resolve JID (LID -> Phone) de forma centralizada
+        jid = await Normalizer.resolve(jid, companyId);
 
         // [REFINE] Block Official WhatsApp Messages
         if (jid === '0@s.whatsapp.net') return;
