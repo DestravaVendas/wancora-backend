@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI, Type } from "@google/genai";
 import { sendMessage, markMessageAsRead, sendReaction } from "../baileys/sender.js"; 
+import { sessions } from "../baileys/connection.js";
 import { resolveJid, ensureLeadExists } from "../crm/sync.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport, checkAvailability, searchFiles, sendFile } from "../ai/agentTools.js";
@@ -318,7 +319,11 @@ const _internalProcessAI = async (messageData) => {
     setTimeout(() => processingLock.delete(lockKey), 60000);
 
     // 🛡️ [FIX] Resolve LID para Phone JID centralizado antes de qualquer lógica
-    const finalRemoteJid = await resolveJid(remote_jid, company_id);
+    const sessionId = msgSessionId || await getSessionId(company_id);
+    const session = sessions.get(sessionId);
+    const myJid = session?.sock?.user?.id ? normalizeJid(session.sock.user.id) : null;
+
+    const finalRemoteJid = await resolveJid(remote_jid, company_id, myJid);
     
     if (finalRemoteJid !== remote_jid) {
         console.log(`   🔗 [SENTINEL] LID ${remote_jid} resolvido para ${finalRemoteJid}`);
@@ -336,7 +341,6 @@ const _internalProcessAI = async (messageData) => {
 
     if (!lead) {
         console.log(`   🆕 [SENTINEL] Lead não encontrado para ${phone}. Criando via ensureLeadExists...`);
-        const myJid = await getSessionId(company_id); // Fallback JID
         const leadId = await ensureLeadExists(finalRemoteJid, company_id, `Novo Lead (${phone})`, myJid);
         
         if (leadId) {
