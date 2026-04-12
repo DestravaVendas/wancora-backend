@@ -3,6 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import { normalizeJid } from "../../utils/wppParsers.js";
 import { Logger } from "../../utils/logger.js"; 
 import getRedisClient from "../redisClient.js"; 
+import { Normalizer } from "../baileys/normalizer.js";
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false },
@@ -64,55 +65,8 @@ const isGenericName = (name, phone) => {
 };
 
 // 🛡️ [NORMALIZER SERVICE] Resolve JID LID para JID de Telefone usando o mapa de identidade
-// Detecta também IDs técnicos (LIDs) mascarados como números de telefone.
 export const resolveJid = async (jid, companyId) => {
-    if (!jid) return null;
-    
-    let cleanJid = normalizeJid(jid);
-    const pureId = cleanJid.split('@')[0];
-    
-    // 🛡️ [DETECÇÃO TÉCNICA] 
-    // IDs > 13 dígitos ou com sufixo @lid são identificadores técnicos (LIDs)
-    const isTechnicalId = cleanJid.includes('@lid') || (pureId.length > 13 && /^\d+$/.test(pureId));
-    
-    if (!isTechnicalId) return cleanJid;
-
-    try {
-        // 1. Hard Resolution (Mapa de Identidade no DB)
-        const { data } = await supabase
-            .from('identity_map')
-            .select('phone_jid')
-            .eq('lid_jid', cleanJid)
-            .eq('company_id', companyId)
-            .maybeSingle();
-
-        if (data?.phone_jid) return normalizeJid(data.phone_jid);
-
-        // 2. Fallback: Se for um LID mascarado em @s.whatsapp.net, tenta buscar a versão @lid
-        if (cleanJid.includes('@s.whatsapp.net')) {
-             const lidEquivalent = cleanJid.replace('@s.whatsapp.net', '@lid');
-             const { data: inverseMap } = await supabase
-                .from('identity_map')
-                .select('phone_jid')
-                .eq('lid_jid', lidEquivalent)
-                .eq('company_id', companyId)
-                .maybeSingle();
-             if (inverseMap?.phone_jid) return normalizeJid(inverseMap.phone_jid);
-        }
-
-        // 3. Heurística: Se o ID técnico PARECE um telefone (ex: 55...), assume como tal
-        // Isso resolve o problema de quando o WhatsApp manda o LID mas ele tem formato de número
-        if (pureId.length >= 10 && pureId.startsWith('55')) {
-            const phoneJid = `${pureId}@s.whatsapp.net`;
-            // Registra o vínculo para futuras mensagens
-            supabase.rpc('link_identities', { p_lid: cleanJid, p_phone: phoneJid, p_company_id: companyId }).then(() => {});
-            return phoneJid;
-        }
-
-        return cleanJid;
-    } catch (e) {
-        return cleanJid;
-    }
+    return await Normalizer.resolve(jid, companyId);
 };
 
 export const notifyActivity = (companyId, sessionId, type) => {
@@ -377,7 +331,7 @@ export const upsertMessage = async (msgData) => {
             : null;
 
         // 🛡️ [FIX] Se o "telefone" ainda for um LID mascarado (longo), não salva na coluna phone
-        const finalPhone = (purePhone && purePhone.length <= 13) ? purePhone : null;
+        const finalPhone = (purePhone && purePhone.length <= 15) ? purePhone : null;
 
         const finalData = { 
             ...msgData, 
