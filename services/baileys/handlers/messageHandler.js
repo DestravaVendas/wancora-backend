@@ -169,7 +169,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
         
         if (!isGroup && !fromMe) {
-             const purePhone = jid.split('@')[0].replace(/\D/g, '');
+             const purePhone = Normalizer.toPhone(jid);
              const { data: lead } = await supabase.from('leads').select('id').eq('phone', purePhone).eq('company_id', companyId).maybeSingle();
              if (lead) messageData.lead_id = lead.id;
         }
