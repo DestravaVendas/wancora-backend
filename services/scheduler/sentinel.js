@@ -1,8 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI, Type } from "@google/genai";
-import { sendMessage, markMessageAsRead, sendReaction } from "../baileys/sender.js"; 
-import { sessions } from "../baileys/connection.js";
-import { resolveJid, ensureLeadExists } from "../crm/sync.js";
+import { sendMessage, markMessageAsRead } from "../baileys/sender.js"; 
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport, checkAvailability, searchFiles, sendFile } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
@@ -22,53 +20,6 @@ const aiInstances = new Map();
 // Helper de Atraso Humano
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
-
-/**
- * 🛡️ [NOVO] Marca a mensagem como processada pela IA no banco
- */
-const markAsProcessed = async (whatsappId, companyId, error = null) => {
-    try {
-        await supabase.from('messages')
-            .update({ 
-                ai_processed: true, 
-                ai_error: error 
-            })
-            .eq('whatsapp_id', whatsappId)
-            .eq('company_id', companyId);
-    } catch (e) {
-        console.error(`❌ [SENTINEL] Erro ao marcar processamento:`, e.message);
-    }
-};
-
-/**
- * 🤖 [RECOVERY BOT] Busca mensagens pendentes de resposta (offline ou erro)
- */
-export const recoverPendingMessages = async (companyId = null) => {
-    console.log(`🤖 [RECOVERY] Iniciando varredura de mensagens pendentes...`);
-    try {
-        let query = supabase.from('messages')
-            .select('*')
-            .eq('from_me', false)
-            .eq('ai_processed', false)
-            .order('created_at', { ascending: true });
-
-        if (companyId) query = query.eq('company_id', companyId);
-
-        const { data: pending } = await query;
-
-        if (pending && pending.length > 0) {
-            console.log(`   🔎 Encontradas ${pending.length} mensagens pendentes.`);
-            for (const msg of pending) {
-                // Re-emite para o barramento de IA processar
-                aiBus.emit('new_message_arrived', msg);
-                // Pequeno delay para não sobrecarregar a fila
-                await delay(500);
-            }
-        }
-    } catch (e) {
-        console.error(`❌ [RECOVERY] Erro na recuperação:`, e.message);
-    }
-};
 
 // --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL - COMPLETO) ---
 const ALL_TOOLS = [
@@ -128,28 +79,6 @@ const ALL_TOOLS = [
                 description: { type: Type.STRING, description: "Detalhes e pauta do agendamento." }
             },
             required: ["title", "dateISO"]
-        }
-    },
-    {
-        name: "react_to_message",
-        description: "Reage à última mensagem do cliente com um emoji para parecer mais humano (ex: risada, coração, joinha). Use com moderação.",
-        parameters: {
-            type: Type.OBJECT,
-            properties: {
-                emoji: { type: Type.STRING, description: "O emoji da reação (ex: 😂, ❤️, 👍)." }
-            },
-            required: ["emoji"]
-        }
-    },
-    {
-        name: "send_sticker",
-        description: "Envia uma figurinha (sticker) divertida ou temática para o cliente.",
-        parameters: {
-            type: Type.OBJECT,
-            properties: {
-                url: { type: Type.STRING, description: "URL da imagem para converter em figurinha." }
-            },
-            required: ["url"]
         }
     }
 ];
@@ -259,26 +188,9 @@ const processAIResponse = async (messageData) => {
         
         const nextTask = currentLock.then(async () => {
             try {
-                // 🛡️ [ESTABILIDADE] Timeout de 2 minutos para o processamento total da IA
-                const timeoutPromise = new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error("TIMEOUT_SENTINEL")), 120000)
-                );
-
-                await Promise.race([
-                    _internalProcessAI(consolidatedData),
-                    timeoutPromise
-                ]);
-
-                // Marca todas as mensagens do buffer como processadas
-                for (const m of finalMessages) {
-                    await markAsProcessed(m.whatsapp_id, m.company_id);
-                }
+                await _internalProcessAI(consolidatedData);
             } catch (e) {
                 console.error(`❌ [SENTINEL] Erro na fila de ${remote_jid}:`, e.message);
-                // Marca com erro para auditoria
-                for (const m of finalMessages) {
-                    await markAsProcessed(m.whatsapp_id, m.company_id, e.message);
-                }
             }
         });
 
@@ -318,43 +230,53 @@ const _internalProcessAI = async (messageData) => {
     // 🛡️ Aumentamos a tranca para 60s, pois agora a IA vai "demorar" muito tempo agindo como humano
     setTimeout(() => processingLock.delete(lockKey), 60000);
 
-    // 🛡️ [FIX] Resolve LID para Phone JID centralizado antes de qualquer lógica
-    const sessionId = msgSessionId || await getSessionId(company_id);
-    const session = sessions.get(sessionId);
-    const myJid = session?.sock?.user?.id ? normalizeJid(session.sock.user.id) : null;
-
-    const finalRemoteJid = await resolveJid(remote_jid, company_id, myJid);
-    
-    if (finalRemoteJid !== remote_jid) {
-        console.log(`   🔗 [SENTINEL] LID ${remote_jid} resolvido para ${finalRemoteJid}`);
-    }
-
-    const phone = finalRemoteJid.split('@')[0].replace(/\D/g, '');
+    const phone = remote_jid.split('@')[0].replace(/\D/g, '');
     console.log(`   🔍 Buscando Lead: ${phone}...`);
 
-    // 🛡️ [SEGURANÇA] Busca exata para evitar match parcial de números
+    // 🛡️ [SEGURANÇA] Busca exata para evitar match parcial de números (Ex: 123 matching 55123)
+    // Tentamos primeiro com o número completo (com DDI) e depois sem DDI se necessário
     let { data: lead } = await supabase.from('leads')
         .select('id, name, bot_status, owner_id, pipeline_stage_id')
         .eq('company_id', company_id)
         .eq('phone', phone)
         .maybeSingle();
 
-    if (!lead) {
-        console.log(`   🆕 [SENTINEL] Lead não encontrado para ${phone}. Criando via ensureLeadExists...`);
-        const leadId = await ensureLeadExists(finalRemoteJid, company_id, `Novo Lead (${phone})`, myJid);
-        
-        if (leadId) {
-            const { data: createdLead } = await supabase.from('leads')
-                .select('id, name, bot_status, owner_id, pipeline_stage_id')
-                .eq('id', leadId)
-                .single();
-            lead = createdLead;
-        }
+    if (!lead && phone.startsWith('55')) {
+        const phoneWithoutDDI = phone.substring(2);
+        const { data: fallbackLead } = await supabase.from('leads')
+            .select('id, name, bot_status, owner_id, pipeline_stage_id')
+            .eq('company_id', company_id)
+            .eq('phone', phoneWithoutDDI)
+            .maybeSingle();
+        lead = fallbackLead;
     }
 
     if (!lead) {
-        console.error(`   ❌ [SENTINEL] Falha crítica ao obter/criar lead para ${phone}`);
-        return;
+        console.log(`   🆕 [SENTINEL] Lead não encontrado para ${phone}. Criando automaticamente...`);
+        
+        // Busca o estágio inicial do funil
+        const { data: stage } = await supabase.from('pipeline_stages')
+            .select('id')
+            .eq('company_id', company_id)
+            .order('position', { ascending: true })
+            .limit(1)
+            .maybeSingle();
+
+        const { data: newLead, error: createError } = await supabase.from('leads').insert({
+            company_id: company_id,
+            phone: phone,
+            name: `Novo Lead (${phone})`,
+            status: 'new',
+            bot_status: 'active',
+            pipeline_stage_id: stage?.id,
+            position: Date.now()
+        }).select('id, name, bot_status, owner_id, pipeline_stage_id').single();
+
+        if (createError) {
+            console.error(`   ❌ [SENTINEL] Erro ao criar lead automático:`, createError.message);
+            return;
+        }
+        lead = newLead;
     }
 
     if (lead.bot_status === 'off') {
@@ -382,14 +304,7 @@ const _internalProcessAI = async (messageData) => {
         supabase.from('messages').select('content, from_me, message_type, transcription, created_at').eq('company_id', company_id).eq('remote_jid', remote_jid).eq('from_me', false).neq('whatsapp_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
-    const activeAgents = (agentsRes.data || []).filter(agent => {
-        // 🛡️ [FILTRO DE INSTÂNCIA]
-        // Se instance_ids for nulo ou vazio, o agente responde por todas as instâncias da empresa
-        if (!agent.instance_ids || agent.instance_ids.length === 0) return true;
-        // Caso contrário, verifica se a instância da mensagem (msgSessionId) está na lista permitida
-        return agent.instance_ids.includes(msgSessionId);
-    });
-
+    const activeAgents = agentsRes.data || [];
     const lastMsgDate = historyRes.data?.created_at || null;
     const companyConfig = companyRes.data?.ai_config;
 
@@ -464,9 +379,6 @@ const _internalProcessAI = async (messageData) => {
         
         // 🛡️ [ISOLAMENTO CRÍTICO] Instrução de Bolha: Garante que a IA saiba exatamente com quem fala
         systemInstruction += `\n\n[DIRETRIZ DE ISOLAMENTO]\nVocê está em uma conversa PRIVADA e ISOLADA com o cliente "${lead.name}".\nNUNCA mencione outros clientes ou misture contextos.\nTrate esta conversa como uma bolha única.`;
-        
-        systemInstruction += `\n\n[DIRETRIZ DE AGENDAMENTO]\n1. SEMPRE use 'check_availability' ANTES de confirmar um horário.\n2. Se 'check_availability' ou 'schedule_meeting' retornar erro, NÃO peça para o cliente usar o link. Tente corrigir o formato da data (YYYY-MM-DD) e tente novamente.\n3. O agendamento deve ser REAL no sistema, não apenas uma promessa na conversa.`;
-
         systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nHoje é: ${dataCompleta} às ${horaCompleta}\n${filesKnowledge}`;
         
         // Libera as tools com base no nível do agente
@@ -533,39 +445,10 @@ const _internalProcessAI = async (messageData) => {
 
                 try {
                     if (call.name === 'check_availability') {
-                        // 🛡️ [FIX] Mapeia 'date' ou 'dateISO' para a função
-                        const dateArg = call.args.dateISO || call.args.date;
-                        output = await checkAvailability(company_id, dateArg);
-                    }
-                    else if (call.name === 'react_to_message') {
-                        const sessionId = await getSessionId(company_id);
-                        if (sessionId) {
-                            await sendReaction(sessionId, company_id, remote_jid, id, call.args.emoji);
-                            output = { success: true, message: `Reagido com ${call.args.emoji}` };
-                        }
-                    }
-                    else if (call.name === 'send_sticker') {
-                        const sessionId = await getSessionId(company_id);
-                        if (sessionId) {
-                            await sendMessage({
-                                sessionId,
-                                to: remote_jid,
-                                type: 'sticker',
-                                url: call.args.url
-                            });
-                            output = { success: true, message: "Figurinha enviada." };
-                        }
+                        output = await checkAvailability(company_id, call.args.dateISO);
                     }
                     else if (call.name === 'schedule_meeting') {
-                        // 🛡️ [FIX] Mapeia 'time' e 'date' se a IA enviar separado, ou usa 'dateISO'
-                        let dateArg = call.args.dateISO;
-                        if (!dateArg && call.args.date && call.args.time) {
-                            dateArg = `${call.args.date}T${call.args.time}:00`;
-                        } else if (!dateArg) {
-                            dateArg = call.args.date || call.args.time;
-                        }
-                        
-                        output = await scheduleMeeting(company_id, lead.id, call.args.title, dateArg, call.args.description, lead.owner_id);
+                        output = await scheduleMeeting(company_id, lead.id, call.args.title, call.args.dateISO, call.args.description, lead.owner_id);
                     }
                     else if (call.name === 'transfer_to_human') {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
@@ -720,11 +603,6 @@ export const startSentinel = () => {
         // Removemos o timeout fixo de 2.5s pois agora usamos a lógica de Debounce/Acumulação de 6s dentro de processAIResponse
         processAIResponse(messageData).catch(e => console.error("Erro interno no Sentinel:", e));
     });
-
-    // 🤖 [RECOVERY] Varredura periódica a cada 10 minutos para garantir 100% de entrega
-    setInterval(() => {
-        recoverPendingMessages().catch(() => {});
-    }, 10 * 60 * 1000);
 
     console.log("🟢 [SENTINEL] IA Conectada na Memória RAM (Imune a quedas do Render e TIMED_OUT)!");
 };

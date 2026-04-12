@@ -3,12 +3,12 @@ import { createClient } from "@supabase/supabase-js";
 import { normalizeJid } from "../../utils/wppParsers.js";
 import { Logger } from "../../utils/logger.js"; 
 import getRedisClient from "../redisClient.js"; 
-import { Normalizer } from "../baileys/normalizer.js";
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false },
     db: { schema: 'public' },
-    global: { headers: { 'x-my-custom-header': 'wancora-backend' } }
+    global: { headers: { 'x-my-custom-header': 'wancora-backend' } },
+    options: { timeout: 60000 }
 });
 
 const leadLock = new Set(); 
@@ -53,30 +53,14 @@ export { normalizeJid };
 const isGenericName = (name, phone) => {
     if (!name) return true;
     const cleanName = name.toString().trim();
-    if (cleanName.length < 2) return true; 
-    if (/^[\d\s\+\-\(\)]*$/.test(cleanName)) return true; 
+    if (cleanName.length < 2) return true; // Nomes de 1 letra são suspeitos
+    if (/^[\d\s\+\-\(\)]*$/.test(cleanName)) return true; // Só números/símbolos
     
-    // Se o nome contém "@lid" ou é apenas um número longo (LID), é técnico
+    // Se o nome contém "@lid", é um ID técnico, não um nome
     if (cleanName.includes('@lid')) return true;
-    if (cleanName.length > 13 && /^\d+$/.test(cleanName)) return true;
 
-    if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true; 
-    return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName); 
-};
-
-// 🛡️ [NORMALIZER SERVICE] Resolve JID LID para JID de Telefone usando o mapa de identidade
-export const resolveJid = async (jid, companyId, myJid = null) => {
-    return await Normalizer.resolve(jid, companyId, myJid);
-};
-
-export const notifyActivity = (companyId, sessionId, type) => {
-    // 🛡️ [BROADCAST] Notifica o frontend via Realtime para manter o indicador de sync ativo
-    // Usamos o sessionId como canal, o frontend se inscreve nele.
-    supabase.channel(`sync-activity-${sessionId}`).send({
-        type: 'broadcast',
-        event: 'activity',
-        payload: { type, timestamp: Date.now() }
-    }).catch(() => {});
+    if (phone && cleanName.replace(/\D/g, '') === phone.replace(/\D/g, '')) return true; // Nome igual telefone
+    return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName); // Sem letras
 };
 
 export const updateInstanceStatus = async (sessionId, companyId, data) => {
@@ -103,34 +87,15 @@ export const updateSyncStatus = async (sessionId, status, percent = 0) => {
 export const upsertContactsBulk = async (contactsArray) => {
     if (!contactsArray || contactsArray.length === 0) return;
     
-    const validContacts = [];
-    for (const c of contactsArray) {
-        if (!c.jid || !c.company_id) continue;
-        
-        let cleanJid = normalizeJid(c.jid);
-        // Tenta resolver LID se for o caso
-        if (cleanJid.includes('@lid')) {
-            const resolved = await resolveJid(cleanJid, c.company_id);
-            if (resolved && !resolved.includes('@lid')) {
-                cleanJid = resolved;
-            }
-        }
-
-        const purePhone = Normalizer.toPhone(cleanJid);
-        const contactData = { ...c, jid: cleanJid, phone: purePhone };
-        
-        // 🛡️ [FIX] Remove undefined values
-        Object.keys(contactData).forEach(key => contactData[key] === undefined && delete contactData[key]);
-        
-        validContacts.push(contactData);
-    }
+    const validContacts = contactsArray
+        .filter(c => c.jid && c.company_id)
+        .map(c => {
+            const cleanJid = normalizeJid(c.jid);
+            const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
+            return { ...c, jid: cleanJid, phone: purePhone };
+        });
 
     if (validContacts.length === 0) return;
-
-    // Notifica atividade para o indicador visual
-    if (validContacts[0].session_id) {
-        notifyActivity(validContacts[0].company_id, validContacts[0].session_id, 'bulk_contacts');
-    }
 
     try {
         await safeSupabaseCall(async () => {
@@ -150,16 +115,8 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
     try {
         if (!jid || !companyId || jid.includes('status@broadcast') || jid.includes('@newsletter')) return;
 
-        // 🛡️ [FIX] Resolve LID antes de salvar
-        let cleanJid = normalizeJid(jid);
-        if (cleanJid.includes('@lid')) {
-            const resolved = await resolveJid(cleanJid, companyId);
-            if (resolved && !resolved.includes('@lid')) {
-                cleanJid = resolved;
-            }
-        }
-
-        const purePhone = Normalizer.toPhone(cleanJid); 
+        const cleanJid = normalizeJid(jid);
+        const purePhone = cleanJid.split('@')[0].replace(/\D/g, ''); 
         
         const updateData = { jid: cleanJid, phone: purePhone, company_id: companyId, updated_at: new Date(), ...extraData };
 
@@ -181,13 +138,6 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             updateData.profile_pic_updated_at = new Date(); 
         }
 
-        // 🛡️ [FIX] Remove undefined values to prevent Supabase client issues (fetch failed)
-        Object.keys(updateData).forEach(key => updateData[key] === undefined && delete updateData[key]);
-
-        if (extraData.session_id) {
-            notifyActivity(companyId, extraData.session_id, 'contact_upsert');
-        }
-
         await safeSupabaseCall(async () => {
             await supabase.from('contacts').upsert(updateData, { onConflict: 'company_id, jid' });
         });
@@ -204,22 +154,8 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
 export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     if (!jid) return null;
     
-    // 🛡️ [FIX] Resolve LID antes de qualquer operação de Lead
-    let cleanJid = normalizeJid(jid);
+    const cleanJid = normalizeJid(jid);
     if (!cleanJid) return null;
-
-    if (cleanJid.includes('@lid')) {
-        const resolved = await resolveJid(cleanJid, companyId);
-        if (resolved && !resolved.includes('@lid')) {
-            cleanJid = resolved;
-        } else {
-            // Se não conseguimos resolver o LID para um telefone real, 
-            // NÃO criamos o lead ainda para evitar duplicidade.
-            // O sistema aguardará o mapeamento de identidade do Baileys.
-            console.log(`⚠️ [SYNC] Ignorando criação de lead para LID não resolvido: ${cleanJid}`);
-            return null;
-        }
-    }
 
     if (cleanJid.includes('@g.us') || cleanJid.includes('@newsletter') || cleanJid.includes('status@broadcast')) return null; 
     
@@ -228,8 +164,8 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         if (cleanMyJid && cleanJid === cleanMyJid) return null;
     }
 
-    const purePhone = Normalizer.toPhone(cleanJid);
-    if (!purePhone || purePhone.length < 8 || purePhone.length > 15) return null;
+    const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
+    if (purePhone.length < 8 || purePhone.length > 15) return null;
     
     // 🛡️ LOCK: Evita que duas mensagens do mesmo lead criem dois registros no Supabase
     const locked = await isLeadLocked(companyId, purePhone);
@@ -279,20 +215,15 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 
         const { data: stage } = await supabase.from('pipeline_stages').select('id').eq('company_id', companyId).order('position', { ascending: true }).limit(1).maybeSingle();
 
-        const leadPayload = {
-            company_id: companyId,
-            phone: purePhone,
-            name: finalName, 
-            status: 'new',
-            pipeline_stage_id: stage?.id || null,
-            position: Date.now()
-        };
-
-        // 🛡️ [FIX] Remove undefined values
-        Object.keys(leadPayload).forEach(key => leadPayload[key] === undefined && delete leadPayload[key]);
-
         const { data: newLead } = await safeSupabaseCall(() => 
-            supabase.from('leads').insert(leadPayload).select('id').single()
+            supabase.from('leads').insert({
+                company_id: companyId,
+                phone: purePhone,
+                name: finalName, 
+                status: 'new',
+                pipeline_stage_id: stage?.id,
+                position: Date.now()
+            }).select('id').single()
         );
 
         return newLead?.id;
@@ -306,55 +237,22 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
 export const upsertMessage = async (msgData) => {
     try {
         if (msgData.remote_jid.includes('status@broadcast')) return;
-        
-        // 🛡️ [NORMALIZER] Arquitetura de Unificação Retroativa
-        let originalJid = normalizeJid(msgData.remote_jid);
-        const pureId = originalJid.split('@')[0];
-        
-        // Detecta se é um ID técnico (LID)
-        const isTechnical = originalJid.includes('@lid') || (pureId.length > 13 && /^\d+$/.test(pureId));
-        let lidJid = isTechnical ? originalJid : null;
-        let canonicalJid = originalJid;
-        
-        // Tenta resolver o JID real se for um identificador técnico
-        if (isTechnical) {
-            const resolved = await resolveJid(originalJid, msgData.company_id);
-            if (resolved && resolved !== originalJid) {
-                canonicalJid = resolved;
-            }
-        }
-
-        // 🛡️ [FIX] Se o canonical_jid for um grupo, não tentamos extrair telefone
-        const isGroup = canonicalJid.includes('@g.us');
-        const purePhone = (!isGroup && canonicalJid.includes('@s.whatsapp.net')) 
-            ? canonicalJid.split('@')[0].replace(/\D/g, '') 
-            : null;
-
-        // 🛡️ [FIX] Se o "telefone" ainda for um LID mascarado (longo), não salva na coluna phone
-        const finalPhone = (purePhone && purePhone.length <= 15) ? purePhone : null;
-
-        const finalData = { 
-            ...msgData, 
-            remote_jid: originalJid,     // ID original do Baileys
-            lid_jid: lidJid,             // ID técnico para unificação
-            canonical_jid: canonicalJid, // ID unificado (Telefone se soubermos)
-            phone: finalPhone            // Apenas números reais
-        };
-
-        // Notifica atividade para o indicador visual
-        notifyActivity(msgData.company_id, msgData.session_id, 'message_upsert');
+        const cleanRemoteJid = normalizeJid(msgData.remote_jid);
+        const finalData = { ...msgData, remote_jid: cleanRemoteJid };
 
         await safeSupabaseCall(async () => {
             // 1. Upsert da Mensagem
-            const { error: msgError } = await supabase.from('messages').upsert(finalData, { onConflict: 'company_id, whatsapp_id' });
-            if (msgError) throw msgError;
+            await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
 
-            // 2. [GARANTIA] Atualiza o contato com o JID Canônico
-            if (!isGroup) {
+            // 2. [GARANTIA] Upsert do Contato para garantir que apareça na Inbox
+            // O gatilho de banco 'trigger_update_chat_stats' cuidará do unread_count e last_message_at
+            // Mas aqui garantimos que o registro do contato exista.
+            if (!msgData.from_me) {
+                const phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
                 await supabase.from('contacts').upsert({
-                    jid: canonicalJid,
+                    jid: cleanRemoteJid,
                     company_id: msgData.company_id,
-                    phone: finalPhone,
+                    phone: phone,
                     last_message_at: msgData.created_at || new Date()
                 }, { onConflict: 'jid, company_id' });
             }

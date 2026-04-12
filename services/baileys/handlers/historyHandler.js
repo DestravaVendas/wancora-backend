@@ -1,159 +1,232 @@
-import { upsertContactsBulk, updateSyncStatus, normalizeJid, upsertContact, resolveJid } from '../../crm/sync.js'; 
+
+import { upsertContactsBulk, updateSyncStatus, normalizeJid, upsertContact } from '../../crm/sync.js'; 
 import { handleMessage } from './messageHandler.js';
 import { unwrapMessage } from '../../../utils/wppParsers.js';
 import { createClient } from '@supabase/supabase-js';
-import { Logger } from '../../../utils/logger.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const HISTORY_MSG_LIMIT = 50; // Aumentado para garantir mais contexto
+// [AJUSTE] Reduzido para 10 para permitir download seguro de mídia
+const HISTORY_MSG_LIMIT = 10; 
+const HISTORY_MONTHS_LIMIT = 6;
 const processedHistoryChunks = new Set();
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 export const resetHistoryState = (sessionId) => {
-    // Limpa o cache de chunks processados para esta sessão
     for (const key of processedHistoryChunks) {
-        if (key.startsWith(sessionId)) processedHistoryChunks.delete(key);
+        if (key.startsWith(sessionId)) {
+            processedHistoryChunks.delete(key);
+        }
     }
 };
 
+const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
+    const CONCURRENCY = 3; 
+    const DELAY = 800;
+    
+    (async () => {
+        for (let i = 0; i < contacts.length; i += CONCURRENCY) {
+            const chunk = contacts.slice(i, i + CONCURRENCY);
+            await Promise.all(chunk.map(async (c) => {
+                try {
+                    const newUrl = await sock.profilePictureUrl(c.jid, 'image').catch(() => null);
+                    if (newUrl) {
+                        // Atualiza apenas a foto
+                        await upsertContact(c.jid, companyId, null, newUrl, false, null, false, null, { profile_pic_updated_at: new Date() });
+                    }
+                } catch (e) {}
+            }));
+            await sleep(DELAY);
+        }
+    })();
+};
+
 export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
+    
     const chunkKey = `${sessionId}-chunk-${chunkCounter}`;
-    if (processedHistoryChunks.has(chunkKey)) {
-        Logger.warn('sync', `Chunk ${chunkCounter} para ${sessionId} já processado. Ignorando.`, { companyId });
-        return;
-    }
+    if (processedHistoryChunks.has(chunkKey)) return;
     processedHistoryChunks.add(chunkKey);
 
-    Logger.info('sync', `[SYNC] Lote ${chunkCounter} | Iniciando Mineração de Dados...`, { companyId, sessionId });
+    const estimatedProgress = progress || Math.min(10 + (chunkCounter * 2), 95);
+    console.log(`📚 [SYNC] Lote ${chunkCounter} | Contatos Brutos: ${contacts?.length || 0} | Msgs: ${messages?.length || 0}`);
     
+    await updateSyncStatus(sessionId, 'importing_contacts', estimatedProgress);
+
     try {
         const contactsMap = new Map();
-        const identityPayload = [];
+        const contactsToFetchPic = [];
 
-        // --- CAMADA 1: EXTRAÇÃO DE CONTATOS (Array Oficial) --- 
+        // --- FASE 1: CARREGAR DADOS DA AGENDA ---
         if (contacts && contacts.length > 0) {
             for (const c of contacts) {
                 const jid = normalizeJid(c.id);
-                if (!jid || jid.includes('@broadcast')) continue;
+                if (!jid || jid.includes('@lid') || jid === 'status@broadcast') continue;
 
-                // Mapeia LIDs para telefones, crucial para unificação
-                if (c.lid) {
-                    const cleanLid = normalizeJid(c.lid);
-                    identityPayload.push({ lid_jid: cleanLid, phone_jid: jid, company_id: companyId });
-                }
+                const phoneName = c.name || c.notify || c.verifiedName;
+                const isFromBook = !!(c.name && c.name.trim().length > 0);
 
-                contactsMap.set(jid, {
+                contactsMap.set(jid, { 
                     jid,
-                    name: c.name || c.notify || c.verifiedName, 
-                    isFromBook: !!c.name,
-                    imgUrl: c.imgUrl || null
+                    name: phoneName, 
+                    isFromBook: isFromBook,
+                    imgUrl: c.imgUrl,
+                    verifiedName: c.verifiedName
                 });
+
+                if (c.lid) {
+                     supabase.rpc('link_identities', {
+                        p_lid: normalizeJid(c.lid),
+                        p_phone: jid,
+                        p_company_id: companyId
+                    }).then(() => {});
+                }
             }
         }
 
-        // --- CAMADA 2: MINERAÇÃO DE MENSAGENS (Fallback de Identidade e Contatos) ---
+        // --- FASE 2: MINERAÇÃO DE NOMES NAS MENSAGENS (NAME HARVESTER) ---
+        // Essencial para recuperar nomes de contatos que não estão na agenda mas têm PushName
         if (messages && messages.length > 0) {
-            for (const msg of messages) {
+            messages.forEach(msg => {
                 const clean = unwrapMessage(msg);
-                const jid = normalizeJid(clean.key.remoteJid);
-                if (!jid || jid.includes('@broadcast')) continue;
-
-                // Se a mensagem tem um LID no participante (em grupos), mapeia também
-                if (clean.key.participant && clean.key.participant.includes('@lid')) {
-                    // Infelizmente aqui não temos o telefone correspondente fácil, 
-                    // mas o Baileys emitirá o identity-map.update depois.
-                }
-
-                if (!contactsMap.has(jid)) {
-                    contactsMap.set(jid, {
-                        jid,
-                        name: clean.pushName || null,
-                        isFromBook: false,
-                        imgUrl: null
-                    });
-                }
-            }
-        }
-
-        // 1. Persistência de Identidade (LID -> Phone) - DEVE SER PRIMEIRO
-        if (identityPayload.length > 0) {
-            await supabase.from('identity_map').upsert(identityPayload, { onConflict: 'lid_jid, company_id' });
-            Logger.info('sync', `[SYNC] ${identityPayload.length} LIDs mapeados para ${sessionId}.`, { companyId, sessionId });
-        }
-
-        // 2. Persistência de Contatos em Lote
-        if (contactsMap.size > 0) {
-            const bulkContacts = [];
-            const myJid = normalizeJid(sock.user?.id);
-
-            for (const c of contactsMap.values()) {
-                // Resolve JID (LID -> Phone) antes de salvar o contato
-                const resolvedJid = await resolveJid(c.jid, companyId, myJid);
+                if (!clean.key) return;
                 
-                bulkContacts.push({
-                    jid: resolvedJid,
-                    company_id: companyId,
-                    name: c.isFromBook ? c.name : null,
-                    push_name: !c.isFromBook ? c.name : null,
-                    profile_pic_url: c.imgUrl,
-                    phone: resolvedJid.split('@')[0].replace(/\D/g, ''),
-                    updated_at: new Date()
-                });
+                const remoteJid = normalizeJid(clean.key.remoteJid);
+                const participant = clean.key.participant ? normalizeJid(clean.key.participant) : null;
+                
+                const targetJid = participant || remoteJid;
 
-                // 🔥 [MELHORIA] Se não tem foto, tenta buscar (Background)
-                if (!c.imgUrl && !resolvedJid.includes('@g.us')) {
-                    sock.profilePictureUrl(resolvedJid, 'image').then(url => {
-                        if (url) {
-                            supabase.from('contacts')
-                                .update({ profile_pic_url: url, profile_pic_updated_at: new Date() })
-                                .eq('jid', resolvedJid)
-                                .eq('company_id', companyId)
-                                .then(() => {});
-                        }
-                    }).catch(() => {});
+                if (targetJid && !targetJid.includes('status@broadcast') && clean.pushName) {
+                    const existing = contactsMap.get(targetJid);
+                    
+                    // Se não existe, ou existe mas sem nome da agenda, usa o pushName
+                    if (!existing || (!existing.isFromBook && !existing.name)) {
+                        contactsMap.set(targetJid, {
+                            jid: targetJid,
+                            name: clean.pushName,
+                            isFromBook: false,
+                            imgUrl: existing?.imgUrl,
+                            verifiedName: existing?.verifiedName
+                        });
+                    }
                 }
-            }
-            await upsertContactsBulk(bulkContacts);
-            Logger.info('sync', `[SYNC] ${bulkContacts.length} contatos upserted para ${sessionId}.`, { companyId, sessionId });
+            });
         }
 
-        // --- CAMADA 3: PROCESSAMENTO DE MENSAGENS --- 
+        // --- FASE 3: PERSISTÊNCIA (CONTATOS ANTES DAS MENSAGENS) ---
+        const bulkPayload = [];
+        
+        for (const [jid, data] of contactsMap.entries()) {
+             const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
+             const contactData = {
+                jid: jid,
+                phone: purePhone,
+                company_id: companyId,
+                updated_at: new Date()
+            };
+
+            if (data.isFromBook) {
+                contactData.name = data.name;
+            } else if (data.name) {
+                contactData.push_name = data.name;
+            }
+
+            if (data.imgUrl) {
+                contactData.profile_pic_url = data.imgUrl;
+            } else {
+                contactsToFetchPic.push({ jid, profile_pic_url: null });
+            }
+
+            if (data.verifiedName) {
+                contactData.verified_name = data.verifiedName;
+                contactData.is_business = true;
+            }
+
+            bulkPayload.push(contactData);
+        }
+
+        if (bulkPayload.length > 0) {
+            const BATCH_SIZE = 500;
+            for (let i = 0; i < bulkPayload.length; i += BATCH_SIZE) {
+                await upsertContactsBulk(bulkPayload.slice(i, i + BATCH_SIZE));
+            }
+        }
+            
+        if (contactsToFetchPic.length > 0) {
+            fetchProfilePicsInBackground(sock, contactsToFetchPic, companyId);
+        }
+
+        // --- FASE 4: MENSAGENS E LEADS ---
         if (messages && messages.length > 0) {
-            const chats = {};
-            messages.forEach(m => {
-                const clean = unwrapMessage(m);
+            await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress + 2);
+            
+            const cutoffDate = new Date();
+            cutoffDate.setMonth(cutoffDate.getMonth() - HISTORY_MONTHS_LIMIT);
+            const cutoffTimestamp = Math.floor(cutoffDate.getTime() / 1000);
+
+            const chats = {}; 
+            
+            messages.forEach(msg => {
+                let clean;
+                try { clean = unwrapMessage(msg); } catch(e) { return; } 
+
+                if (!clean.key?.remoteJid) return;
+                
+                const msgTs = Number(clean.messageTimestamp);
+                if (msgTs < cutoffTimestamp) return;
+
                 const jid = normalizeJid(clean.key.remoteJid);
-                if (!jid) return;
+                if (!jid || jid === 'status@broadcast') return;
+
                 if (!chats[jid]) chats[jid] = [];
+                
+                // Injeta nome resolvido para criação correta do lead
+                const knownContact = contactsMap.get(jid);
+                if (knownContact) {
+                    clean._forcedName = knownContact.isFromBook ? knownContact.name : knownContact.name;
+                } else {
+                    clean._forcedName = clean.pushName;
+                }
+                
                 chats[jid].push(clean);
             });
 
-            for (const jid of Object.keys(chats)) {
-                chats[jid].sort((a, b) => (Number(a.messageTimestamp) || 0) - (Number(b.messageTimestamp) || 0));
-                const recentMsgs = chats[jid].slice(-HISTORY_MSG_LIMIT);
+            const chatJids = Object.keys(chats);
+
+            for (const jid of chatJids) {
+                chats[jid].sort((a, b) => (Number(a.messageTimestamp) || 0) - (Number(b.messageTimestamp) || 0)); 
+                const topMessages = chats[jid].slice(-HISTORY_MSG_LIMIT);
                 
-                for (const msg of recentMsgs) {
-                    await handleMessage(msg, sock, companyId, sessionId, false, null, { 
-                        downloadMedia: true, 
-                        createLead: true 
-                    });
+                const latestMsg = topMessages[topMessages.length - 1];
+                if (latestMsg && latestMsg.messageTimestamp) {
+                    const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
+                    supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
                 }
+
+                for (const msg of topMessages) {
+                    try {
+                        const options = { 
+                            // [ATIVAÇÃO] Download de mídia ativado para histórico RECENTE
+                            downloadMedia: true, 
+                            fetchProfilePic: false, 
+                            createLead: true 
+                        };
+                        
+                        await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
+                    } catch (msgError) {}
+                }
+                // [OTIMIZAÇÃO] Delay ligeiramente maior entre chats para dar tempo ao download de mídia
+                await sleep(50); 
             }
-            Logger.info('sync', `[SYNC] ${messages.length} mensagens processadas para ${sessionId}.`, { companyId, sessionId });
         }
 
     } catch (e) {
-        Logger.error('sync', `[SYNC ERROR] Falha ao processar lote ${chunkCounter} para ${sessionId}`, { companyId, sessionId, error: e.message, stack: e.stack });
-        if (isLatest) {
-            await updateSyncStatus(sessionId, 'error', progress || 0);
-        }
+        console.error("❌ [SYNC ERROR]", e);
     } finally {
-        if (progress !== undefined) {
-             await updateSyncStatus(sessionId, 'importing_messages', progress);
-        }
         if (isLatest) {
+            console.log(`✅ [HISTÓRICO] Sincronização Total Concluída.`);
             await updateSyncStatus(sessionId, 'completed', 100);
-            Logger.log('sync', `✅ [SYNC] Sincronização da sessão ${sessionId} finalizada.`);
+            resetHistoryState(sessionId);
         }
     }
 };

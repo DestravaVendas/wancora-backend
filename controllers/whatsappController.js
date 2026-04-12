@@ -223,28 +223,19 @@ export const sendReaction = async (sessionId, companyId, remoteJid, msgId, react
 
 export const deleteMessage = async (sessionId, companyId, remoteJid, msgId, everyone = false) => {
     try {
+        await supabase.from('messages').update({ is_deleted: true, content: '⊘ Mensagem apagada' }).eq('id', msgId).eq('company_id', companyId);
         if (everyone) {
             const session = sessions.get(sessionId);
-            if (!session || !session.sock) throw new Error("Conexão com WhatsApp não encontrada ou fechada. Tente novamente em instantes.");
-            
-            const { data: targetMsg } = await supabase.from('messages').select('whatsapp_id, from_me').eq('id', msgId).single();
-            if (targetMsg) {
-                const key = { remoteJid: normalizeJid(remoteJid), id: targetMsg.whatsapp_id, fromMe: targetMsg.from_me };
-                
-                // [FIX] Garante que o socket está pronto antes de enviar
-                if (session.sock.ws && session.sock.ws.readyState !== 1) { // 1 = OPEN
-                    throw new Error("A conexão com o WhatsApp está instável. Aguarde a reconexão automática.");
+            if (session?.sock) {
+                const { data: targetMsg } = await supabase.from('messages').select('whatsapp_id, from_me').eq('id', msgId).single();
+                if (targetMsg) {
+                    const key = { remoteJid: normalizeJid(remoteJid), id: targetMsg.whatsapp_id, fromMe: targetMsg.from_me };
+                    await executeLocked(sessionId, async () => {
+                        await session.sock.sendMessage(normalizeJid(remoteJid), { delete: key });
+                    });
                 }
-
-                await executeLocked(sessionId, async () => {
-                    await session.sock.sendMessage(normalizeJid(remoteJid), { delete: key });
-                });
             }
         }
-
-        // Só atualiza o banco se o comando acima (se houver) não falhou
-        await supabase.from('messages').update({ is_deleted: true, content: '⊘ Mensagem apagada' }).eq('id', msgId).eq('company_id', companyId);
-        
         return { success: true };
     } catch (error) {
         console.error(`[Controller] Erro ao deletar:`, error);
@@ -332,57 +323,5 @@ export const triggerAITest = async (req, res) => {
         res.json(result);
     } catch (error) {
         res.status(500).json({ error: error.message });
-    }
-};
-
-// --- GESTÃO DE CONTATOS ---
-export const refreshContactPic = async (req, res) => {
-    const { jid, sessionId } = req.body;
-    
-    try {
-        const session = sessions.get(sessionId);
-        if (!session || !session.sock) {
-            return res.status(404).json({ error: "Sessão não encontrada ou desconectada" });
-        }
-
-        let normalizedJid = normalizeJid(jid);
-        
-        // 🛡️ [FIX] Se for LID, tenta resolver antes de pedir a foto
-        if (normalizedJid.includes('@lid')) {
-            const { data: mapping } = await supabase
-                .from('identity_map')
-                .select('phone_jid')
-                .eq('lid_jid', normalizedJid)
-                .maybeSingle();
-            
-            if (mapping?.phone_jid) {
-                normalizedJid = mapping.phone_jid;
-            }
-        }
-
-        try {
-            // 🛡️ [FIX] Timeout real aumentado para 15s para dar tempo ao Baileys em conexões lentas
-            const ppUrlPromise = session.sock.profilePictureUrl(normalizedJid, 'image');
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timed Out')), 15000));
-            
-            const ppUrl = await Promise.race([ppUrlPromise, timeoutPromise]);
-            
-            // Atualiza no banco de dados para persistência
-            await supabase
-                .from('contacts')
-                .update({ profile_pic_url: ppUrl, profile_pic_updated_at: new Date() })
-                .eq('jid', normalizedJid)
-                .eq('company_id', session.companyId); // Segurança extra
-
-            return res.json({ success: true, profilePicUrl: ppUrl });
-        } catch (picError) {
-            // Se der erro de autorização, timeout ou não encontrado, retorna sucesso mas com null
-            // para evitar que o frontend trave no spinner infinito
-            console.warn(`⚠️ [REFRESH PIC] Falha para ${normalizedJid}:`, picError.message);
-            return res.json({ success: true, profilePicUrl: null, message: "Foto não disponível ou privada" });
-        }
-    } catch (error) {
-        console.error("Erro refreshContactPic:", error);
-        res.status(500).json({ error: "Erro interno ao processar atualização de foto" });
     }
 };

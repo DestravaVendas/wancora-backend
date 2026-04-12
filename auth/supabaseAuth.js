@@ -48,14 +48,14 @@ const flushToDB = async (sessionId) => {
     const cache = sessionCaches.get(sessionId);
     if (!cache || cache.isFlushing || cache.writes.size === 0) return;
     
-    // Debounce Reduzido: 50ms (Ultra agressivo para evitar Bad MAC)
+    // Debounce Reduzido: 100ms (Mais agressivo para evitar Bad MAC em reconexões rápidas)
     const now = Date.now();
-    if (now - cache.lastFlush < 50) {
+    if (now - cache.lastFlush < 100) {
         if (!cache.flushTimer) {
             cache.flushTimer = setTimeout(() => {
                 cache.flushTimer = null;
                 flushToDB(sessionId);
-            }, 50);
+            }, 100);
         }
         return;
     }
@@ -210,9 +210,9 @@ export const useSupabaseAuthState = async (sessionId) => {
                         }
                     }
 
-                    // 2. Aciona o gravador de fundo (só salva na nuvem a cada 100ms)
+                    // 2. Aciona o gravador de fundo (só salva na nuvem a cada 500ms)
                     if (!cache.isFlushing) {
-                        setTimeout(() => flushToDB(sessionId), 100);
+                        setTimeout(() => flushToDB(sessionId), 500);
                     }
                 }
             }

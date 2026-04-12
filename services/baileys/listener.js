@@ -1,6 +1,6 @@
 
 import { updateSyncStatus } from '../crm/sync.js';
-import { handlePresenceUpdate, handleContactsUpsert, handleIdentityMapUpdate } from './handlers/contactHandler.js';
+import { handlePresenceUpdate, handleContactsUpsert } from './handlers/contactHandler.js';
 import { handleReceiptUpdate, handleMessageUpdate, handleReaction } from './handlers/messageHandler.js';
 import { handleHistorySync, resetHistoryState } from './handlers/historyHandler.js'; // Import atualizado
 import { enqueueMessage } from './messageQueue.js'; 
@@ -26,8 +26,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     sock.ev.on('presence.update', (update) => handlePresenceUpdate(update, companyId));
     
     sock.ev.on('contacts.upsert', (contacts) => handleContactsUpsert(contacts, companyId));
-
-    sock.ev.on('identity-map.update', (update) => handleIdentityMapUpdate(update, companyId));
     
     sock.ev.on('contacts.update', async (updates) => {
         for (const update of updates) {
@@ -52,7 +50,6 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // 4. HISTÓRICO (SYNC)
     sock.ev.on('messaging-history.set', (data) => {
         historyChunkCounter++;
-        console.log(`📚 [LISTENER] Recebido chunk de histórico #${historyChunkCounter} para ${sessionId}`);
         handleHistorySync(data, sock, sessionId, companyId, historyChunkCounter);
     });
 };

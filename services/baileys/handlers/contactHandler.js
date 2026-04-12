@@ -1,7 +1,6 @@
 
 import { upsertContact, upsertContactsBulk, normalizeJid } from '../../crm/sync.js';
 import { createClient } from '@supabase/supabase-js';
-import { Normalizer } from '../normalizer.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const presenceDebounce = new Map();
@@ -14,8 +13,20 @@ export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
     const presences = presenceUpdate.presences;
 
     // --- LID RESOLVER PARA PRESENÇA ---
-    id = await Normalizer.resolve(id, companyId);
-    if (!id) return;
+    if (id.includes('@lid')) {
+        const { data } = await supabase
+            .from('identity_map')
+            .select('phone_jid')
+            .eq('lid_jid', normalizeJid(id))
+            .eq('company_id', companyId)
+            .maybeSingle();
+            
+        if (data?.phone_jid) {
+            id = data.phone_jid; 
+        } else {
+            return; 
+        }
+    }
 
     const jid = normalizeJid(id);
 
@@ -77,20 +88,15 @@ export const handleContactsUpsert = async (contacts, companyId) => {
             if (!jid) continue;
 
             if (c.lid) {
-                const cleanLid = normalizeJid(c.lid);
-                const cleanPhone = jid;
-                
-                if (cleanLid !== cleanPhone) {
-                    await supabase.rpc('link_identities', {
-                        p_lid: cleanLid,
-                        p_phone: cleanPhone,
-                        p_company_id: companyId
-                    });
-                    console.log(`🔗 [CONTACT] Heurística: ${cleanLid} -> ${cleanPhone}`);
-                }
+                supabase.rpc('link_identities', {
+                    p_lid: normalizeJid(c.lid),
+                    p_phone: jid,
+                    p_company_id: companyId
+                }).then(() => {});
             }
 
-            // [FIX] Não pula mais @lid, pois o upsertContact agora resolve o LID internamente
+            if (jid.includes('@lid')) continue;
+
             const bestName = c.name || c.notify || c.verifiedName;
             const isFromBook = !!c.name;
 
@@ -100,25 +106,10 @@ export const handleContactsUpsert = async (contacts, companyId) => {
     } else {
         // BULK PROCESSING PARA A LISTA COMPLETA
         const bulkPayload = [];
-        const identityPayload = [];
         
         for (const c of contacts) {
             const jid = normalizeJid(c.id);
-            if (!jid) continue;
-
-            // Coleta mapeamentos LID -> Phone
-            if (c.lid) {
-                const cleanLid = normalizeJid(c.lid);
-                if (cleanLid !== jid) {
-                    identityPayload.push({
-                        lid_jid: cleanLid,
-                        phone_jid: jid,
-                        company_id: companyId,
-                        created_at: new Date()
-                    });
-                    console.log(`🔗 [BULK] Coletando vínculo: ${cleanLid} -> ${jid}`);
-                }
-            }
+            if (!jid || jid.includes('@lid')) continue;
 
             const isFromBook = !!c.name;
             const bestName = c.name || c.notify || c.verifiedName;
@@ -144,50 +135,10 @@ export const handleContactsUpsert = async (contacts, companyId) => {
             bulkPayload.push(contactData);
         }
 
-        // 1. Primeiro salva os mapeamentos de identidade (Crucial para o resolveJid funcionar no bulk de contatos)
-        if (identityPayload.length > 0) {
-            const ID_CHUNK = 500;
-            for (let i = 0; i < identityPayload.length; i += ID_CHUNK) {
-                await supabase.from('identity_map').upsert(identityPayload.slice(i, i + ID_CHUNK), { onConflict: 'lid_jid, company_id' });
-            }
-        }
-
-        // 2. Depois salva os contatos
         const CHUNK_SIZE = 500;
         for (let i = 0; i < bulkPayload.length; i += CHUNK_SIZE) {
             await upsertContactsBulk(bulkPayload.slice(i, i + CHUNK_SIZE));
         }
-    }
-};
-
-/**
- * 🛡️ [NOVO] Processa mapeamento de identidade (LID -> Phone) emitido pelo Baileys
- */
-export const handleIdentityMapUpdate = async (update, companyId) => {
-    try {
-        const { jid, lid } = update;
-        if (!jid || !lid) return;
-
-        const cleanLid = normalizeJid(lid);
-        const cleanPhone = normalizeJid(jid);
-
-        // 1. Salva o vínculo (Isso disparará o Trigger SQL de unificação de mensagens)
-        await supabase.rpc('link_identities', {
-            p_lid: cleanLid,
-            p_phone: cleanPhone,
-            p_company_id: companyId
-        });
-        
-        console.log(`🔗 [IDENTITY] Vínculo detectado e unificado: ${cleanLid} -> ${cleanPhone}`);
-
-        // 2. Força o refresh do contato agora que sabemos o telefone real
-        // Isso garante que o nome e foto apareçam no chat unificado
-        setTimeout(() => {
-            refreshContactInfo(null, cleanPhone, companyId, null).catch(() => {});
-        }, 1000);
-
-    } catch (e) {
-        console.error("❌ [IDENTITY] Erro ao vincular identidade:", e.message);
     }
 };
 

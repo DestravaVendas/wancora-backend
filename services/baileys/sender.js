@@ -6,7 +6,6 @@ import { convertAudioToOpus } from '../../utils/audioConverter.js';
 import { transcribeAudio } from '../../services/ai/transcriber.js';
 import { getFileBuffer } from '../../services/google/driveService.js';
 import { createClient } from "@supabase/supabase-js";
-import { resolveJid } from '../crm/sync.js'; // 🛡️ [NOVO] Importa o resolvedor de LID
 import sharp from 'sharp';
 import axios from 'axios';
 
@@ -41,25 +40,6 @@ export const executeLocked = async (sessionId, task) => {
 
     sendLocks.set(sessionId, nextTask.catch(() => {}));
     return nextTask;
-};
-
-// 🛡️ NOVO: Função para enviar reações (Emojis)
-export const sendReaction = async (sessionId, companyId, jid, messageId, emoji) => {
-    return executeLocked(sessionId, async () => {
-        const session = sessions.get(sessionId);
-        if (!session || !session.sock) return;
-
-        await session.sock.sendMessage(jid, {
-            react: {
-                text: emoji,
-                key: {
-                    remoteJid: jid,
-                    id: messageId,
-                    fromMe: false // Reage à mensagem do cliente
-                }
-            }
-        });
-    });
 };
 
 // 🛡️ NOVO: Função para forçar a visualização (visto azul) antes de responder
@@ -137,19 +117,12 @@ export const sendMessage = async ({
 
         const sock = session.sock;
         let jid = normalizeJid(to);
-
-        // 🛡️ [FIX] Resolve LID antes de enviar para garantir que use o JID canônico se disponível
-        if (jid.includes('@lid')) {
-            const resolved = await resolveJid(jid, companyId);
-            if (resolved && !resolved.includes('@lid')) {
-                jid = resolved;
-            }
-        }
+        // ... rest of the logic inside the task
 
         try {
             // [ANTI-BAN] Verifica se a conexão ainda está ativa antes de simular comportamento
-            if (!sock || !sock.user || !sock.ws || sock.ws.readyState !== 1) {
-                throw new Error("Conexão com WhatsApp perdida ou fechada durante o processo de envio.");
+            if (!sock || !sock.user) {
+                throw new Error("Conexão com WhatsApp perdida durante o processo de envio.");
             }
 
             // [FIX BRASIL] Validação de existência para corrigir 9º dígito
@@ -238,148 +211,169 @@ export const sendMessage = async ({
             else if (driveFileId) productionTime = 2500;
 
             await delay(productionTime);
-            
-            // 🛡️ [ESTABILIDADE] Verifica novamente antes de enviar o payload real
-            if (!sock.ws || sock.ws.readyState !== 1) throw new Error("Socket fechado antes do envio.");
-
             await sock.sendPresenceUpdate('paused', jid);
 
             let sentMsg;
-            let retryCount = 0;
-            const MAX_SEND_RETRIES = 2;
+            
+            switch (type) {
+                case 'text':
+                    sentMsg = await sock.sendMessage(jid, { 
+                        text: content || "",
+                    });
+                    break;
 
-            const trySend = async () => {
-                try {
-                    switch (type) {
-                        case 'text':
-                            return await sock.sendMessage(jid, { text: content || "" });
-                        case 'image':
-                            return await sock.sendMessage(jid, { image: { url: url }, caption: caption });
-                        case 'video':
-                            return await sock.sendMessage(jid, { video: { url: url }, caption: caption, gifPlayback: false });
-                        case 'audio':
-                            if (ptt && typeof url === 'string') { 
-                                try {
-                                    const { buffer, waveform, duration } = await convertAudioToOpus(url);
-                                    const msg = await sock.sendMessage(jid, {
-                                        audio: buffer,
-                                        ptt: true, 
-                                        seconds: duration,
-                                        mimetype: 'audio/ogg; codecs=opus',
-                                        waveform: Buffer.from(waveform)
-                                    });
-                                    if (companyId) {
-                                        transcribeAudio(buffer, 'audio/ogg', companyId).then(text => {
-                                            if (text && msg.key.id) {
-                                                supabase.from('messages').update({ transcription: text }).eq('whatsapp_id', msg.key.id).eq('company_id', companyId).then();
-                                            }
-                                        });
-                                    }
-                                    return msg;
-                                } catch (conversionError) {
-                                    return await sock.sendMessage(jid, { audio: { url: url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
-                                }
-                            } else {
-                                return await sock.sendMessage(jid, { audio: { url: url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
-                            }
-                        case 'document':
-                            return await sock.sendMessage(jid, { document: { url: url }, mimetype: mimetype || 'application/pdf', fileName: fileName || 'documento', caption: caption });
-                        case 'sticker':
-                            try {
-                                const stickerBuffer = typeof url === 'string' ? await convertToSticker(url) : url; 
-                                return await sock.sendMessage(jid, { sticker: stickerBuffer });
-                            } catch (stickerErr) {
-                                return await sock.sendMessage(jid, { sticker: url });
-                            }
-                        case 'poll':
-                            if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
-                            const cleanOptions = poll.options.map(opt => opt.trim()).filter(opt => opt.length > 0);
-                            if (cleanOptions.length < 2) throw new Error("Enquete precisa de pelo menos 2 opções válidas.");
-                            return await sock.sendMessage(jid, {
-                                poll: { name: poll.name.trim(), values: cleanOptions, selectableCount: Number(poll.selectableOptionsCount) || 1 }
-                            });
-                        case 'location':
-                            if (!location) throw new Error("Dados de localização inválidos");
-                            return await sock.sendMessage(jid, { location: { degreesLatitude: location.latitude, degreesLongitude: location.longitude } });
-                        case 'contact':
-                            if (!contact || !contact.vcard) throw new Error("Dados de contato inválidos");
-                            return await sock.sendMessage(jid, { contacts: { displayName: contact.displayName, contacts: [{ vcard: contact.vcard }] } });
-                        case 'product':
-                            if (!product || !product.productId) throw new Error("Produto inválido.");
-                            return await sock.sendMessage(jid, { 
-                                product: {
-                                    productImage: product.productImageCount ? { url: url || '' } : undefined,
-                                    productId: product.productId,
-                                    title: product.title || 'Produto',
-                                    description: product.description,
-                                    currencyCode: product.currencyCode || 'BRL',
-                                    priceAmount1000: product.priceAmount1000 || 0,
-                                    retailerId: "WhatsApp",
-                                    url: "", 
-                                    productImageCount: 1 
-                                },
-                                businessOwnerJid: sock.user.id 
-                            });
-                        case 'card':
-                            if (!card || !card.link) throw new Error("Card precisa de um link.");
-                            let thumbBuffer = undefined;
-                            if (card.thumbnailUrl) thumbBuffer = await generateThumbnail(card.thumbnailUrl);
-                            return await sock.sendMessage(jid, {
-                                text: card.description ? `${card.title}\n\n${card.description}` : card.title,
-                                contextInfo: {
-                                    externalAdReply: {
-                                        title: card.title,
-                                        body: card.description || "Clique para abrir",
-                                        thumbnail: thumbBuffer,
-                                        sourceUrl: card.link,
-                                        mediaType: 1, 
-                                        renderLargerThumbnail: true, 
-                                        showAdAttribution: true 
-                                    }
-                                }
-                            });
-                        case 'pix':
-                            const pixPayload = {
-                                viewOnceMessage: {
-                                    message: {
-                                        interactiveMessage: {
-                                            header: { title: caption || "Pagamento PIX", hasMediaAttachment: false },
-                                            body: { text: content || "Clique no botão abaixo para copiar a chave PIX." },
-                                            footer: { text: "Wancora Pay" },
-                                            nativeFlowMessage: {
-                                                buttons: [
-                                                    {
-                                                        name: "cta_copy",
-                                                        buttonParamsJson: JSON.stringify({
-                                                            display_text: "Copiar Chave PIX",
-                                                            id: "pix_copy",
-                                                            copy_code: url 
-                                                        })
-                                                    }
-                                                ]
-                                            }
-                                        }
-                                    }
-                                }
-                            };
-                            const message = generateWAMessageFromContent(jid, pixPayload, { userJid: sock.user.id });
-                            await sock.relayMessage(jid, message.message, { messageId: message.key.id });
-                            return message;
-                        default:
-                            return await sock.sendMessage(jid, { text: content || "" });
-                    }
-                } catch (err) {
-                    if (retryCount < MAX_SEND_RETRIES && (err.message.includes('Stream Errored') || err.message.includes('connection closed'))) {
-                        retryCount++;
-                        console.warn(`⚠️ [SENDER] Falha no envio (${err.message}). Tentativa ${retryCount}/${MAX_SEND_RETRIES} em 2s...`);
-                        await delay(2000);
-                        return trySend();
-                    }
-                    throw err;
-                }
-            };
+                case 'image':
+                    sentMsg = await sock.sendMessage(jid, { image: url, caption: caption });
+                    break;
 
-            sentMsg = await trySend();
+                case 'video':
+                    sentMsg = await sock.sendMessage(jid, { video: url, caption: caption, gifPlayback: false });
+                    break;
+
+                case 'audio':
+                    if (ptt && typeof url === 'string') { 
+                        try {
+                            const { buffer, waveform, duration } = await convertAudioToOpus(url);
+                            
+                            sentMsg = await sock.sendMessage(jid, {
+                                audio: buffer,
+                                ptt: true, 
+                                seconds: duration,
+                                mimetype: 'audio/ogg; codecs=opus',
+                                waveform: Buffer.from(waveform)
+                            });
+
+                            if (companyId) {
+                                transcribeAudio(buffer, 'audio/ogg', companyId).then(text => {
+                                    if (text && sentMsg.key.id) {
+                                        supabase.from('messages').update({ transcription: text }).eq('whatsapp_id', sentMsg.key.id).then();
+                                    }
+                                });
+                            }
+                        } catch (conversionError) {
+                            sentMsg = await sock.sendMessage(jid, { audio: { url }, ptt: false, mimetype: mimetype || 'audio/mp4' });
+                        }
+                    } else {
+                        sentMsg = await sock.sendMessage(jid, { audio: url, ptt: false, mimetype: mimetype || 'audio/mp4' });
+                    }
+                    break;
+
+                case 'document':
+                    sentMsg = await sock.sendMessage(jid, { document: url, mimetype: mimetype || 'application/pdf', fileName: fileName || 'documento', caption: caption });
+                    break;
+
+                case 'sticker':
+                    try {
+                        const stickerBuffer = typeof url === 'string' ? await convertToSticker(url) : url; 
+                        sentMsg = await sock.sendMessage(jid, { sticker: stickerBuffer });
+                    } catch (stickerErr) {
+                        sentMsg = await sock.sendMessage(jid, { sticker: url });
+                    }
+                    break;
+
+                case 'poll':
+                    if (!poll || !poll.name || !poll.options) throw new Error("Dados da enquete inválidos");
+                    const cleanOptions = poll.options.map(opt => opt.trim()).filter(opt => opt.length > 0);
+                    if (cleanOptions.length < 2) throw new Error("Enquete precisa de pelo menos 2 opções válidas.");
+                    sentMsg = await sock.sendMessage(jid, {
+                        poll: { name: poll.name.trim(), values: cleanOptions, selectableCount: Number(poll.selectableOptionsCount) || 1 }
+                    });
+                    break;
+
+                case 'location':
+                    if (!location) throw new Error("Dados de localização inválidos");
+                    sentMsg = await sock.sendMessage(jid, { location: { degreesLatitude: location.latitude, degreesLongitude: location.longitude } });
+                    break;
+
+                case 'contact':
+                    if (!contact || !contact.vcard) throw new Error("Dados de contato inválidos");
+                    sentMsg = await sock.sendMessage(jid, { contacts: { displayName: contact.displayName, contacts: [{ vcard: contact.vcard }] } });
+                    break;
+
+                case 'product':
+                    if (!product || !product.productId) throw new Error("Produto inválido.");
+                    sentMsg = await sock.sendMessage(jid, { 
+                        product: {
+                            productImage: product.productImageCount ? { url: url || '' } : undefined,
+                            productId: product.productId,
+                            title: product.title || 'Produto',
+                            description: product.description,
+                            currencyCode: product.currencyCode || 'BRL',
+                            priceAmount1000: product.priceAmount1000 || 0,
+                            retailerId: "WhatsApp",
+                            url: "", 
+                            productImageCount: 1 
+                        },
+                        businessOwnerJid: sock.user.id 
+                    });
+                    break;
+
+                case 'card':
+                    if (!card || !card.link) throw new Error("Card precisa de um link.");
+                    
+                    let thumbBuffer = undefined;
+                    if (card.thumbnailUrl) {
+                        thumbBuffer = await generateThumbnail(card.thumbnailUrl);
+                    }
+
+                    sentMsg = await sock.sendMessage(jid, {
+                        text: card.description ? `${card.title}\n\n${card.description}` : card.title,
+                        contextInfo: {
+                            externalAdReply: {
+                                title: card.title,
+                                body: card.description || "Clique para abrir",
+                                thumbnail: thumbBuffer,
+                                sourceUrl: card.link,
+                                mediaType: 1, 
+                                renderLargerThumbnail: true, 
+                                showAdAttribution: true 
+                            }
+                        }
+                    });
+                    break;
+
+                case 'pix':
+                    // [NATIVO] Implementação de Botão PIX via nativeFlowMessage
+                    const pixPayload = {
+                        viewOnceMessage: {
+                            message: {
+                                interactiveMessage: {
+                                    header: {
+                                        title: caption || "Pagamento PIX",
+                                        hasMediaAttachment: false
+                                    },
+                                    body: {
+                                        text: content || "Clique no botão abaixo para copiar a chave PIX."
+                                    },
+                                    footer: {
+                                        text: "Wancora Pay"
+                                    },
+                                    nativeFlowMessage: {
+                                        buttons: [
+                                            {
+                                                name: "cta_copy",
+                                                buttonParamsJson: JSON.stringify({
+                                                    display_text: "Copiar Chave PIX",
+                                                    id: "pix_copy",
+                                                    copy_code: url // A chave PIX vem no campo 'url'
+                                                })
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    
+                    const message = generateWAMessageFromContent(jid, pixPayload, { userJid: sock.user.id });
+                    await sock.relayMessage(jid, message.message, { messageId: message.key.id });
+                    sentMsg = message;
+                    break;
+
+                default:
+                    sentMsg = await sock.sendMessage(jid, { text: content || "" });
+            }
+
             return sentMsg;
 
         } catch (err) {

@@ -5,8 +5,7 @@ import {
     createCommunity, 
     syncCatalog,
     triggerStressTest,
-    triggerAITest,
-    refreshContactPic
+    triggerAITest
 } from "../controllers/whatsappController.js";
 import { requireAuth } from "../middleware/auth.js";
 
@@ -24,9 +23,6 @@ router.post("/community/create", createCommunity);
 
 // Catálogo
 router.post("/catalog/sync", syncCatalog);
-
-// Gestão de Contatos
-router.post("/contact/refresh-pic", refreshContactPic);
 
 // Testes de Stress e IA
 router.post("/stress/campaign", triggerStressTest);

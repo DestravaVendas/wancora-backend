@@ -1,6 +1,6 @@
 import { getContentType, normalizeJid, unwrapMessage, getBody } from '../../../utils/wppParsers.js';
 import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
-import { upsertMessage, ensureLeadExists, upsertContact, resolveJid } from '../../crm/sync.js';
+import { upsertMessage, ensureLeadExists, upsertContact } from '../../crm/sync.js';
 import { handleMediaUpload } from './mediaHandler.js';
 import { refreshContactInfo } from './contactHandler.js'; 
 import { dispatchWebhook } from '../../integrations/webhook.js';
@@ -9,8 +9,7 @@ import { createClient } from '@supabase/supabase-js';
 import { Logger } from '../../../utils/logger.js'; 
 import axios from 'axios';
 import { aiBus } from '../../scheduler/sentinel.js'; 
-import getRedisClient from '../../redisClient.js'; 
-import { Normalizer } from '../normalizer.js';
+import getRedisClient from '../../redisClient.js'; // 🛡️ NOVO: Importação do Redis
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -54,11 +53,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
 
         let jid = normalizeJid(unwrapped.key.remoteJid);
-        const myJid = normalizeJid(sock.user?.id);
         
-        // 🛡️ [NORMALIZER] Resolve JID (LID -> Phone) de forma centralizada
-        jid = await Normalizer.resolve(jid, companyId, myJid);
-
         // [REFINE] Block Official WhatsApp Messages
         if (jid === '0@s.whatsapp.net') return;
 
@@ -81,27 +76,48 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         const fromMe = unwrapped.key.fromMe;
         const pushName = forcedName || unwrapped.pushName;
         
-        if (fromMe) {
-            console.log(`[HANDLER] Mensagem enviada por mim (Outro Dispositivo). ID: ${msgId}, Para: ${jid}`);
-        }
-        
         const body = getBody(unwrapped.message);
         const isMedia = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type);
         
         // Permite sticker passar mesmo sem body
         if (!body && !isMedia && type !== 'stickerMessage') return;
 
+        // LID RESOLVER (Hard & Soft)
+        if (jid.includes('@lid')) {
+            // 1. Hard Resolution (Identity Map)
+            const { data: mapping } = await supabase.from('identity_map').select('phone_jid').eq('lid_jid', jid).eq('company_id', companyId).maybeSingle();
+            if (mapping?.phone_jid) {
+                jid = mapping.phone_jid;
+            } else {
+                // 2. Soft Resolution (Phone Match)
+                const purePhone = jid.split('@')[0].replace(/\D/g, '');
+                const { data: contact } = await supabase.from('contacts')
+                    .select('jid')
+                    .eq('company_id', companyId)
+                    .eq('phone', purePhone)
+                    .like('jid', '%@s.whatsapp.net')
+                    .maybeSingle();
+                
+                if (contact?.jid) {
+                    const resolvedJid = contact.jid;
+                    const lidPhone = unwrapped.key.remoteJid.split('@')[0].replace(/\D/g, '');
+                    const resolvedPhone = resolvedJid.split('@')[0].replace(/\D/g, '');
+
+                    if (lidPhone === resolvedPhone) {
+                        jid = resolvedJid;
+                        // Aproveita e salva no mapa para a próxima
+                        supabase.rpc('link_identities', { p_lid: unwrapped.key.remoteJid, p_phone: jid, p_company_id: companyId }).then(() => {});
+                    }
+                }
+            }
+        }
+
         // --- CORREÇÃO CRÍTICA: GARANTIA DE CONTATO ---
-        if (!isGroup) {
+        if (!fromMe && !isGroup) {
             await upsertContact(jid, companyId, pushName, null, false, null, false, null, { 
                 push_name: pushName,
                 last_message_at: new Date()
             });
-            
-            // 🔥 [NOVO] Busca foto do perfil para novos contatos imediatamente
-            if (isRealtime && !fromMe) {
-                refreshContactInfo(sock, jid, companyId, pushName).catch(() => {});
-            }
         }
         // ----------------------------------------------
 
@@ -161,7 +177,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             status: fromMe ? 'sent' : 'delivered',
             created_at: new Date( (unwrapped.messageTimestamp || Date.now() / 1000) * 1000 ),
             participant: participantJid, 
-            lead_id: null 
+            lead_id: isGroup ? null : undefined 
         };
 
         if (transcriptionText) {
@@ -170,7 +186,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
         
         if (!isGroup && !fromMe) {
-             const purePhone = Normalizer.toPhone(jid);
+             const purePhone = jid.split('@')[0].replace(/\D/g, '');
              const { data: lead } = await supabase.from('leads').select('id').eq('phone', purePhone).eq('company_id', companyId).maybeSingle();
              if (lead) messageData.lead_id = lead.id;
         }
