@@ -49,38 +49,35 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
     processedHistoryChunks.add(chunkKey);
 
     const estimatedProgress = progress || Math.min(10 + (chunkCounter * 2), 95);
-    console.log(`📚 [SYNC] Lote ${chunkCounter} | Contatos Brutos: ${contacts?.length || 0} | Msgs: ${messages?.length || 0}`);
+    console.log(`📚 [SYNC] Lote ${chunkCounter} | Processando Camadas...`);
     
     await updateSyncStatus(sessionId, 'importing_contacts', estimatedProgress);
 
     try {
         const contactsMap = new Map();
-        const contactsToFetchPic = [];
-
-        // --- FASE 1: CARREGAR DADOS DA AGENDA ---
         const identityPayload = [];
+
+        // --- CAMADA 1: IDENTIDADE (LID -> PHONE) ---
+        // Extraímos todos os vínculos de identidade antes de qualquer outra coisa
         if (contacts && contacts.length > 0) {
             for (const c of contacts) {
                 const jid = normalizeJid(c.id);
                 if (!jid || jid === 'status@broadcast') continue;
 
-                // Coleta mapeamentos LID -> Phone
                 if (c.lid) {
                     const cleanLid = normalizeJid(c.lid);
-                    const cleanPhone = jid;
-                    if (cleanLid !== cleanPhone) {
+                    if (cleanLid !== jid) {
                         identityPayload.push({
                             lid_jid: cleanLid,
-                            phone_jid: cleanPhone,
+                            phone_jid: jid,
                             company_id: companyId,
                             created_at: new Date()
                         });
-                        
-                        // [NOVO] Se o LID for mascarado em @s.whatsapp.net, salva também a versão @lid
+                        // Mapeamento duplo para garantir resolução em ambos os domínios
                         if (cleanLid.includes('@s.whatsapp.net')) {
                             identityPayload.push({
                                 lid_jid: cleanLid.replace('@s.whatsapp.net', '@lid'),
-                                phone_jid: cleanPhone,
+                                phone_jid: jid,
                                 company_id: companyId,
                                 created_at: new Date()
                             });
@@ -89,19 +86,17 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 }
 
                 const phoneName = c.name || c.notify || c.verifiedName;
-                const isFromBook = !!(c.name && c.name.trim().length > 0);
-
                 contactsMap.set(jid, { 
                     jid,
                     name: phoneName, 
-                    isFromBook: isFromBook,
+                    isFromBook: !!(c.name && c.name.trim().length > 0),
                     imgUrl: c.imgUrl,
                     verifiedName: c.verifiedName
                 });
             }
         }
 
-        // 🛡️ [NOVO] Salva mapeamentos de identidade antes de processar contatos/mensagens
+        // Persistência imediata da identidade (Hard Link)
         if (identityPayload.length > 0) {
             const ID_CHUNK = 500;
             for (let i = 0; i < identityPayload.length; i += ID_CHUNK) {
@@ -109,59 +104,21 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             }
         }
 
-        // --- FASE 2: MINERAÇÃO DE NOMES NAS MENSAGENS (NAME HARVESTER) ---
-        // Essencial para recuperar nomes de contatos que não estão na agenda mas têm PushName
-        if (messages && messages.length > 0) {
-            messages.forEach(msg => {
-                const clean = unwrapMessage(msg);
-                if (!clean.key) return;
-                
-                const remoteJid = normalizeJid(clean.key.remoteJid);
-                const participant = clean.key.participant ? normalizeJid(clean.key.participant) : null;
-                
-                const targetJid = participant || remoteJid;
-
-                if (targetJid && !targetJid.includes('status@broadcast') && clean.pushName) {
-                    const existing = contactsMap.get(targetJid);
-                    
-                    // Se não existe, ou existe mas sem nome da agenda, usa o pushName
-                    if (!existing || (!existing.isFromBook && !existing.name)) {
-                        contactsMap.set(targetJid, {
-                            jid: targetJid,
-                            name: clean.pushName,
-                            isFromBook: false,
-                            imgUrl: existing?.imgUrl,
-                            verifiedName: existing?.verifiedName
-                        });
-                    }
-                }
-            });
-        }
-
-        // --- FASE 3: PERSISTÊNCIA (CONTATOS ANTES DAS MENSAGENS) ---
+        // --- CAMADA 2: CONTATOS (PERSISTÊNCIA) ---
         const bulkPayload = [];
-        
         for (const [jid, data] of contactsMap.entries()) {
-             const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
-             const contactData = {
+            const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
+            const contactData = {
                 jid: jid,
-                phone: purePhone,
+                phone: purePhone.length <= 13 ? purePhone : null,
                 company_id: companyId,
                 updated_at: new Date()
             };
 
-            if (data.isFromBook) {
-                contactData.name = data.name;
-            } else if (data.name) {
-                contactData.push_name = data.name;
-            }
+            if (data.isFromBook) contactData.name = data.name;
+            else if (data.name) contactData.push_name = data.name;
 
-            if (data.imgUrl) {
-                contactData.profile_pic_url = data.imgUrl;
-            } else {
-                contactsToFetchPic.push({ jid, profile_pic_url: null });
-            }
-
+            if (data.imgUrl) contactData.profile_pic_url = data.imgUrl;
             if (data.verifiedName) {
                 contactData.verified_name = data.verifiedName;
                 contactData.is_business = true;
@@ -176,12 +133,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 await upsertContactsBulk(bulkPayload.slice(i, i + BATCH_SIZE));
             }
         }
-            
-        if (contactsToFetchPic.length > 0) {
-            fetchProfilePicsInBackground(sock, contactsToFetchPic, companyId);
-        }
 
-        // --- FASE 4: MENSAGENS E LEADS ---
+        // --- CAMADA 3: MENSAGENS (POR ÚLTIMO) ---
         if (messages && messages.length > 0) {
             await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress + 2);
             
@@ -189,14 +142,13 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             cutoffDate.setMonth(cutoffDate.getMonth() - HISTORY_MONTHS_LIMIT);
             const cutoffTimestamp = Math.floor(cutoffDate.getTime() / 1000);
 
+            // Agrupa por chat para processamento ordenado
             const chats = {}; 
-            
             messages.forEach(msg => {
                 let clean;
                 try { clean = unwrapMessage(msg); } catch(e) { return; } 
 
                 if (!clean.key?.remoteJid) return;
-                
                 const msgTs = Number(clean.messageTimestamp);
                 if (msgTs < cutoffTimestamp) return;
 
@@ -204,45 +156,23 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 if (!jid || jid === 'status@broadcast') return;
 
                 if (!chats[jid]) chats[jid] = [];
-                
-                // Injeta nome resolvido para criação correta do lead
-                const knownContact = contactsMap.get(jid);
-                if (knownContact) {
-                    clean._forcedName = knownContact.isFromBook ? knownContact.name : knownContact.name;
-                } else {
-                    clean._forcedName = clean.pushName;
-                }
-                
                 chats[jid].push(clean);
             });
 
-            const chatJids = Object.keys(chats);
-
-            for (const jid of chatJids) {
+            for (const jid of Object.keys(chats)) {
+                // Ordena mensagens por tempo
                 chats[jid].sort((a, b) => (Number(a.messageTimestamp) || 0) - (Number(b.messageTimestamp) || 0)); 
                 const topMessages = chats[jid].slice(-HISTORY_MSG_LIMIT);
                 
-                const latestMsg = topMessages[topMessages.length - 1];
-                if (latestMsg && latestMsg.messageTimestamp) {
-                    const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
-                    supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
-                }
-
-                // [OTIMIZAÇÃO] Processa mensagens do chat
                 for (const msg of topMessages) {
                     try {
-                        const options = { 
-                            // [ATIVAÇÃO] Download de mídia ativado para TODAS as 10 mensagens do histórico conforme solicitado
+                        // handleMessage agora usará o resolveJid refatorado da Etapa 1
+                        await handleMessage(msg, sock, companyId, sessionId, false, null, { 
                             downloadMedia: true, 
-                            fetchProfilePic: false, 
                             createLead: true 
-                        };
-                        
-                        await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
+                        });
                     } catch (msgError) {}
                 }
-                // [OTIMIZAÇÃO] Delay ligeiramente maior entre chats para dar tempo ao download de mídia
-                await sleep(50); 
             }
         }
 
