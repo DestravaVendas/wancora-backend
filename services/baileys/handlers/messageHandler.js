@@ -54,9 +54,10 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
 
         let jid = normalizeJid(unwrapped.key.remoteJid);
+        const myJid = normalizeJid(sock.user?.id);
         
         // 🛡️ [NORMALIZER] Resolve JID (LID -> Phone) de forma centralizada
-        jid = await Normalizer.resolve(jid, companyId);
+        jid = await Normalizer.resolve(jid, companyId, myJid);
 
         // [REFINE] Block Official WhatsApp Messages
         if (jid === '0@s.whatsapp.net') return;
