@@ -110,14 +110,31 @@ export const sendMessage = async ({
     driveFileId, 
     companyId,
     timingConfig // [NOVO] Configuração de tempo { min_delay, max_delay, override_typing_time }
-}) => {
-    return executeLocked(sessionId, async () => {
-        const session = sessions.get(sessionId);
-        if (!session || !session.sock) throw new Error(`Sessão ${sessionId} não encontrada.`);
+}, retryCount = 0) => {
+    
+    const session = sessions.get(sessionId);
 
-        const sock = session.sock;
+    // 🛡️ [AGUARDA CONEXÃO] Se o socket caiu (Erro 515), a IA não morre. Ela espera até 15s.
+    if (!session || !session.sock || !session.sock.ws || !session.sock.ws.isOpen) {
+        if (retryCount < 5) {
+            console.log(`⏳ [SENDER] Socket indisponível para ${sessionId}. Aguardando reconexão... (Tentativa ${retryCount + 1}/5)`);
+            await new Promise(r => setTimeout(r, 3000));
+            // Tenta novamente preservando todos os parâmetros
+            return sendMessage({ 
+                sessionId, to, type, content, url, caption, fileName, mimetype, 
+                ptt, poll, location, contact, product, card, driveFileId, companyId, timingConfig 
+            }, retryCount + 1);
+        }
+        throw new Error("Conexão com WhatsApp perdida ou fechada durante o processo de envio.");
+    }
+
+    return executeLocked(sessionId, async () => {
+        // Re-valida a sessão após ganhar o Lock (pode ter caído enquanto esperava na fila)
+        const currentSession = sessions.get(sessionId);
+        if (!currentSession || !currentSession.sock) throw new Error(`Sessão ${sessionId} não encontrada após lock.`);
+
+        const sock = currentSession.sock;
         let jid = normalizeJid(to);
-        // ... rest of the logic inside the task
 
         try {
             // [ANTI-BAN] Verifica se a conexão ainda está ativa antes de simular comportamento
