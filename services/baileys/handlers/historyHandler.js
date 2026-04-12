@@ -38,29 +38,36 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 // Mapeia LIDs para telefones, crucial para unificação
                 if (c.lid) {
-                    identityPayload.push({ lid_jid: normalizeJid(c.lid), phone_jid: jid, company_id: companyId });
+                    const cleanLid = normalizeJid(c.lid);
+                    identityPayload.push({ lid_jid: cleanLid, phone_jid: jid, company_id: companyId });
                 }
 
                 contactsMap.set(jid, {
                     jid,
                     name: c.name || c.notify || c.verifiedName, 
                     isFromBook: !!c.name,
-                    imgUrl: c.imgUrl
+                    imgUrl: c.imgUrl || null
                 });
             }
         }
 
-        // --- CAMADA 2: MINERAÇÃO DE MENSAGENS (Fallback de Identidade) ---
+        // --- CAMADA 2: MINERAÇÃO DE MENSAGENS (Fallback de Identidade e Contatos) ---
         if (messages && messages.length > 0) {
             for (const msg of messages) {
                 const clean = unwrapMessage(msg);
                 const jid = normalizeJid(clean.key.remoteJid);
                 if (!jid || jid.includes('@broadcast')) continue;
 
-                if (!contactsMap.has(jid) && clean.pushName) {
+                // Se a mensagem tem um LID no participante (em grupos), mapeia também
+                if (clean.key.participant && clean.key.participant.includes('@lid')) {
+                    // Infelizmente aqui não temos o telefone correspondente fácil, 
+                    // mas o Baileys emitirá o identity-map.update depois.
+                }
+
+                if (!contactsMap.has(jid)) {
                     contactsMap.set(jid, {
                         jid,
-                        name: clean.pushName,
+                        name: clean.pushName || null,
                         isFromBook: false,
                         imgUrl: null
                     });
@@ -68,18 +75,20 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             }
         }
 
-        // Persistência de Identidade (LID -> Phone)
+        // 1. Persistência de Identidade (LID -> Phone) - DEVE SER PRIMEIRO
         if (identityPayload.length > 0) {
             await supabase.from('identity_map').upsert(identityPayload, { onConflict: 'lid_jid, company_id' });
             Logger.info('sync', `[SYNC] ${identityPayload.length} LIDs mapeados para ${sessionId}.`, { companyId, sessionId });
         }
 
-        // Persistência de Contatos em Lote
+        // 2. Persistência de Contatos em Lote
         if (contactsMap.size > 0) {
             const bulkContacts = [];
+            const myJid = normalizeJid(sock.user?.id);
+
             for (const c of contactsMap.values()) {
                 // Resolve JID (LID -> Phone) antes de salvar o contato
-                const resolvedJid = await resolveJid(c.jid, companyId);
+                const resolvedJid = await resolveJid(c.jid, companyId, myJid);
                 
                 bulkContacts.push({
                     jid: resolvedJid,
@@ -90,6 +99,19 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     phone: resolvedJid.split('@')[0].replace(/\D/g, ''),
                     updated_at: new Date()
                 });
+
+                // 🔥 [MELHORIA] Se não tem foto, tenta buscar (Background)
+                if (!c.imgUrl && !resolvedJid.includes('@g.us')) {
+                    sock.profilePictureUrl(resolvedJid, 'image').then(url => {
+                        if (url) {
+                            supabase.from('contacts')
+                                .update({ profile_pic_url: url, profile_pic_updated_at: new Date() })
+                                .eq('jid', resolvedJid)
+                                .eq('company_id', companyId)
+                                .then(() => {});
+                        }
+                    }).catch(() => {});
+                }
             }
             await upsertContactsBulk(bulkContacts);
             Logger.info('sync', `[SYNC] ${bulkContacts.length} contatos upserted para ${sessionId}.`, { companyId, sessionId });
