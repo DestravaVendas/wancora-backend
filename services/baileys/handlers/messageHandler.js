@@ -173,11 +173,10 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             content: body,
             message_type: type?.replace('Message', '') || 'unknown',
             media_url: mediaUrl,
-            transcription: transcriptionText, // 🛡️ NOVO: Adiciona ao objeto para o Sentinel
             status: fromMe ? 'sent' : 'delivered',
             created_at: new Date( (unwrapped.messageTimestamp || Date.now() / 1000) * 1000 ),
             participant: participantJid, 
-            lead_id: isGroup ? null : undefined 
+            lead_id: null // 🛡️ CORREÇÃO: Usar null em vez de undefined. Undefined destrói o fetch do Supabase.
         };
 
         if (transcriptionText) {
