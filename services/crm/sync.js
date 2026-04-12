@@ -1,4 +1,3 @@
-
 import { createClient } from "@supabase/supabase-js";
 import { normalizeJid } from "../../utils/wppParsers.js";
 import { Logger } from "../../utils/logger.js"; 
@@ -116,9 +115,12 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         if (!jid || !companyId || jid.includes('status@broadcast') || jid.includes('@newsletter')) return;
 
         const cleanJid = normalizeJid(jid);
-        const purePhone = cleanJid.split('@')[0].replace(/\D/g, ''); 
         
-        const updateData = { jid: cleanJid, phone: purePhone, company_id: companyId, updated_at: new Date(), ...extraData };
+        // 🛡️ CORREÇÃO DE LID: Só extrai telefone se NÃO for um LID
+        const purePhone = cleanJid.includes('@s.whatsapp.net') ? cleanJid.split('@')[0].replace(/\D/g, '') : null; 
+        
+        const updateData = { jid: cleanJid, company_id: companyId, updated_at: new Date(), ...extraData };
+        if (purePhone) updateData.phone = purePhone; // Só adiciona o phone no payload se ele existir
 
         if (isBusiness) updateData.is_business = true;
         if (verifiedName) updateData.verified_name = verifiedName;
@@ -238,21 +240,27 @@ export const upsertMessage = async (msgData) => {
     try {
         if (msgData.remote_jid.includes('status@broadcast')) return;
         const cleanRemoteJid = normalizeJid(msgData.remote_jid);
+
+        // 🛡️ SANITIZAÇÃO ANTI-CRASH: Remove qualquer chave 'undefined' do payload
         const finalData = { ...msgData, remote_jid: cleanRemoteJid };
+        Object.keys(finalData).forEach(key => finalData[key] === undefined && delete finalData[key]);
 
         await safeSupabaseCall(async () => {
             // 1. Upsert da Mensagem
             await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
 
             // 2. [GARANTIA] Upsert do Contato para garantir que apareça na Inbox
-            // O gatilho de banco 'trigger_update_chat_stats' cuidará do unread_count e last_message_at
-            // Mas aqui garantimos que o registro do contato exista.
             if (!msgData.from_me) {
-                const phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
+                // 🛡️ CORREÇÃO DE LID: Só extrai o telefone se for um JID real. LIDs não têm telefone.
+                let phone = null;
+                if (cleanRemoteJid.includes('@s.whatsapp.net')) {
+                    phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
+                }
+
                 await supabase.from('contacts').upsert({
                     jid: cleanRemoteJid,
                     company_id: msgData.company_id,
-                    phone: phone,
+                    phone: phone, // Agora manda null se for LID, mantendo o banco limpo
                     last_message_at: msgData.created_at || new Date()
                 }, { onConflict: 'jid, company_id' });
             }
