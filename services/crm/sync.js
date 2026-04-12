@@ -63,24 +63,22 @@ const isGenericName = (name, phone) => {
     return !/[a-zA-Z\u00C0-\u00FF]/.test(cleanName); 
 };
 
-/**
- * 🛡️ [NORMALIZER SERVICE] Resolve JID LID para JID de Telefone usando o mapa de identidade
- * Detecta também IDs técnicos (LIDs) mascarados como números de telefone.
- */
+// 🛡️ [NORMALIZER SERVICE] Resolve JID LID para JID de Telefone usando o mapa de identidade
+// Detecta também IDs técnicos (LIDs) mascarados como números de telefone.
 export const resolveJid = async (jid, companyId) => {
     if (!jid) return null;
     
     let cleanJid = normalizeJid(jid);
     const pureId = cleanJid.split('@')[0];
     
-    // 🛡️ [DETECÇÃO AVANÇADA] 
-    // Se o ID for muito longo (> 13 dígitos) ou contiver @lid, é um identificador técnico
+    // 🛡️ [DETECÇÃO TÉCNICA] 
+    // IDs > 13 dígitos ou com sufixo @lid são identificadores técnicos (LIDs)
     const isTechnicalId = cleanJid.includes('@lid') || (pureId.length > 13 && /^\d+$/.test(pureId));
     
     if (!isTechnicalId) return cleanJid;
 
     try {
-        // 1. Busca no Mapa de Identidade (Hard Resolution)
+        // 1. Hard Resolution (Mapa de Identidade no DB)
         const { data } = await supabase
             .from('identity_map')
             .select('phone_jid')
@@ -90,7 +88,7 @@ export const resolveJid = async (jid, companyId) => {
 
         if (data?.phone_jid) return normalizeJid(data.phone_jid);
 
-        // 2. Se for um LID mascarado em @s.whatsapp.net, tenta buscar o inverso no mapa
+        // 2. Fallback: Se for um LID mascarado em @s.whatsapp.net, tenta buscar a versão @lid
         if (cleanJid.includes('@s.whatsapp.net')) {
              const lidEquivalent = cleanJid.replace('@s.whatsapp.net', '@lid');
              const { data: inverseMap } = await supabase
@@ -102,11 +100,11 @@ export const resolveJid = async (jid, companyId) => {
              if (inverseMap?.phone_jid) return normalizeJid(inverseMap.phone_jid);
         }
 
-        // 3. Soft Resolution (Heurística baseada em contatos existentes)
-        const purePhone = pureId.replace(/\D/g, '');
-        if (purePhone.length >= 10 && !purePhone.startsWith('0')) {
-            const phoneJid = `${purePhone}@s.whatsapp.net`;
-            // Linka preventivamente se o número parecer válido
+        // 3. Heurística: Se o ID técnico PARECE um telefone (ex: 55...), assume como tal
+        // Isso resolve o problema de quando o WhatsApp manda o LID mas ele tem formato de número
+        if (pureId.length >= 10 && pureId.startsWith('55')) {
+            const phoneJid = `${pureId}@s.whatsapp.net`;
+            // Registra o vínculo para futuras mensagens
             supabase.rpc('link_identities', { p_lid: cleanJid, p_phone: phoneJid, p_company_id: companyId }).then(() => {});
             return phoneJid;
         }
@@ -368,12 +366,13 @@ export const upsertMessage = async (msgData) => {
         if (isTechnical) {
             const resolved = await resolveJid(originalJid, msgData.company_id);
             if (resolved && resolved !== originalJid) {
-                console.log(`🔗 [SYNC] Unificando ID Técnico ${originalJid} -> ${resolved}`);
                 canonicalJid = resolved;
             }
         }
 
-        const purePhone = canonicalJid.includes('@s.whatsapp.net') 
+        // 🛡️ [FIX] Se o canonical_jid for um grupo, não tentamos extrair telefone
+        const isGroup = canonicalJid.includes('@g.us');
+        const purePhone = (!isGroup && canonicalJid.includes('@s.whatsapp.net')) 
             ? canonicalJid.split('@')[0].replace(/\D/g, '') 
             : null;
 
@@ -382,44 +381,28 @@ export const upsertMessage = async (msgData) => {
 
         const finalData = { 
             ...msgData, 
-            remote_jid: originalJid,     // Mantém o ID original do Baileys para integridade
-            lid_jid: lidJid,             // Armazena o LID para o Trigger de unificação retroativa
-            canonical_jid: canonicalJid, // O ID unificado (Telefone se soubermos)
-            phone: finalPhone            // Apenas números reais para busca e CRM
+            remote_jid: originalJid,     // ID original do Baileys
+            lid_jid: lidJid,             // ID técnico para unificação
+            canonical_jid: canonicalJid, // ID unificado (Telefone se soubermos)
+            phone: finalPhone            // Apenas números reais
         };
 
-        // 🛡️ [FIX] Remove undefined values to prevent Supabase client issues (fetch failed)
-        Object.keys(finalData).forEach(key => finalData[key] === undefined && delete finalData[key]);
-
+        // Notifica atividade para o indicador visual
         notifyActivity(msgData.company_id, msgData.session_id, 'message_upsert');
 
         await safeSupabaseCall(async () => {
-            // 🛡️ [DEBUG] Log para rastrear mensagens fromMe que não aparecem
-            if (msgData.from_me) {
-                console.log(`💾 [SYNC] Salvando mensagem fromMe: ${msgData.whatsapp_id} para ${canonicalJid}`);
-            }
-
-            // 1. Upsert da Mensagem (Agora usando a restrição unificada por whatsapp_id)
+            // 1. Upsert da Mensagem
             const { error: msgError } = await supabase.from('messages').upsert(finalData, { onConflict: 'company_id, whatsapp_id' });
-            if (msgError) {
-                console.error(`❌ [SYNC] Erro Supabase ao salvar mensagem (${msgData.whatsapp_id}):`, msgError.message, {
-                    code: msgError.code,
-                    details: msgError.details,
-                    hint: msgError.hint
-                });
-                throw msgError;
-            }
+            if (msgError) throw msgError;
 
-            // 2. [GARANTIA] Upsert do Contato (Sempre usando o JID Canônico para evitar duplicidade na Inbox)
-            const { error: contactError } = await supabase.from('contacts').upsert({
-                jid: canonicalJid,
-                company_id: msgData.company_id,
-                phone: purePhone,
-                last_message_at: msgData.created_at || new Date()
-            }, { onConflict: 'jid, company_id' });
-
-            if (contactError) {
-                console.error(`❌ [SYNC] Erro Supabase ao atualizar contato:`, contactError.message);
+            // 2. [GARANTIA] Atualiza o contato com o JID Canônico
+            if (!isGroup) {
+                await supabase.from('contacts').upsert({
+                    jid: canonicalJid,
+                    company_id: msgData.company_id,
+                    phone: finalPhone,
+                    last_message_at: msgData.created_at || new Date()
+                }, { onConflict: 'jid, company_id' });
             }
         });
     } catch (e) {
