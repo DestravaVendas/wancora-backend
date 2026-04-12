@@ -5,14 +5,59 @@ import { unwrapMessage } from '../../../utils/wppParsers.js';
 import mime from 'mime-types';
 import pino from 'pino';
 import sharp from 'sharp'; 
+import getRedisClient from '../../redisClient.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'silent' });
 
+/**
+ * 🛡️ [MEDIA CACHE]
+ * Verifica se a mídia já foi processada para evitar downloads e uploads redundantes.
+ */
+const getCachedMedia = async (msgId, companyId) => {
+    const redis = getRedisClient();
+    const cacheKey = `media_url:${companyId}:${msgId}`;
+    
+    if (redis && redis.status === 'ready') {
+        const cached = await redis.get(cacheKey);
+        if (cached) return cached;
+    }
+
+    // Fallback: Busca no banco de dados
+    const { data } = await supabase
+        .from('messages')
+        .select('media_url')
+        .eq('whatsapp_id', msgId)
+        .eq('company_id', companyId)
+        .not('media_url', 'is', null)
+        .maybeSingle();
+
+    if (data?.media_url) {
+        if (redis && redis.status === 'ready') {
+            await redis.set(cacheKey, data.media_url, 'EX', 86400); // Cache de 24h
+        }
+        return data.media_url;
+    }
+
+    return null;
+};
+
+const setMediaCache = async (msgId, companyId, url) => {
+    const redis = getRedisClient();
+    if (redis && redis.status === 'ready') {
+        const cacheKey = `media_url:${companyId}:${msgId}`;
+        await redis.set(cacheKey, url, 'EX', 86400);
+    }
+};
+
 export const handleMediaUpload = async (rawMsg, companyId) => {
     try {
-        // 1. Sanitização: Desenrola a mensagem para acessar o conteúdo real (ViewOnce, Ephemeral, etc)
         const msg = unwrapMessage(rawMsg);
+        const msgId = msg.key.id;
+
+        // 🛡️ [CACHE CHECK]
+        const cachedUrl = await getCachedMedia(msgId, companyId);
+        if (cachedUrl) return cachedUrl;
 
         // PATCH: User-Agent Genérico para evitar bloqueio no download
         const downloadOptions = {
@@ -85,7 +130,12 @@ export const handleMediaUpload = async (rawMsg, companyId) => {
         }
 
         const { data } = supabase.storage.from('chat-media').getPublicUrl(filePath);
-        return data.publicUrl;
+        const publicUrl = data.publicUrl;
+
+        // 🛡️ [CACHE SET]
+        await setMediaCache(msgId, companyId, publicUrl);
+
+        return publicUrl;
 
     } catch (e) {
         const m = e.message || '';
