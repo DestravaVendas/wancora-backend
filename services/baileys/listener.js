@@ -1,4 +1,3 @@
-
 import { updateSyncStatus } from '../crm/sync.js';
 import { handlePresenceUpdate, handleContactsUpsert } from './handlers/contactHandler.js';
 import { handleReceiptUpdate, handleMessageUpdate, handleReaction } from './handlers/messageHandler.js';
@@ -25,7 +24,33 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // 2. PRESENÇA & CONTATOS
     sock.ev.on('presence.update', (update) => handlePresenceUpdate(update, companyId));
     
-    sock.ev.on('contacts.upsert', (contacts) => handleContactsUpsert(contacts, companyId));
+    sock.ev.on('contacts.upsert', async (contacts) => {
+        // 1. Mantém a rotina original de salvar contatos
+        handleContactsUpsert(contacts, companyId);
+        
+        // 2. 🛡️ [MAPA DE IDENTIDADE] O WhatsApp entrega a relação LID <-> Phone aqui
+        try {
+            const { createClient } = await import('@supabase/supabase-js');
+            const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+
+            for (const contact of contacts) {
+                // Se o contato veio com o número de telefone E o código LID
+                if (contact.id && contact.lid) {
+                    const cleanPhone = contact.id.replace(/:[0-9]+@/, '@'); // Remove porta de dispositivo
+                    const cleanLid = contact.lid.replace(/:[0-9]+@/, '@');
+
+                    // Executa a RPC silenciosamente para mapear no banco
+                    supabase.rpc('link_identities', { 
+                        p_lid: cleanLid, 
+                        p_phone: cleanPhone, 
+                        p_company_id: companyId 
+                    }).catch(() => {});
+                }
+            }
+        } catch (e) {
+            console.error("❌ [LISTENER] Erro no mapeamento de LID:", e.message);
+        }
+    });
     
     sock.ev.on('contacts.update', async (updates) => {
         for (const update of updates) {
