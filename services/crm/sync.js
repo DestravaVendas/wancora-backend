@@ -241,29 +241,26 @@ export const upsertMessage = async (msgData) => {
         if (msgData.remote_jid.includes('status@broadcast')) return;
         const cleanRemoteJid = normalizeJid(msgData.remote_jid);
 
-        // 🛡️ SANITIZAÇÃO ANTI-CRASH: Remove qualquer chave 'undefined' do payload
         const finalData = { ...msgData, remote_jid: cleanRemoteJid };
         Object.keys(finalData).forEach(key => finalData[key] === undefined && delete finalData[key]);
 
         await safeSupabaseCall(async () => {
-            // 1. Upsert da Mensagem
             await supabase.from('messages').upsert(finalData, { onConflict: 'remote_jid, whatsapp_id' });
 
-            // 2. [GARANTIA] Upsert do Contato para garantir que apareça na Inbox
-            if (!msgData.from_me) {
-                // 🛡️ CORREÇÃO DE LID: Só extrai o telefone se for um JID real. LIDs não têm telefone.
-                let phone = null;
-                if (cleanRemoteJid.includes('@s.whatsapp.net')) {
-                    phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
-                }
-
-                await supabase.from('contacts').upsert({
-                    jid: cleanRemoteJid,
-                    company_id: msgData.company_id,
-                    phone: phone, // Agora manda null se for LID, mantendo o banco limpo
-                    last_message_at: msgData.created_at || new Date()
-                }, { onConflict: 'jid, company_id' });
+            // 🛡️ CORREÇÃO CRÍTICA: Salva/Atualiza o contato MESMO SE A MENSAGEM FOR ENVIADA POR VOCÊ (from_me: true)
+            // Isso garante que a conversa apareça e suba para o topo da lista de chats do Wancora!
+            let phone = null;
+            if (cleanRemoteJid.includes('@s.whatsapp.net')) {
+                phone = cleanRemoteJid.split('@')[0].replace(/\D/g, '');
+                if (phone.length > 14) phone = null; // Proteção extra contra LIDs na coluna phone
             }
+
+            await supabase.from('contacts').upsert({
+                jid: cleanRemoteJid,
+                company_id: msgData.company_id,
+                phone: phone,
+                last_message_at: msgData.created_at || new Date()
+            }, { onConflict: 'jid, company_id' });
         });
     } catch (e) {
         console.error(`❌ [SYNC] Erro upsertMessage:`, e.message);
