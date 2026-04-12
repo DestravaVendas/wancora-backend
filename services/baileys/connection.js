@@ -167,6 +167,14 @@ export const killSession = async (sessionId) => {
     }
 };
 
+export const shutdownAllSessions = async () => {
+    console.log(`🛑 [BAILEYS] Encerrando todas as ${sessions.size} sessões ativas...`);
+    const sessionIds = Array.from(sessions.keys());
+    for (const sessionId of sessionIds) {
+        await killSession(sessionId);
+    }
+};
+
 export const deleteSession = async (sessionId, companyId) => {
     await killSession(sessionId);
     await deleteSessionData(sessionId, companyId);
