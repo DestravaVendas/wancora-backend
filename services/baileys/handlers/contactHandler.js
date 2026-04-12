@@ -1,6 +1,7 @@
 
 import { upsertContact, upsertContactsBulk, normalizeJid } from '../../crm/sync.js';
 import { createClient } from '@supabase/supabase-js';
+import { Normalizer } from '../normalizer.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const presenceDebounce = new Map();
@@ -13,20 +14,8 @@ export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
     const presences = presenceUpdate.presences;
 
     // --- LID RESOLVER PARA PRESENÇA ---
-    if (id.includes('@lid')) {
-        const { data } = await supabase
-            .from('identity_map')
-            .select('phone_jid')
-            .eq('lid_jid', normalizeJid(id))
-            .eq('company_id', companyId)
-            .maybeSingle();
-            
-        if (data?.phone_jid) {
-            id = data.phone_jid; 
-        } else {
-            return; 
-        }
-    }
+    id = await Normalizer.resolve(id, companyId);
+    if (!id) return;
 
     const jid = normalizeJid(id);
 
