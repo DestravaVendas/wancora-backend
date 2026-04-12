@@ -52,6 +52,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // 4. HISTÓRICO (SYNC)
     sock.ev.on('messaging-history.set', (data) => {
         historyChunkCounter++;
+        console.log(`📚 [LISTENER] Recebido chunk de histórico #${historyChunkCounter} para ${sessionId}`);
         handleHistorySync(data, sock, sessionId, companyId, historyChunkCounter);
     });
 };
