@@ -116,7 +116,7 @@ export const upsertContactsBulk = async (contactsArray) => {
             }
         }
 
-        const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
+        const purePhone = Normalizer.toPhone(cleanJid);
         const contactData = { ...c, jid: cleanJid, phone: purePhone };
         
         // 🛡️ [FIX] Remove undefined values
@@ -159,7 +159,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
             }
         }
 
-        const purePhone = cleanJid.split('@')[0].replace(/\D/g, ''); 
+        const purePhone = Normalizer.toPhone(cleanJid); 
         
         const updateData = { jid: cleanJid, phone: purePhone, company_id: companyId, updated_at: new Date(), ...extraData };
 
@@ -228,8 +228,8 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         if (cleanMyJid && cleanJid === cleanMyJid) return null;
     }
 
-    const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
-    if (purePhone.length < 8 || purePhone.length > 15) return null;
+    const purePhone = Normalizer.toPhone(cleanJid);
+    if (!purePhone || purePhone.length < 8 || purePhone.length > 15) return null;
     
     // 🛡️ LOCK: Evita que duas mensagens do mesmo lead criem dois registros no Supabase
     const locked = await isLeadLocked(companyId, purePhone);
