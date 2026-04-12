@@ -65,8 +65,8 @@ const isGenericName = (name, phone) => {
 };
 
 // 🛡️ [NORMALIZER SERVICE] Resolve JID LID para JID de Telefone usando o mapa de identidade
-export const resolveJid = async (jid, companyId) => {
-    return await Normalizer.resolve(jid, companyId);
+export const resolveJid = async (jid, companyId, myJid = null) => {
+    return await Normalizer.resolve(jid, companyId, myJid);
 };
 
 export const notifyActivity = (companyId, sessionId, type) => {
