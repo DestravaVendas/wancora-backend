@@ -14,11 +14,17 @@ export class Normalizer {
     /**
      * Resolve um JID (que pode ser LID) para o JID de telefone real.
      */
-    static async resolve(jid, companyId) {
+    static async resolve(jid, companyId, myJid = null) {
         if (!jid) return null;
         
         const cleanJid = normalizeJid(jid);
         const pureId = cleanJid.split('@')[0];
+
+        // 🛡️ [SELF-DETECTION] Se o JID for o meu próprio, retorna o canônico 'me' ou o telefone
+        if (myJid) {
+            const cleanMyJid = normalizeJid(myJid);
+            if (cleanJid === cleanMyJid) return cleanMyJid;
+        }
         
         // 🛡️ [DETECÇÃO TÉCNICA] 
         const isTechnicalId = cleanJid.includes('@lid') || (pureId.length > 13 && /^\d+$/.test(pureId));
@@ -48,7 +54,7 @@ export class Normalizer {
             }
 
             // 3. Heurística: Se o ID técnico PARECE um telefone (ex: 55...), assume como tal
-            if (pureId.length >= 10 && pureId.startsWith('55')) {
+            if (pureId.length >= 10 && pureId.startsWith('55') && !cleanJid.includes('@lid')) {
                 const phoneJid = `${pureId}@s.whatsapp.net`;
                 // Registra o vínculo para futuras mensagens via RPC
                 supabase.rpc('link_identities', { 
