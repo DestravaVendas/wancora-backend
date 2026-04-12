@@ -258,7 +258,16 @@ const processAIResponse = async (messageData) => {
         
         const nextTask = currentLock.then(async () => {
             try {
-                await _internalProcessAI(consolidatedData);
+                // 🛡️ [ESTABILIDADE] Timeout de 2 minutos para o processamento total da IA
+                const timeoutPromise = new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error("TIMEOUT_SENTINEL")), 120000)
+                );
+
+                await Promise.race([
+                    _internalProcessAI(consolidatedData),
+                    timeoutPromise
+                ]);
+
                 // Marca todas as mensagens do buffer como processadas
                 for (const m of finalMessages) {
                     await markAsProcessed(m.whatsapp_id, m.company_id);
