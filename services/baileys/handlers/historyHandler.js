@@ -22,8 +22,8 @@ export const resetHistoryState = (sessionId) => {
 };
 
 const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
-    const CONCURRENCY = 3; 
-    const DELAY = 800;
+    const CONCURRENCY = 1; // 🛡️ Reduzido de 3 para 1. Evita flood e 'bad-request' na Meta
+    const DELAY = 1500;    // 🛡️ Aumentado para 1.5s entre requisições
     
     (async () => {
         for (let i = 0; i < contacts.length; i += CONCURRENCY) {
@@ -32,7 +32,6 @@ const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
                 try {
                     const newUrl = await sock.profilePictureUrl(c.jid, 'image').catch(() => null);
                     if (newUrl) {
-                        // Atualiza apenas a foto
                         await upsertContact(c.jid, companyId, null, newUrl, false, null, false, null, { profile_pic_updated_at: new Date() });
                     }
                 } catch (e) {}
