@@ -325,3 +325,58 @@ export const triggerAITest = async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 };
+
+* 🛡️ [FEATURE] Atualiza/Baixa a foto de perfil de um contato sob demanda.
+ * Trata erros de timeout e privacidade de forma graciosa.
+ */
+export const refreshContactPic = async (req, res) => {
+    const { jid, sessionId, companyId } = req.body;
+    
+    if (!jid || !sessionId || !companyId) {
+        return res.status(400).json({ error: "JID, SessionID e CompanyID são obrigatórios" });
+    }
+
+    const session = sessions.get(sessionId);
+    if (!session || !session.sock) {
+        return res.status(404).json({ error: "Sessão do WhatsApp não encontrada ou desconectada na memória." });
+    }
+
+    try {
+        // 🛡️ TIMEOUT RACE: O WhatsApp pode demorar a responder se o alvo estiver offline.
+        // Forçamos o cancelamento em 10 segundos para não prender a UI do cliente.
+        const fetchPicPromise = session.sock.profilePictureUrl(jid, 'image');
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('TIMEOUT_BAILEYS')), 10000)
+        );
+
+        const ppUrl = await Promise.race([fetchPicPromise, timeoutPromise]);
+
+        if (ppUrl) {
+            // Salva a nova URL no Supabase (Atualizando o timestamp)
+            await supabase.from('contacts')
+                .update({ profile_pic_url: ppUrl, profile_pic_updated_at: new Date() })
+                .eq('jid', jid)
+                .eq('company_id', companyId);
+
+            return res.json({ profilePicUrl: ppUrl });
+        }
+
+        return res.json({ profilePicUrl: null, status: 'no_picture' });
+
+    } catch (error) {
+        const msg = error.message || '';
+        
+        // Trata erro de "Privacidade" (Foto visível só para contatos)
+        if (msg.includes('not-authorized') || msg.includes('item-not-found') || msg.includes('401')) {
+            return res.json({ profilePicUrl: null, status: 'private_or_empty' });
+        }
+        
+        // Trata a demora da Meta
+        if (msg.includes('TIMEOUT_BAILEYS')) {
+            return res.json({ profilePicUrl: null, status: 'timeout' });
+        }
+
+        console.error(`❌ [REFRESH PIC] Erro interno para ${jid}:`, msg);
+        return res.status(500).json({ error: "Erro ao comunicar com o WhatsApp" });
+    }
+};
