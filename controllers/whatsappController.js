@@ -326,9 +326,8 @@ export const triggerAITest = async (req, res) => {
     }
 };
 
-* 🛡️ [FEATURE] Atualiza/Baixa a foto de perfil de um contato sob demanda.
- * Trata erros de timeout e privacidade de forma graciosa.
- */
+// 🛡️ [FEATURE] Atualiza/Baixa a foto de perfil de um contato sob demanda.
+// Trata erros de timeout e privacidade de forma graciosa.
 export const refreshContactPic = async (req, res) => {
     const { jid, sessionId, companyId } = req.body;
     
