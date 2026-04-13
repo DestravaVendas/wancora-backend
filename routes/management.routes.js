@@ -28,4 +28,9 @@ router.post("/catalog/sync", syncCatalog);
 router.post("/stress/campaign", triggerStressTest);
 router.post("/stress/ai", triggerAITest);
 
+router.get('/instances/:sessionId/sync-status', authMiddleware, whatsappController.getSyncStatus);
+
+// 🛡️ [NOVO] Rota para Refresh Manual de Foto de Perfil
+router.post('/contact/refresh-pic', authMiddleware, whatsappController.refreshContactPic);
+
 export default router;
