@@ -2,14 +2,41 @@ import { getContentType, normalizeJid, unwrapMessage, getBody } from '../../../u
 import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 import { upsertMessage, ensureLeadExists, upsertContact } from '../../crm/sync.js';
 import { handleMediaUpload } from './mediaHandler.js';
-import { refreshContactInfo } from './contactHandler.js'; 
+import { refreshContactInfo } from './contactHandler.js';
 import { dispatchWebhook } from '../../integrations/webhook.js';
-import { transcribeAudio } from '../../ai/transcriber.js'; 
+import { transcribeAudio } from '../../ai/transcriber.js';
 import { createClient } from '@supabase/supabase-js';
-import { Logger } from '../../../utils/logger.js'; 
+import { Logger } from '../../../utils/logger.js';
 import axios from 'axios';
-import { aiBus } from '../../scheduler/sentinel.js'; 
-import getRedisClient from '../../redisClient.js'; // 🛡️ NOVO: Importação do Redis
+import { aiBus } from '../../scheduler/sentinel.js';
+import getRedisClient from '../../redisClient.js';
+
+// =============================================================================
+// TIMEOUTS DE OPERAÇÕES PESADAS
+//
+// Operações de I/O de longa duração (download de mídia, transcrição por IA)
+// rodam dentro de um slot do messageQueue. Se não tiverem timeout, um único
+// serviço externo travado pode prender o worker indefinidamente.
+//
+// Estes timeouts são um "último recurso" — o timeout primário fica no messageQueue.
+// Aqui servem para retornar null graciosamente e não propagar exceção.
+// =============================================================================
+const MEDIA_DOWNLOAD_TIMEOUT_MS = 60_000;  // 60s para download + upload ao Supabase Storage
+const TRANSCRIPTION_TIMEOUT_MS  = 45_000;  // 45s para chamada à IA de transcrição
+
+/**
+ * Wrapper de timeout para Promises — retorna fallback em vez de rejeitar.
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {T} fallback - Valor retornado ao expirar
+ * @returns {Promise<T>}
+ */
+const withTimeout = (promise, ms, fallback = null) =>
+    Promise.race([
+        promise,
+        new Promise(resolve => setTimeout(() => resolve(fallback), ms))
+    ]);
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -148,20 +175,56 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             }
         }
 
+        // ─────────────────────────────────────────────────────────────────────
+        // DOWNLOAD DE MÍDIA (com timeout blindado)
+        //
+        // handleMediaUpload envolve: download do CDN do WA + upload Supabase Storage.
+        // É a operação mais pesada do handler. O timeout de 60s libera o slot
+        // da fila caso o CDN do WhatsApp esteja lento, sem travar outros usuários.
+        // ─────────────────────────────────────────────────────────────────────
         let mediaUrl = null;
         if (isMedia && (isRealtime || downloadMedia)) {
-            mediaUrl = await handleMediaUpload(unwrapped, companyId);
+            mediaUrl = await withTimeout(
+                handleMediaUpload(unwrapped, companyId),
+                MEDIA_DOWNLOAD_TIMEOUT_MS
+            );
+            if (!mediaUrl) {
+                Logger.error('baileys', `[HANDLER] Timeout no download de mídia (msg ${unwrapped.key?.id})`, {}, companyId);
+            }
         }
 
-        let transcriptionText = null;
+        // ─────────────────────────────────────────────────────────────────────
+        // TRANSCRIÇÃO DE ÁUDIO (fire-and-forget — NÃO bloqueia o slot da fila)
+        //
+        // A transcrição pode levar 10-30s (modelo de IA externo). Bloquear o
+        // worker esperando ela significa que NENHUMA outra mensagem da mesma
+        // sessão pode ser processada nesse slot durante esse tempo.
+        //
+        // Solução: lançamos a transcrição em background e salvamos o resultado
+        // no banco via update quando ela terminar — sem travar o fluxo principal.
+        // ─────────────────────────────────────────────────────────────────────
         if (isRealtime && mediaUrl && type === 'audioMessage') {
-             try {
-                 const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
-                 const buffer = Buffer.from(response.data);
-                 transcriptionText = await transcribeAudio(buffer, 'audio/ogg', companyId);
-             } catch (err) {
-                 console.error("❌ [HANDLER] Erro na transcrição:", err.message);
-             }
+            const msgIdForTranscription = unwrapped.key.id;
+            const companyIdForTranscription = companyId;
+
+            // 🚀 FIRE-AND-FORGET: não bloqueia o slot da fila
+            withTimeout(
+                axios.get(mediaUrl, { responseType: 'arraybuffer' })
+                    .then(response => transcribeAudio(Buffer.from(response.data), 'audio/ogg', companyIdForTranscription)),
+                TRANSCRIPTION_TIMEOUT_MS
+            ).then(transcriptionText => {
+                if (transcriptionText) {
+                    // Update assíncrono — salva a transcrição quando a IA responder
+                    supabase.from('messages')
+                        .update({ transcription: transcriptionText })
+                        .eq('whatsapp_id', msgIdForTranscription)
+                        .eq('company_id', companyIdForTranscription)
+                        .then(() => {})
+                        .catch(err => Logger.error('baileys', `[HANDLER] Falha ao salvar transcrição ${msgIdForTranscription}`, { error: err.message }, companyIdForTranscription));
+                }
+            }).catch(err => {
+                Logger.error('baileys', `[HANDLER] Erro na transcrição de áudio ${msgIdForTranscription}`, { error: err.message }, companyIdForTranscription);
+            });
         }
 
         const messageData = {
@@ -179,10 +242,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             lead_id: null // 🛡️ CORREÇÃO: Usar null em vez de undefined. Undefined destrói o fetch do Supabase.
         };
 
-        if (transcriptionText) {
-             // Atualiza no banco se houver transcrição
-             supabase.from('messages').update({ transcription: transcriptionText }).eq('whatsapp_id', unwrapped.key.id).eq('company_id', companyId).then(() => {});
-        }
+        // [TRANSCRIÇÃO REMOVIDA DAQUI — agora é fire-and-forget no bloco acima]
         
         if (!isGroup && !fromMe) {
              const purePhone = jid.split('@')[0].replace(/\D/g, '');

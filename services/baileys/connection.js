@@ -22,6 +22,9 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 export const sessions = new Map();
 const retries = new Map();
+// 🔴 [ANTI-BAN] Sessões encerradas por logout (401/403 - loggedOut).
+// O Watchdog NUNCA deve tentar reviver uma sessão neste Set (Hard Rule §12.3).
+const bannedSessions = new Set();
 const sessionLocks = new Map(); // 🛡️ [LOCK] Heartbeats das travas
 
 const BOOT_DELAY = 60000; // 60s para garantir que instâncias antigas do Render morram
@@ -155,9 +158,14 @@ setInterval(async () => {
                 const inMemory = sessions.get(dbSess.session_id);
                 
                 // 1. ZUMBI: Está no banco como conectado mas não está na memória do Node
+                // 🔴 [BLOQUEIO ANTI-BAN] Sessões banidas (401/403) NUNCA são restauradas (Hard Rule §12.3)
                 if (!inMemory && dbSess.status === 'connected') {
-                    console.warn(`🧟 [WATCHDOG] Detectada Sessão Zumbi: ${dbSess.session_id}. Restaurando...`);
-                    startSession(dbSess.session_id, dbSess.company_id).catch(() => {});
+                    if (bannedSessions.has(dbSess.session_id)) {
+                        console.warn(`🚫 [WATCHDOG] Sessão ${dbSess.session_id} está banida (logout). Ignorando restauração para proteger o IP.`);
+                    } else {
+                        console.warn(`🧟 [WATCHDOG] Detectada Sessão Zumbi: ${dbSess.session_id}. Restaurando...`);
+                        startSession(dbSess.session_id, dbSess.company_id).catch(() => {});
+                    }
                 } 
                 
                 // 2. TRAVADA: Está em 'connecting' ou 'qrcode' há mais de 10 minutos sem atualização
@@ -217,9 +225,11 @@ export const startSession = async (sessionId, companyId) => {
             printQRInTerminal: false,
             auth: {
                 creds: state.creds,
-                // Otimização: Envolve as chaves em um cache de memória para performance
+                // PERFORMANCE: Envolve as chaves em um cache de memória para reduzir I/O (§2.1)
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
+            // RESILIÊNCIA: Gerenciamento automático de sessões Signal degradadas pelo Baileys (§10.1)
+            enableAutoSessionRecreation: true,
             msgRetryCounterCache: redis ? {
                 get: async (key) => {
                     const start = Date.now();
@@ -237,11 +247,15 @@ export const startSession = async (sessionId, companyId) => {
                     await redis.del(`retry:${sessionId}:${key}`);
                 }
             } : undefined,
+            // ANTI-BAN: Simula navegador Desktop real Ubuntu/Chrome (§2.1 + §12)
             browser: Browsers.ubuntu("Chrome"), 
             syncFullHistory: true, 
-            markOnlineOnConnect: false, // Otimização: Evita flood de presença antes do sync
+            // ANTI-BAN: Comportamento humano — aparece online ao conectar (§2.1)
+            markOnlineOnConnect: true,
             generateHighQualityLinkPreview: true,
             defaultQueryTimeoutMs: 90000, 
+            // RESILIÊNCIA: Timeout de conexão para ambientes de nuvem (§2.1)
+            connectTimeoutMs: 60000,
             retryRequestDelayMs: 2500,
             keepAliveIntervalMs: 30000, 
             shouldIgnoreJid: (jid) => isJidBroadcast(jid) || jid.includes('newsletter') || jid.includes('status@broadcast'),
@@ -316,7 +330,10 @@ export const startSession = async (sessionId, companyId) => {
                 // [REPARO] Se for erro de criptografia mas não for logout real, tentamos apenas reconectar
                 // Deletar a sessão (deleteSession) obriga o usuário a ler o QR Code de novo.
                 if (isLoggedOut) {
-                    Logger.fatal('baileys', `Sessão encerrada permanentemente (Logout).`, { sessionId, error: errorMsg }, companyId);
+                    Logger.fatal('baileys', `Sessão encerrada permanentemente (Logout — 401/403). Protegendo IP contra reconexão.`, { sessionId, statusCode, error: errorMsg }, companyId);
+                    // 🔴 [ANTI-BAN] Marca como banida ANTES de deletar para bloquear o Watchdog (Hard Rule §12.3)
+                    bannedSessions.add(sessionId);
+                    retries.delete(sessionId); // Zera retries para não tentar reconectar
                     await deleteSession(sessionId, companyId);
                     return; 
                 }

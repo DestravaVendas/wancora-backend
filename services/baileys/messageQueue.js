@@ -1,59 +1,149 @@
 
 import { handleMessage } from './handlers/messageHandler.js';
 
-// Configuração da Fila
-const CONCURRENCY_LIMIT = 10; // Processa no máximo 10 mensagens simultaneamente
-const queue = [];
-let activeWorkers = 0;
+// =============================================================================
+// CONFIGURAÇÃO DA FILA — ISOLAMENTO POR SESSÃO
+//
+// Em vez de uma fila global compartilhada (que causa starvation entre empresas),
+// cada sessão possui seu próprio estado de fila e pool de workers.
+//
+// Arquitetura:
+//   sessionQueues: Map<sessionId, { queue: Array, activeWorkers: number }>
+//
+// Benefícios:
+//   - Empresa A processando áudio pesado NÃO bloqueia Empresa B
+//   - Workers por sessão evitam monopolização do pool global
+//   - Mensagens realtime (isRealtime=true) têm inserção prioritária (head insert)
+//
+// Manual §10 & §12: Processamento não-bloqueante e isolado é requisito de estabilidade.
+// =============================================================================
+
+const CONCURRENCY_PER_SESSION = 3; // Workers simultâneos por sessão (ajustar conforme CPU/I/O)
+const TASK_TIMEOUT_MS = 90_000;     // 90s — timeout máximo por tarefa (download de mídia pesada)
+
+// Map: sessionId -> { queue: [], activeWorkers: number }
+const sessionQueues = new Map();
 
 /**
- * Processador da Fila (Worker)
- * Pega itens da fila e executa o handleMessage respeitando o limite de concorrência.
+ * Garante que o estado da fila para a sessão exista.
+ * @param {string} sessionId
+ * @returns {{ queue: Array, activeWorkers: number }}
  */
-const processNext = async () => {
-    // Se atingiu o limite ou fila vazia, para. Não agende recursão se não há trabalho.
-    if (activeWorkers >= CONCURRENCY_LIMIT || queue.length === 0) return;
+const getSessionState = (sessionId) => {
+    if (!sessionQueues.has(sessionId)) {
+        sessionQueues.set(sessionId, { queue: [], activeWorkers: 0 });
+    }
+    return sessionQueues.get(sessionId);
+};
 
-    activeWorkers++;
-    const task = queue.shift();
+/**
+ * Wrapper de timeout para qualquer Promise.
+ * Garante que um worker não fique preso indefinidamente em I/O travado.
+ * @param {Promise} promise - A promise a ser executada
+ * @param {number} ms - Timeout em milissegundos
+ * @param {string} label - Label para log de diagnóstico
+ * @returns {Promise}
+ */
+const withTimeout = (promise, ms, label = 'task') => {
+    const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`⏰ Timeout (${ms}ms) excedido: ${label}`)), ms)
+    );
+    return Promise.race([promise, timeout]);
+};
+
+/**
+ * Processador interno da fila de uma sessão.
+ * Pega tarefas e executa respeitando CONCURRENCY_PER_SESSION.
+ * Ao finalizar uma tarefa, automaticamente tenta consumir a próxima da mesma sessão.
+ * @param {string} sessionId
+ */
+const processNext = async (sessionId) => {
+    const state = getSessionState(sessionId);
+
+    // Para se atingiu o limite de concorrência para esta sessão ou fila vazia
+    if (state.activeWorkers >= CONCURRENCY_PER_SESSION || state.queue.length === 0) return;
+
+    state.activeWorkers++;
+    const task = state.queue.shift();
 
     try {
-        // Executa a lógica pesada (DB, Media Download, Webhook)
-        await handleMessage(
-            task.msg, 
-            task.sock, 
-            task.companyId, 
-            task.sessionId, 
-            task.isRealtime
+        // Executa com timeout de segurança — impede que mídia/IA trave o slot para sempre
+        await withTimeout(
+            handleMessage(task.msg, task.sock, task.companyId, task.sessionId, task.isRealtime),
+            TASK_TIMEOUT_MS,
+            `msg:${task.msg.key?.id}`
         );
     } catch (error) {
-        console.error(`❌ [QUEUE] Erro ao processar mensagem ${task.msg.key?.id}:`, error.message);
+        // 🛡️ ERRO BLINDADO: Captura qualquer falha (incluindo timeout) sem travar a fila
+        console.error(
+            `❌ [QUEUE:${sessionId}] Falha na msg ${task.msg.key?.id}:`,
+            error.message
+        );
     } finally {
-        activeWorkers--;
-        // Gatilho: Ao terminar um, tenta pegar o próximo imediatamente
-        processNext();
+        // SEMPRE decrementa — garante que o slot é liberado mesmo em caso de erro ou timeout
+        state.activeWorkers--;
+
+        // Limpa o Map se a sessão ficou completamente ociosa (evita leak de memória)
+        if (state.activeWorkers === 0 && state.queue.length === 0) {
+            sessionQueues.delete(sessionId);
+        }
+
+        // Gatilho: ao liberar slot, tenta consumir a próxima tarefa da mesma sessão
+        processNext(sessionId);
     }
 };
 
 /**
- * Adiciona uma mensagem à fila de processamento.
+ * Adiciona uma mensagem à fila de processamento da sessão correspondente.
+ *
+ * 🚀 PRIORIZAÇÃO: Mensagens em tempo real (isRealtime=true, type='notify') são inseridas
+ * no início da fila (unshift), deslocando mensagens de histórico mais antigas para o final.
+ * Isso garante que uma mensagem nova do usuário não espere atrás de 500 msgs de histórico.
+ *
  * @param {object} msg - Objeto mensagem do Baileys
  * @param {object} sock - Socket da conexão
  * @param {string} companyId - ID da empresa
- * @param {string} sessionId - ID da sessão
- * @param {boolean} isRealtime - Se é mensagem nova ou histórico
+ * @param {string} sessionId - ID da sessão (chave de isolamento)
+ * @param {boolean} isRealtime - Se é mensagem nova (true) ou histórico (false)
  */
 export const enqueueMessage = (msg, sock, companyId, sessionId, isRealtime) => {
-    queue.push({ msg, sock, companyId, sessionId, isRealtime });
-    
-    // Tenta iniciar o processamento se houver slots livres
-    processNext();
+    const state = getSessionState(sessionId);
+    const task = { msg, sock, companyId, sessionId, isRealtime };
+
+    if (isRealtime) {
+        // Prioridade ALTA: mensagem nova vai para o início da fila
+        state.queue.unshift(task);
+    } else {
+        // Prioridade NORMAL: histórico vai para o final
+        state.queue.push(task);
+    }
+
+    // Tenta iniciar processamento (non-blocking — não aguarda a Promise aqui)
+    processNext(sessionId);
 };
 
 /**
- * Retorna métricas da fila para monitoramento
+ * Retorna métricas agregadas de todas as filas ativas para monitoramento.
+ * @returns {{ sessions: number, totalPending: number, totalActive: number, detail: object }}
  */
-export const getQueueStats = () => ({
-    pending: queue.length,
-    active: activeWorkers
-});
+export const getQueueStats = () => {
+    let totalPending = 0;
+    let totalActive = 0;
+    const detail = {};
+
+    for (const [sessionId, state] of sessionQueues.entries()) {
+        totalPending += state.queue.length;
+        totalActive += state.activeWorkers;
+        detail[sessionId] = { pending: state.queue.length, active: state.activeWorkers };
+    }
+
+    return { sessions: sessionQueues.size, totalPending, totalActive, detail };
+};
+
+/**
+ * Drena (limpa) a fila de uma sessão — útil ao desconectar/destruir uma instância.
+ * @param {string} sessionId
+ */
+export const drainSessionQueue = (sessionId) => {
+    sessionQueues.delete(sessionId);
+};

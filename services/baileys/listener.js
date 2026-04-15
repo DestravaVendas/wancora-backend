@@ -2,7 +2,8 @@ import { updateSyncStatus } from '../crm/sync.js';
 import { handlePresenceUpdate, handleContactsUpsert } from './handlers/contactHandler.js';
 import { handleReceiptUpdate, handleMessageUpdate, handleReaction } from './handlers/messageHandler.js';
 import { handleHistorySync, resetHistoryState } from './handlers/historyHandler.js'; // Import atualizado
-import { enqueueMessage } from './messageQueue.js'; 
+import { enqueueMessage, drainSessionQueue } from './messageQueue.js';
+
 
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
@@ -12,12 +13,26 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     
     let historyChunkCounter = 0;
 
+    // ==========================================================================
+    // SERIALIZAÇÃO DE CHUNKS: Fila de Promises para garantir que apenas 1 chunk
+    // seja processado por vez. Sem isso, chunks concorrentes podem gerar race
+    // conditions onde a Fase 3 de um chunk começa antes da Fase 2 de outro,
+    // violando a Barreira de Sincronização definida no Manual §11.1.
+    // ==========================================================================
+    let historyProcessingChain = Promise.resolve();
+
     // 1. CONEXÃO
     sock.ev.on('connection.update', async (update) => {
         const { connection } = update;
         if (connection === 'open') {
             console.log(`⚡ [LISTENER] Conexão aberta!`);
             await updateSyncStatus(sessionId, 'importing_contacts', 5);
+        }
+        if (connection === 'close') {
+            // 🧹 CLEANUP: Drena a fila isolada desta sessão ao desconectar.
+            // Evita que tasks orfãs de uma instância destruída consumam memória/workers.
+            drainSessionQueue(sessionId);
+            console.log(`🧹 [LISTENER] Fila da sessão ${sessionId} drenada.`);
         }
     });
 
@@ -72,9 +87,26 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     sock.ev.on('message-receipt.update', (events) => handleReceiptUpdate(events, companyId));
     sock.ev.on('messages.reaction', (reactions) => handleReaction(reactions, sock, companyId));
 
-    // 4. HISTÓRICO (SYNC)
+    // 4. HISTÓRICO (SYNC) — Barreira de Sincronização de 3 Fases
+    //
+    // CRÍTICO: O handler é enfileirado em vez de chamado diretamente.
+    // O Baileys dispara o evento 'messaging-history.set' múltiplas vezes
+    // (um por lote de dados do WhatsApp) de forma rápida e não-bloqueante.
+    //
+    // A cadeia de Promises (historyProcessingChain) garante que cada chunk
+    // seja processado de forma SEQUENCIAL: o Chunk N+1 só começa quando o
+    // Chunk N completar TODAS as 3 fases (LID → Contacts → Messages).
+    //
+    // Falhas individuais de um chunk são capturadas no .catch() local e não
+    // quebram a fila — o próximo chunk ainda será processado.
     sock.ev.on('messaging-history.set', (data) => {
         historyChunkCounter++;
-        handleHistorySync(data, sock, sessionId, companyId, historyChunkCounter);
+        const currentChunk = historyChunkCounter; // captura por closure para log correto
+        
+        historyProcessingChain = historyProcessingChain.then(() =>
+            handleHistorySync(data, sock, sessionId, companyId, currentChunk)
+        ).catch(err => {
+            console.error(`❌ [LISTENER] Falha no chunk ${currentChunk} da fila de histórico:`, err.message);
+        });
     });
 };

@@ -41,25 +41,105 @@ const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
     })();
 };
 
-export const handleHistorySync = async ({ contacts, messages, isLatest, progress }, sock, sessionId, companyId, chunkCounter) => {
+// =============================================================================
+// BARREIRA DE SINCRONIZAÇÃO — 3 FASES ESTRITAS (Manual Baileys §11.1)
+//
+// As fases são SEQUENCIAIS e não podem ser invertidas:
+//   Fase 1 → lidPnMappings  : O Coração do CRM para grupos (LID ↔ PN)
+//   Fase 2 → contacts       : Upsert massivo antes de qualquer mensagem
+//   Fase 3 → chats/messages : Processado SOMENTE após Fase 2 concluída
+//
+// Isso garante que nenhuma chave estrangeira (contact_jid) seja violada.
+// =============================================================================
+export const handleHistorySync = async ({ contacts, messages, isLatest, progress, lidPnMappings }, sock, sessionId, companyId, chunkCounter) => {
     
     const chunkKey = `${sessionId}-chunk-${chunkCounter}`;
     if (processedHistoryChunks.has(chunkKey)) return;
     processedHistoryChunks.add(chunkKey);
 
     const estimatedProgress = progress || Math.min(10 + (chunkCounter * 2), 95);
-    console.log(`📚 [SYNC] Lote ${chunkCounter} | Contatos Brutos: ${contacts?.length || 0} | Msgs: ${messages?.length || 0}`);
+    console.log(`📚 [SYNC] Lote ${chunkCounter} | LID-PN Maps: ${lidPnMappings?.length || 0} | Contatos Brutos: ${contacts?.length || 0} | Msgs: ${messages?.length || 0}`);
     
     await updateSyncStatus(sessionId, 'importing_contacts', estimatedProgress);
 
     try {
+
+        // =====================================================================
+        // FASE 1: LID-PN MAPPING (Manual §11.1 — Prioridade Absoluta)
+        //
+        // O WhatsApp está migrando para LIDs (Logical IDs). Sem esse mapeamento
+        // o CRM perde a identidade real (número de telefone) de contatos em grupos.
+        //
+        // Fontes de mapeamento (em ordem de confiabilidade):
+        //   1. lidPnMappings nativos do evento (mais confiável, array separado)
+        //   2. contacts que possuem o campo .lid embutido (complementar)
+        // =====================================================================
+
+        // Fonte 1: lidPnMappings nativos entregues pelo Baileys no evento
+        if (lidPnMappings && lidPnMappings.length > 0) {
+            console.log(`🗺️  [FASE 1] Processando ${lidPnMappings.length} mapeamentos LID-PN nativos...`);
+            
+            const lidBatch = lidPnMappings
+                .filter(m => m.lid && m.pn)  // garante que ambos existem
+                .map(m => ({
+                    p_lid: normalizeJid(m.lid),
+                    p_phone: normalizeJid(m.pn),
+                    p_company_id: companyId
+                }));
+
+            // Processa em série para evitar sobrecarga de RPC no Supabase
+            for (const mapping of lidBatch) {
+                try {
+                    await supabase.rpc('link_identities', mapping);
+                } catch (e) {
+                    // Falha individual não aborta o lote — apenas loga
+                    console.warn(`⚠️  [FASE 1] Falha ao mapear LID ${mapping.p_lid}:`, e.message);
+                }
+            }
+            console.log(`✅ [FASE 1] ${lidBatch.length} mapeamentos LID-PN nativos processados.`);
+        }
+
+        // Fonte 2: contacts que trazem .lid embutido (complementar ao lidPnMappings)
+        if (contacts && contacts.length > 0) {
+            const contactsWithLid = contacts.filter(c => c.id && c.lid);
+            if (contactsWithLid.length > 0) {
+                console.log(`🗺️  [FASE 1] Processando ${contactsWithLid.length} mapeamentos LID embutidos nos contatos...`);
+                for (const c of contactsWithLid) {
+                    try {
+                        // Remove sufixo de dispositivo (ex: :1@s.whatsapp.net → @s.whatsapp.net)
+                        const pn  = normalizeJid(c.id);
+                        const lid = normalizeJid(c.lid);
+                        if (pn && lid) {
+                            await supabase.rpc('link_identities', {
+                                p_lid: lid,
+                                p_phone: pn,
+                                p_company_id: companyId
+                            });
+                        }
+                    } catch (e) {
+                        console.warn(`⚠️  [FASE 1] Falha no LID embutido (${c.id}):`, e.message);
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // FASE 2: UPSERT MASSIVO DE CONTACTS (Manual §11.1)
+        //
+        // Todos os contacts devem estar no banco ANTES de qualquer mensagem
+        // ser processada. Inclui dois sub-passos:
+        //   2a. Normalização da agenda de contatos
+        //   2b. Name Harvesting das mensagens (enriquece contatos sem nome)
+        // =====================================================================
+
         const contactsMap = new Map();
         const contactsToFetchPic = [];
 
-        // --- FASE 1: CARREGAR DADOS DA AGENDA ---
+        // --- FASE 2a: NORMALIZAÇÃO DA AGENDA ---
         if (contacts && contacts.length > 0) {
             for (const c of contacts) {
                 const jid = normalizeJid(c.id);
+                // JIDs de LID puro e status@broadcast são ignorados aqui
                 if (!jid || jid.includes('@lid') || jid === 'status@broadcast') continue;
 
                 const phoneName = c.name || c.notify || c.verifiedName;
@@ -72,20 +152,11 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                     imgUrl: c.imgUrl,
                     verifiedName: c.verifiedName
                 });
-
-                if (c.lid) {
-                     // 🛡️ MUDANÇA: Await garante que o banco reconheça o LID antes de processar mensagens
-                     await supabase.rpc('link_identities', {
-                        p_lid: normalizeJid(c.lid),
-                        p_phone: jid,
-                        p_company_id: companyId
-                    }).catch(() => {});
-                }
             }
         }
 
-        // --- FASE 2: MINERAÇÃO DE NOMES NAS MENSAGENS (NAME HARVESTER) ---
-        // Essencial para recuperar nomes de contatos que não estão na agenda mas têm PushName
+        // --- FASE 2b: NAME HARVESTING (enriquece com pushName das mensagens) ---
+        // Recupera nomes de contatos que NÃO estão na agenda mas aparecem nas mensagens
         if (messages && messages.length > 0) {
             messages.forEach(msg => {
                 const clean = unwrapMessage(msg);
@@ -93,13 +164,11 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 
                 const remoteJid = normalizeJid(clean.key.remoteJid);
                 const participant = clean.key.participant ? normalizeJid(clean.key.participant) : null;
-                
                 const targetJid = participant || remoteJid;
 
                 if (targetJid && !targetJid.includes('status@broadcast') && clean.pushName) {
                     const existing = contactsMap.get(targetJid);
-                    
-                    // Se não existe, ou existe mas sem nome da agenda, usa o pushName
+                    // Só usa pushName se não há nome vindo da agenda física do telefone
                     if (!existing || (!existing.isFromBook && !existing.name)) {
                         contactsMap.set(targetJid, {
                             jid: targetJid,
@@ -113,7 +182,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             });
         }
 
-        // --- FASE 3: PERSISTÊNCIA (CONTATOS ANTES DAS MENSAGENS) ---
+        // --- PERSISTÊNCIA DA FASE 2 (Upsert Massivo) ---
         const bulkPayload = [];
         
         for (const [jid, data] of contactsMap.entries()) {
@@ -146,17 +215,26 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         }
 
         if (bulkPayload.length > 0) {
+            console.log(`👥 [FASE 2] Persistindo ${bulkPayload.length} contatos no CRM...`);
             const BATCH_SIZE = 500;
             for (let i = 0; i < bulkPayload.length; i += BATCH_SIZE) {
                 await upsertContactsBulk(bulkPayload.slice(i, i + BATCH_SIZE));
             }
+            console.log(`✅ [FASE 2] Contatos persistidos. FK garantida para mensagens.`);
         }
             
+        // Fotos de perfil: dispara em background APÓS o upsert (não bloqueia a Fase 3)
         if (contactsToFetchPic.length > 0) {
             fetchProfilePicsInBackground(sock, contactsToFetchPic, companyId);
         }
 
-        // --- FASE 4: MENSAGENS E LEADS ---
+        // =====================================================================
+        // FASE 3: CHATS E MENSAGENS (Manual §11.1 — Só após Fase 2)
+        //
+        // Executada SOMENTE após os contacts estarem no banco.
+        // Isso garante que a FK (contact_jid → contacts.jid) nunca seja violada.
+        // =====================================================================
+
         if (messages && messages.length > 0) {
             await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress + 2);
             
@@ -180,18 +258,17 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                 if (!chats[jid]) chats[jid] = [];
                 
-                // Injeta nome resolvido para criação correta do lead
+                // Injeta nome resolvido — contactsMap já populado pela Fase 2, acesso seguro
                 const knownContact = contactsMap.get(jid);
-                if (knownContact) {
-                    clean._forcedName = knownContact.isFromBook ? knownContact.name : knownContact.name;
-                } else {
-                    clean._forcedName = clean.pushName;
-                }
+                clean._forcedName = knownContact?.isFromBook 
+                    ? knownContact.name 
+                    : (knownContact?.name || clean.pushName);
                 
                 chats[jid].push(clean);
             });
 
             const chatJids = Object.keys(chats);
+            console.log(`💬 [FASE 3] Processando ${chatJids.length} chats e suas mensagens...`);
 
             for (const jid of chatJids) {
                 chats[jid].sort((a, b) => (Number(a.messageTimestamp) || 0) - (Number(b.messageTimestamp) || 0)); 
@@ -200,6 +277,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 const latestMsg = topMessages[topMessages.length - 1];
                 if (latestMsg && latestMsg.messageTimestamp) {
                     const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
+                    // Fire-and-forget: atualiza last_message_at sem bloquear o loop
                     supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
                 }
 
@@ -213,18 +291,22 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         };
                         
                         await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
-                    } catch (msgError) {}
+                    } catch (msgError) {
+                        // Falha individual de mensagem não aborta o lote do chat
+                        console.warn(`⚠️  [FASE 3] Falha ao processar msg do chat ${jid}:`, msgError.message);
+                    }
                 }
-                // [OTIMIZAÇÃO] Delay ligeiramente maior entre chats para dar tempo ao download de mídia
+                // [OTIMIZAÇÃO] Delay entre chats para dar tempo ao download de mídia
                 await sleep(50); 
             }
+            console.log(`✅ [FASE 3] Chats e mensagens processados.`);
         }
 
     } catch (e) {
-        console.error("❌ [SYNC ERROR]", e);
+        console.error("❌ [SYNC ERROR] Falha crítica na Barreira de Sincronização:", e);
     } finally {
         if (isLatest) {
-            console.log(`✅ [HISTÓRICO] Sincronização Total Concluída.`);
+            console.log(`✅ [HISTÓRICO] Sincronização Total Concluída. Todas as 3 fases executadas.`);
             await updateSyncStatus(sessionId, 'completed', 100);
             resetHistoryState(sessionId);
         }
