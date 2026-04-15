@@ -2,6 +2,9 @@
 import './instrument.js'; // Sentry deve ser o primeiro import
 import 'dotenv/config'; 
 import { Logger } from './utils/logger.js'; // MOVIDO PARA O TOPO
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const pkg = require('./package.json'); // Versão dinâmica — nunca mais hardcode
 import express from 'express';
 import cors from 'cors';
 import compression from 'compression'; 
@@ -111,7 +114,7 @@ app.get('/api/v1/health', (req, res) => {
         status: 'online', 
         timestamp: new Date().toISOString(),
         service: 'Wancora API',
-        version: '5.4.3'
+        version: pkg.version // Lido dinamicamente do package.json
     });
 });
 
@@ -162,7 +165,7 @@ const restoreSessions = async () => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Wancora Backend v5.4.6 (Render Patch) rodando na porta ${PORT}`);
+    console.log(`🚀 Wancora Backend v${pkg.version} rodando na porta ${PORT}`);
     
     // Pequeno delay para garantir que o health check do Render passe antes do boot pesado
     setTimeout(() => {

@@ -207,8 +207,12 @@ const processReminders = async () => {
         }
 
         // ============================================================
-        // FLUXO 2: LEMBRETES PROGRAMADOS (BEFORE_EVENT)
-        // Busca agendamentos confirmados nas próximas 24h que ainda não tiveram lembrete enviado.
+        // FLUXO 2: LEMBRETES PROGRAMADOS (BEFORE_EVENT) — v2.0 MULTI-DISPARO
+        // ============================================================
+        // PROBLEMA ORIGINAL: reminder_sent=true no 1º disparo bloqueava os próximos.
+        // SOLUÇÃO (zero SQL): usa o campo JSONB custom_notification_config (já existente)
+        // como "state bag" em uma sub-chave "_sent_rule_ids". Registra cada ID de regra
+        // já disparada. Só seta reminder_sent=true quando TODAS as regras forem cumpridas.
         // ============================================================
         const { data: reminders } = await supabase
             .from('appointments')
@@ -220,13 +224,12 @@ const processReminders = async () => {
             `)
             .eq('status', 'confirmed')
             .eq('reminder_sent', false)
-            .eq('send_notifications', true) // Respeita toggle manual
+            .eq('send_notifications', true)
             .gte('start_time', now.toISOString())
             .lte('start_time', tomorrow.toISOString());
 
         if (reminders && reminders.length > 0) {
             for (const app of reminders) {
-                // Lógica de Config similar ao fluxo acima
                 let config = app.custom_notification_config;
                 let ruleData = app.availability_rules;
 
@@ -234,60 +237,67 @@ const processReminders = async () => {
                     config = ruleData.notification_config;
                 }
 
-                if(!config) {
-                     const { data: rules } = await supabase.from('availability_rules')
+                if (!config) {
+                    const { data: rules } = await supabase.from('availability_rules')
                         .select('notification_config, meeting_url, event_location_details, timezone')
                         .eq('company_id', app.company_id)
                         .limit(1);
-                     
-                     if (rules && rules.length > 0) {
-                         config = rules[0].notification_config;
-                         ruleData = rules[0];
-                     }
+                    if (rules && rules.length > 0) {
+                        config = rules[0].notification_config;
+                        ruleData = rules[0];
+                    }
                 }
 
                 const recipients = [];
                 if (app.leads?.phone) recipients.push({ name: app.leads.name, phone: app.leads.phone });
                 if (app.guests && Array.isArray(app.guests)) {
                     app.guests.forEach(g => {
-                         const p = cleanPhone(g.phone);
-                         if (p && !recipients.find(r => cleanPhone(r.phone) === p)) {
-                             recipients.push({ name: g.name, phone: g.phone });
-                         }
+                        const p = cleanPhone(g.phone);
+                        if (p && !recipients.find(r => cleanPhone(r.phone) === p)) {
+                            recipients.push({ name: g.name, phone: g.phone });
+                        }
                     });
                 }
 
                 if (!config || !config.lead_notifications || recipients.length === 0) continue;
 
-                // Filtra regras de "Antes do Evento"
                 const leadReminders = config.lead_notifications.filter(n => n.type === 'before_event' && n.active);
                 if (leadReminders.length === 0) continue;
 
+                // 🧠 STATE BAG: Lê quais IDs de regra já foram disparados neste agendamento.
+                // Persiste em custom_notification_config._sent_rule_ids (array de strings).
+                // Se o appointment tem config própria, enriquecemos ela. Se não, criamos uma estrutura mínima.
+                const stateConfig = app.custom_notification_config || {};
+                const sentRuleIds = new Set(stateConfig._sent_rule_ids || []);
+
                 const appTime = new Date(app.start_time).getTime();
                 const timeUntil = appTime - now.getTime();
-                
+                const margin = 2 * 60 * 1000;
+
+                let firedAnyRuleThisCycle = false;
+
                 for (const rule of leadReminders) {
+                    // Cada regra DEVE ter um ID único. Se não tiver, usamos o índice como fallback.
+                    const ruleId = rule.id || `rule_${rule.type}_${rule.time_amount}_${rule.time_unit}`;
+
+                    // Pula regras já disparadas anteriormente
+                    if (sentRuleIds.has(ruleId)) continue;
+
                     let ruleTimeMs = 0;
                     const amount = Number(rule.time_amount);
                     if (rule.time_unit === 'minutes') ruleTimeMs = amount * 60 * 1000;
-                    else if (rule.time_unit === 'hours') ruleTimeMs = amount * 60 * 60 * 1000;
-                    else if (rule.time_unit === 'days') ruleTimeMs = amount * 24 * 60 * 60 * 1000;
-
-                    // Margem de tolerância: 2 minutos (Worker roda a cada 1 min)
-                    // Dispara se: Agora está dentro da janela de tempo (ex: 59min 30s para regra de 1h)
-                    const margin = 2 * 60 * 1000; 
+                    else if (rule.time_unit === 'hours')   ruleTimeMs = amount * 60 * 60 * 1000;
+                    else if (rule.time_unit === 'days')    ruleTimeMs = amount * 24 * 60 * 60 * 1000;
 
                     if (timeUntil <= ruleTimeMs && timeUntil > (ruleTimeMs - margin)) {
-                        
                         const sessionId = await resolveSession(app.company_id, config.sending_session_id);
-                        if (!sessionId) continue; // Tenta no próximo minuto se reconectar
+                        if (!sessionId) continue;
 
                         for (const r of recipients) {
                             const leadPhone = cleanPhone(r.phone);
                             if (!leadPhone) continue;
 
                             const msg = formatMessage(rule.template, app, ruleData, r.name, r.phone);
-                            
                             try {
                                 await sendMessage({
                                     sessionId,
@@ -296,32 +306,54 @@ const processReminders = async () => {
                                     content: msg,
                                     companyId: app.company_id
                                 });
-                                // 🛡️ Pequena pausa entre lembretes do mesmo minuto para não "metralhar" a fila
                                 await new Promise(res => setTimeout(res, Math.random() * 2000 + 1000));
                             } catch (sendError) {
                                 console.error(`❌ [Agenda] Falha envio lembrete ${leadPhone}:`, sendError.message);
                             }
                         }
 
-                        // Marca como enviado. 
-                        // Nota: Se houver múltiplos lembretes (ex: 1h antes E 10min antes), isso marcaria tudo como enviado
-                        // Para suportar múltiplos avisos no mesmo evento, precisaríamos de uma estrutura de controle mais complexa.
-                        // Nesta versão, assumimos que o lembrete principal foi enviado.
-                        await supabase.from('appointments').update({ reminder_sent: true }).eq('id', app.id);
-                        
-                        // Log de atividade
+                        // Registra esta regra como disparada no state bag
+                        sentRuleIds.add(ruleId);
+                        firedAnyRuleThisCycle = true;
+
                         if (app.leads?.id) {
                             await supabase.from('lead_activities').insert({
                                 company_id: app.company_id,
                                 lead_id: app.leads.id,
                                 type: 'log',
-                                content: `⏰ Lembrete automático enviado para ${recipients.length} participantes (${amount} ${rule.time_unit} antes).`,
-                                created_by: app.user_id, // Atribui ao dono do agendamento
+                                content: `⏰ Lembrete automático enviado para ${recipients.length} participante(s) [Regra: ${amount} ${rule.time_unit} antes].`,
+                                created_by: app.user_id,
                                 created_at: new Date()
                             });
                         }
-                        
-                        break; // Evita disparar duas regras conflitantes no mesmo minuto
+
+                        console.log(`✅ [Agenda] Regra "${ruleId}" disparada para appointment ${app.id}.`);
+                    }
+                }
+
+                // Persiste o state bag atualizado se houve algum disparo
+                if (firedAnyRuleThisCycle) {
+                    const updatedStateConfig = {
+                        ...stateConfig,
+                        _sent_rule_ids: [...sentRuleIds]
+                    };
+
+                    // Verifica se TODAS as regras antes do evento foram disparadas
+                    const allRuleFired = leadReminders.every(rule => {
+                        const ruleId = rule.id || `rule_${rule.type}_${rule.time_amount}_${rule.time_unit}`;
+                        return sentRuleIds.has(ruleId);
+                    });
+
+                    // Se todas as regras já foram disparadas, seta reminder_sent=true definitivamente
+                    await supabase.from('appointments').update({
+                        custom_notification_config: updatedStateConfig,
+                        reminder_sent: allRuleFired
+                    }).eq('id', app.id);
+
+                    if (allRuleFired) {
+                        console.log(`🏁 [Agenda] Todos os lembretes do appointment ${app.id} foram enviados. reminder_sent=true.`);
+                    } else {
+                        console.log(`⏳ [Agenda] Appointment ${app.id} ainda tem lembretes pendentes. reminder_sent permanece false.`);
                     }
                 }
             }

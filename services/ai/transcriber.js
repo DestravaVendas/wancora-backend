@@ -40,7 +40,7 @@ export const transcribeAudio = async (audioBuffer, mimeType, companyId) => {
         }
 
         const response = await ai.models.generateContent({
-            model: "gemini-3-flash-preview",
+            model: "gemini-2.0-flash", // \ud83d\udfe2 PROD: modelo est\u00e1vel GA
             contents: [
                 { text: "Transcreva este áudio exatamente como foi dito. Se for apenas ruído ou silêncio, retorne [Inaudível]. Apenas o texto, sem formatação." },
                 {

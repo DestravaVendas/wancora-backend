@@ -21,6 +21,23 @@ const aiInstances = new Map();
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
 
+// ⏰ [TIME GUARDIAN PROTOCOL] — Horário Comercial
+// Bloqueia respostas da IA fora do horário 08:00–20:00 (America/Sao_Paulo)
+// Decisão: retorno silencioso (sem fila). Se o cliente mandar mensagem DENTRO
+// do horário comercial, a IA retoma normalmente sem acumular lixo em memória.
+const isWithinBusinessHours = () => {
+    const now = new Date();
+    // Obtém hora atual no fuso de São Paulo
+    const formatter = new Intl.DateTimeFormat('pt-BR', {
+        timeZone: 'America/Sao_Paulo',
+        hour: 'numeric',
+        hour12: false
+    });
+    const hourInBrazil = parseInt(formatter.format(now), 10);
+    // Permite resposta entre 08:00 (inclusive) e 20:00 (exclusive)
+    return hourInBrazil >= 8 && hourInBrazil < 20;
+};
+
 // --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL - COMPLETO) ---
 const ALL_TOOLS = [
     {
@@ -209,6 +226,13 @@ const _internalProcessAI = async (messageData) => {
     
     console.log(`\n🔔 [RAIO-X SENTINEL] Processando:`, id);
 
+    // ⏰ [TIME GUARDIAN] Bloqueia respostas da IA fora do horário comercial (08h–20h BRT)
+    if (!isWithinBusinessHours()) {
+        const now = new Date().toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+        console.log(`   🌙 [TIME GUARDIAN] Bloqueio fora do horário comercial. Hora atual BRT: ${now}. IA não responde entre 20h e 08h.`);
+        return;
+    }
+
     // 🛡️ [ESTABILIDADE] Bloqueio de mensagens vazias ou não descriptografadas
     if (!content && !transcription) {
         console.log(`   ⚠️ [SENTINEL] Mensagem ${id} sem conteúdo ou transcrição. Ignorando.`);
@@ -324,10 +348,13 @@ const _internalProcessAI = async (messageData) => {
             return;
         }
 
-        // MODEL FALLBACK: Força 3 Flash para escalar com velocidade e baixo custo
-        let activeModel = 'gemini-3-flash-preview';
-        if (companyConfig?.model && companyConfig.model !== 'gemini-1.5-flash' && companyConfig.model !== 'gemini-2.0-flash') {
-             activeModel = companyConfig.model;
+        // 🛡️ MODEL SELECTOR: Usa modelo configurado pela empresa, com fallback para o
+        // modelo estável de produção. Modelos -preview são PROIBIDOS em produção.
+        const STABLE_DEFAULT_MODEL = 'gemini-2.0-flash';
+        const PREVIEW_PATTERN = /preview/i;
+        let activeModel = STABLE_DEFAULT_MODEL;
+        if (companyConfig?.model && !PREVIEW_PATTERN.test(companyConfig.model)) {
+            activeModel = companyConfig.model;
         }
 
         const ai = getAIClient(activeApiKey);
@@ -413,10 +440,10 @@ const _internalProcessAI = async (messageData) => {
                     console.warn(`   ⚠️ [GEMINI] Erro 503 (Alta Demanda). Tentativa ${retryCount + 1}/5 em ${waitTime}ms...`);
                     await delay(waitTime);
                     
-                    // Se estiver na 3ª tentativa e falhando, tenta trocar o modelo para o Flash Lite (mais leve)
-                    if (retryCount === 2 && activeModel === 'gemini-3-flash-preview') {
-                        console.warn(`   🔄 [GEMINI] Trocando para modelo de fallback (Flash Lite) devido à alta demanda.`);
-                        activeModel = 'gemini-3.1-flash-lite-preview';
+                    // Se estiver na 3ª tentativa e falhando, troca para Flash 1.5 (mais leve e garantidamente estável)
+                    if (retryCount === 2) {
+                        console.warn(`   🔄 [GEMINI] Trocando para modelo de fallback estável (gemini-1.5-flash) devido à alta demanda.`);
+                        activeModel = 'gemini-1.5-flash';
                     }
 
                     return generateWithRetry(currentContents, retryCount + 1);

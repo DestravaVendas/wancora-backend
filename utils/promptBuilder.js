@@ -204,11 +204,17 @@ export const buildSystemPrompt = (agent) => {
     }
 
     // 9. Links Úteis Dinâmicos (Para fallback)
+    // CAMPO REAL: links_config é coluna jsonb na tabela agents (confirmado no schema).
+    // Guard defensivo: filtra links com title E url válidos para evitar injetar
+    // linhas "undefined: undefined" no prompt caso o objeto esteja malformado.
     if (agent.links_config && Array.isArray(agent.links_config) && agent.links_config.length > 0) {
-        prompt += `\n[LINKS DA EMPRESA (FERRAMENTAS DE APOIO)]\nVocê possui os seguintes links cadastrados. Use-os APENAS se o cliente pedir para fazer algo manualmente ou pedir mais informações externas:\n`;
-        agent.links_config.forEach(link => {
-            prompt += `- ${link.title}: ${link.url}\n`;
-        });
+        const validLinks = agent.links_config.filter(l => l && l.title && l.url);
+        if (validLinks.length > 0) {
+            prompt += `\n[LINKS DA EMPRESA (FERRAMENTAS DE APOIO)]\nVocê possui os seguintes links cadastrados. Use-os APENAS se o cliente pedir para fazer algo manualmente ou pedir mais informações externas:\n`;
+            validLinks.forEach(link => {
+                prompt += `- ${link.title}: ${link.url}\n`;
+            });
+        }
     }
 
     // 10. Instrução Mestra do Usuário (O que o usuário digitou no formulário)

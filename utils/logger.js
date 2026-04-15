@@ -82,31 +82,47 @@ const LoggerInstance = {
         const originalConsoleError = console.error;
         const originalConsoleWarn = console.warn;
 
+        // Symbol único por processo — imune a colisões de string e a falsas triagens
+        // globalThis garante escopo único mesmo com múltiplos módulos ESM no mesmo runtime
+        const LOGGING_LOCK = Symbol.for('wancora.logger.isLogging');
+
         console.error = (...args) => {
+            // Mutex de recursão: se já estamos dentro do Logger, não entrar de novo
+            if (globalThis[LOGGING_LOCK]) return originalConsoleError.apply(console, args);
+
             originalConsoleError.apply(console, args);
             const msg = args.map(a => (typeof a === 'object' ? (a.message || JSON.stringify(a)) : String(a))).join(' ');
-            
+
+            // Blocklist secundária: erros que NÃO devem gerar log no Supabase
+            // (para evitar loop caso o próprio Supabase gere um console.error)
             if (
-                msg.includes('rate limit') || 
+                msg.includes('rate limit') ||
                 msg.includes('socket disconnect') ||
-                msg.includes('Falha ao escrever log') || 
-                msg.includes('system_logs') ||           
+                msg.includes('Falha ao escrever log') ||
+                msg.includes('system_logs') ||
                 msg.includes('violates check constraint')
             ) return;
 
-            LoggerInstance.error('backend', 'Captured Console Error', { raw: msg, args });
+            globalThis[LOGGING_LOCK] = true;
+            LoggerInstance.error('backend', 'Captured Console Error', { raw: msg, args })
+                .finally(() => { globalThis[LOGGING_LOCK] = false; });
         };
 
         console.warn = (...args) => {
+            // Mutex de recursão para warn
+            if (globalThis[LOGGING_LOCK]) return originalConsoleWarn.apply(console, args);
+
             originalConsoleWarn.apply(console, args);
             const msg = args.map(a => String(a)).join(' ');
-            
+
             if (
-                msg.includes('ExperimentalWarning') || 
+                msg.includes('ExperimentalWarning') ||
                 msg.includes('Falha ao escrever log')
             ) return;
-            
-            LoggerInstance.warn('backend', 'Captured Console Warn', { raw: msg });
+
+            globalThis[LOGGING_LOCK] = true;
+            LoggerInstance.warn('backend', 'Captured Console Warn', { raw: msg })
+                .finally(() => { globalThis[LOGGING_LOCK] = false; });
         };
     }
 };

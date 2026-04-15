@@ -194,38 +194,72 @@ export const sendMessage = async ({
                 }
             }
 
-            // --- CÁLCULO DE DELAY INTELIGENTE E SEGURO (ANTI-BAD MAC) ---
-            const minDelay = timingConfig?.min_delay_seconds ? timingConfig.min_delay_seconds * 1000 : 2500;
-            const maxDelay = timingConfig?.max_delay_seconds ? timingConfig.max_delay_seconds * 1000 : 4000;
-            
-            // Garante que max >= min 
-            const safeMin = Math.max(minDelay, 1000); 
+            // --- CÁLCULO DE DELAY ANTI-BAN (MARGENS HUMANAS REAIS) ---
+            // Defaults calibrados para imitar digitação humana sem acionar detecção de bot.
+            // Valores abaixo de ~8s em rajadas são os principais gatilhos de banimento.
+            const minDelay = timingConfig?.min_delay_seconds
+                ? timingConfig.min_delay_seconds * 1000
+                : 15000; // Padrão mínimo: 15s entre envios
+            const maxDelay = timingConfig?.max_delay_seconds
+                ? timingConfig.max_delay_seconds * 1000
+                : 45000; // Padrão máximo: 45s (simula leitura + resposta humana)
+
+            // Garante que max >= min
+            const safeMin = Math.max(minDelay, 5000);  // Hard floor: nunca < 5s
             const safeMax = Math.max(maxDelay, safeMin);
-            
-            await delay(randomDelay(Math.floor(safeMin * 0.5), Math.floor(safeMin * 0.8)));
-            
-            // 2. Simulação de Digitação (Typing Time)
+
+            // 1. Pausa pré-presença: simula o tempo de "ler a mensagem antes de responder"
+            const prePresenceDelay = randomDelay(
+                Math.floor(safeMin * 0.35),  // ~35% do min (ex: 5.25s a 15s)
+                Math.floor(safeMin * 0.60)   // ~60% do min
+            );
+            await delay(prePresenceDelay);
+
+            // 2. Sinaliza presença (typing ou recording)
             const presenceType = (type === 'audio' && ptt) ? 'recording' : 'composing';
             await sock.sendPresenceUpdate(presenceType, jid);
 
-            let productionTime = 1000;
-            
-            // 🧠 A IA NO SENTINEL AGORA COMANDA O TEMPO EXATO DA DIGITAÇÃO
+            // 3. Duração da presença (productionTime) — escala pelo conteúdo
+            let productionTime;
+
             if (timingConfig?.override_typing_time) {
+                // IA/Sentinel comanda o tempo exato — respeitar sempre
                 productionTime = timingConfig.override_typing_time;
+
             } else if (type === 'text' && content) {
-                const charTime = content.length * 40;
-                if (timingConfig) {
-                     productionTime = randomDelay(minDelay, safeMax);
-                     if (content.length > 200) productionTime = safeMax;
+                // Escala pelo tamanho real do texto + fator humano de 50ms/char
+                const charTime = content.length * 50;
+                if (content.length <= 80) {
+                    // Mensagem curta: 4s–15s (rápido, mas nunca instantâneo)
+                    productionTime = randomDelay(4000, Math.min(charTime + 4000, 15000));
+                } else if (content.length <= 200) {
+                    // Mensagem média: 15s–30s
+                    productionTime = randomDelay(15000, Math.min(charTime + 8000, 30000));
                 } else {
-                    productionTime = Math.min(charTime, 6000); 
+                    // Mensagem longa ou múltiplos parágrafos: 30s–45s
+                    productionTime = randomDelay(30000, safeMax);
                 }
+
+            } else if (type === 'audio' || ptt) {
+                // Áudio/PTT: simula gravação (15s–40s — reflete duração típica de nota de voz)
+                productionTime = randomDelay(15000, 40000);
+
+            } else if (type === 'sticker') {
+                // Sticker: semi-instantâneo mas com micro-pausa anti-bot
+                productionTime = randomDelay(3000, 7000);
+
+            } else if (type === 'card') {
+                // Card/Rich Link: breve composição
+                productionTime = randomDelay(5000, 12000);
+
+            } else if (driveFileId) {
+                // Arquivo do Drive: simula "preparação para envio"
+                productionTime = randomDelay(8000, 20000);
+
+            } else {
+                // Fallback para outros tipos (image/video/document sem timing config)
+                productionTime = randomDelay(safeMin, safeMax);
             }
-            else if (type === 'audio' || ptt) productionTime = randomDelay(2000, 5000);
-            else if (type === 'sticker') productionTime = 1000;
-            else if (type === 'card') productionTime = 1500;
-            else if (driveFileId) productionTime = 2500;
 
             await delay(productionTime);
             await sock.sendPresenceUpdate('paused', jid);
