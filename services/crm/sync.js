@@ -159,6 +159,14 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     const cleanJid = normalizeJid(jid);
     if (!cleanJid) return null;
 
+    // 🛡️ GUARD LID: Se o JID chegou aqui ainda como @lid, significa que o LID Resolver
+    // do messageHandler não conseguiu translatear para um número real.
+    // Bloquear criação de lead com identidade LID evita leads duplicados e fantasmas.
+    if (cleanJid.includes('@lid')) {
+        console.warn(`[LEAD GUARD] @lid não resolvido ignorado: ${cleanJid}`);
+        return null;
+    }
+
     if (cleanJid.includes('@g.us') || cleanJid.includes('@newsletter') || cleanJid.includes('status@broadcast')) return null; 
     
     if (myJid) {

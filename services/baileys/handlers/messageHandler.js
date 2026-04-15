@@ -109,35 +109,66 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         // Permite sticker passar mesmo sem body
         if (!body && !isMedia && type !== 'stickerMessage') return;
 
-        // LID RESOLVER (Hard & Soft)
+        // =================================================================
+        // LID RESOLVER — 3 CAMADAS (Hard Rule #1 do MANUAL_BAILEYS.md)
+        //
+        // Camada 1: Hard  → identity_map    (dado confiável, já mapeado)
+        // Camada 2: Soft  → contacts.phone  (match por número puro)
+        // Camada 3: Learn → salva mapeamento assim que resolve com sucesso
+        //
+        // Se nenhuma camada resolver, jid permanece @lid.
+        // O guard em ensureLeadExists impedirá criação de lead fantasma.
+        // =================================================================
         if (jid.includes('@lid')) {
-            // 1. Hard Resolution (Identity Map)
-            const { data: mapping } = await supabase.from('identity_map').select('phone_jid').eq('lid_jid', jid).eq('company_id', companyId).maybeSingle();
-            if (mapping?.phone_jid) {
-                jid = mapping.phone_jid;
-            } else {
-                // 2. Soft Resolution (Phone Match)
-                const purePhone = jid.split('@')[0].replace(/\D/g, '');
-                const { data: contact } = await supabase.from('contacts')
-                    .select('jid')
-                    .eq('company_id', companyId)
-                    .eq('phone', purePhone)
-                    .like('jid', '%@s.whatsapp.net')
-                    .maybeSingle();
-                
-                if (contact?.jid) {
-                    const resolvedJid = contact.jid;
-                    const lidPhone = unwrapped.key.remoteJid.split('@')[0].replace(/\D/g, '');
-                    const resolvedPhone = resolvedJid.split('@')[0].replace(/\D/g, '');
+            let resolvedJid = null;
 
-                    if (lidPhone === resolvedPhone) {
-                        jid = resolvedJid;
-                        // Aproveita e salva no mapa para a próxima
-                        supabase.rpc('link_identities', { p_lid: unwrapped.key.remoteJid, p_phone: jid, p_company_id: companyId }).then(() => {});
+            // ── Camada 1: Hard Resolution via identity_map ──────────────
+            const { data: mapping } = await supabase
+                .from('identity_map')
+                .select('phone_jid')
+                .eq('lid_jid', jid)
+                .eq('company_id', companyId)
+                .maybeSingle();
+
+            if (mapping?.phone_jid) {
+                resolvedJid = mapping.phone_jid;
+            }
+
+            // ── Camada 2: Soft Resolution via contacts.phone ─────────────
+            if (!resolvedJid) {
+                const purePhone = jid.split('@')[0].replace(/\D/g, '');
+                if (purePhone.length >= 8) {
+                    const { data: contact } = await supabase
+                        .from('contacts')
+                        .select('jid')
+                        .eq('company_id', companyId)
+                        .eq('phone', purePhone)
+                        .like('jid', '%@s.whatsapp.net')
+                        .maybeSingle();
+
+                    if (contact?.jid) {
+                        resolvedJid = contact.jid;
                     }
                 }
             }
+
+            // ── Camada 3: Learning — persiste mapeamento para próximas vezes ─
+            if (resolvedJid) {
+                // Fire-and-forget: não bloqueia o processamento da mensagem
+                supabase.rpc('link_identities', {
+                    p_lid:        jid,
+                    p_phone:      resolvedJid,
+                    p_company_id: companyId
+                }).then(() => {}).catch(() => {});
+
+                jid = resolvedJid;
+                console.log(`🔗 [LID] Resolvido: ${unwrapped.key.remoteJid} → ${jid}`);
+            } else {
+                // LID não resolvido — guard em sync.js impedirá lead fantasma
+                console.warn(`⚠️ [LID] Não resolvido: ${jid}. Aguardando sync de contatos.`);
+            }
         }
+
 
         // --- CORREÇÃO CRÍTICA: GARANTIA DE CONTATO ---
         if (!fromMe && !isGroup) {

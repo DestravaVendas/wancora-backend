@@ -100,19 +100,37 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         }
 
         // Fonte 2: contacts que trazem .lid embutido (complementar ao lidPnMappings)
+        // 🛡️ RESGATE AGRESSIVO: O Baileys pode enviar c.id como PN e c.lid como LID,
+        // OU c.id como LID e c.lid como PN dependendo da versão do protocolo.
+        // Testamos AMBOS os sentidos para garantir que identity_map seja populada.
         if (contacts && contacts.length > 0) {
             const contactsWithLid = contacts.filter(c => c.id && c.lid);
             if (contactsWithLid.length > 0) {
-                console.log(`🗺️  [FASE 1] Processando ${contactsWithLid.length} mapeamentos LID embutidos nos contatos...`);
+                console.log(`🗺️  [FASE 1] Processando ${contactsWithLid.length} mapeamentos LID embutidos (resgate duplo-sentido)...`);
                 for (const c of contactsWithLid) {
                     try {
-                        // Remove sufixo de dispositivo (ex: :1@s.whatsapp.net → @s.whatsapp.net)
-                        const pn  = normalizeJid(c.id);
-                        const lid = normalizeJid(c.lid);
-                        if (pn && lid) {
+                        const idNorm  = normalizeJid(c.id);
+                        const lidNorm = normalizeJid(c.lid);
+                        if (!idNorm || !lidNorm) continue;
+
+                        // Determina qual campo é o LID e qual é o número de telefone
+                        // baseado no sufixo do JID (regra de negócio: @lid = LID, @s.whatsapp.net = PN)
+                        let finalLid, finalPn;
+                        if (idNorm.includes('@lid')) {
+                            // Sentido A: c.id é o LID, c.lid é o número (menos comum)
+                            finalLid = idNorm;
+                            finalPn  = lidNorm;
+                        } else {
+                            // Sentido B (padrão): c.id é o número, c.lid é o LID
+                            finalPn  = idNorm;
+                            finalLid = lidNorm;
+                        }
+
+                        // Só persiste se o par faz sentido (PN deve ser @s.whatsapp.net)
+                        if (finalPn.includes('@s.whatsapp.net') || finalPn.includes('@g.us')) {
                             await supabase.rpc('link_identities', {
-                                p_lid: lid,
-                                p_phone: pn,
+                                p_lid: finalLid,
+                                p_phone: finalPn,
                                 p_company_id: companyId
                             });
                         }
@@ -120,6 +138,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                         console.warn(`⚠️  [FASE 1] Falha no LID embutido (${c.id}):`, e.message);
                     }
                 }
+                console.log(`✅ [FASE 1] ${contactsWithLid.length} mapeamentos LID embutidos processados.`);
             }
         }
 

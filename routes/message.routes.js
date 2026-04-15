@@ -1,7 +1,7 @@
 
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
-import { sendMessage, sendPollVote, sendReaction, deleteMessage, markChatAsRead, subscribeToPresence } from "../controllers/whatsappController.js";
+import { sendMessage, sendPollVote, sendReaction, deleteMessage, markChatAsRead, subscribeToPresence, refreshContactPic } from "../controllers/whatsappController.js";
 import { requireAuth } from "../middleware/auth.js";
 import { apiLimiter } from "../middleware/limiter.js";
 import { normalizeJid } from "../utils/wppParsers.js";
@@ -140,5 +140,10 @@ router.post("/presence", async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// 📸 Foto de perfil on-demand (Gatilho em Tempo Real)
+// Chamado pelo Frontend ao abrir um chat ou painel lateral de contato.
+// Executa sock.profilePictureUrl() imediatamente e persiste no banco.
+router.post("/contacts/refresh-pic", refreshContactPic);
 
 export default router;

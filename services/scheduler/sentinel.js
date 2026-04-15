@@ -416,11 +416,15 @@ const _internalProcessAI = async (messageData) => {
             toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }];
         }
 
-        // 🧠 NOVA IMPLEMENTAÇÃO SDK ESTÁVEL COM RETRY (503)
+        // 🧠 IMPLEMENTAÇÃO SDK ESTÁVEL COM RETRY DUPLO (503 e 429)
         let contents = [...chatHistory, { role: 'user', parts: [{ text: userMessage }] }];
         
         console.log(`   🧠 [GEMINI] Pensando (Model: ${activeModel})...`);
 
+        // ⚡ BACKOFF EXPONENCIAL SEVERO: 503 = Sobrecarga do servidor, 429 = Rate Limit da API Key
+        // - 503: Usa base de 3s (3s → 6s → 12s → 24s → 48s), troca de modelo na 3ª tentativa
+        // - 429: Usa base de 15s (15s → 30s → 90s), máx 3 tentativas. É severo porque cada retry 
+        //        consome cota. Se esgotar, retorna NULL — nunca joga erro para cima e nunca mata a fila.
         const generateWithRetry = async (currentContents, retryCount = 0) => {
             try {
                 return await ai.models.generateContent({
@@ -434,25 +438,52 @@ const _internalProcessAI = async (messageData) => {
                 });
             } catch (err) {
                 const is503 = err.message?.includes('503') || err.status === 503;
-                
+                const is429 = err.message?.includes('429') || err.status === 429 || err.message?.includes('Resource Exhausted') || err.message?.includes('RESOURCE_EXHAUSTED');
+
+                // --- TRATAMENTO 503: Sobrecarga do servidor Gemini ---
                 if (is503 && retryCount < 5) {
-                    const waitTime = Math.pow(2, retryCount) * 3000; // Aumentado para 3s base
-                    console.warn(`   ⚠️ [GEMINI] Erro 503 (Alta Demanda). Tentativa ${retryCount + 1}/5 em ${waitTime}ms...`);
+                    const waitTime = Math.pow(2, retryCount) * 3000;
+                    console.warn(`   ⚠️ [GEMINI 503] Alta Demanda. Tentativa ${retryCount + 1}/5 em ${waitTime}ms...`);
                     await delay(waitTime);
                     
-                    // Se estiver na 3ª tentativa e falhando, troca para Flash 1.5 (mais leve e garantidamente estável)
+                    // Na 3ª tentativa, downgrade para modelo mais leve
                     if (retryCount === 2) {
-                        console.warn(`   🔄 [GEMINI] Trocando para modelo de fallback estável (gemini-1.5-flash) devido à alta demanda.`);
+                        console.warn(`   🔄 [GEMINI] Downgrade para gemini-1.5-flash por sobrecarga persistente.`);
                         activeModel = 'gemini-1.5-flash';
                     }
-
                     return generateWithRetry(currentContents, retryCount + 1);
                 }
+
+                // --- 🛡️ TRATAMENTO 429: Rate Limit (CRÍTICO - ANTI-QUEDA) ---
+                // Backoff severo: 15s → 30s → 90s (3 tentativas máximas)
+                // NUNCA relança o erro. Se esgotar, retorna null para não matar a fila.
+                if (is429 && retryCount < 3) {
+                    const waitTime = retryCount === 0 ? 15000 : retryCount === 1 ? 30000 : 90000;
+                    console.warn(`   🚫 [GEMINI 429] Rate Limit atingido. Aguardando ${waitTime / 1000}s (Tentativa ${retryCount + 1}/3)...`);
+                    Logger.warn?.('sentinel', `Rate Limit 429 atingido`, { tentativa: retryCount + 1, aguardo_ms: waitTime }, company_id);
+                    await delay(waitTime);
+                    return generateWithRetry(currentContents, retryCount + 1);
+                }
+
+                if (is429) {
+                    // Esgotou todas as tentativas de 429: retorna null silenciosamente.
+                    // A fila continua viva para o próximo lead/mensagem.
+                    console.error(`   ❌ [GEMINI 429] Rate Limit persistente após 3 tentativas. Abortando resposta sem derrubar a fila.`);
+                    Logger.error?.('sentinel', `Rate Limit 429 Fatal`, { aviso: 'Resposta abortada silenciosamente.' }, company_id);
+                    return null;
+                }
+
                 throw err;
             }
         };
 
         let result = await generateWithRetry(contents);
+
+        // 🛡️ Guarda de segurança: Se generateWithRetry retornou null (ex: 429 esgotado), aborta silenciosamente.
+        if (!result) {
+            console.warn(`   ⚠️ [SENTINEL] Resultado nulo (provável Rate Limit esgotado). Abortando sem quebrar a fila.`);
+            return;
+        }
 
         let response = result;
         let functionCalls = response.functionCalls;
