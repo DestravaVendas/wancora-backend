@@ -21,21 +21,46 @@ const aiInstances = new Map();
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
 
-// ⏰ [TIME GUARDIAN PROTOCOL] — Horário Comercial
-// Bloqueia respostas da IA fora do horário 08:00–20:00 (America/Sao_Paulo)
-// Decisão: retorno silencioso (sem fila). Se o cliente mandar mensagem DENTRO
-// do horário comercial, a IA retoma normalmente sem acumular lixo em memória.
-const isWithinBusinessHours = () => {
+// ⏰ [TIME GUARDIAN PROTOCOL] — Horário Comercial Dinâmico
+// Bloqueia respostas da IA avaliando as configurações salvas do Supabase no flow_config.
+const isWithinBusinessHours = (agent) => {
+    const config = agent?.flow_config?.business_hours;
+    if (!config || config.enabled !== true) return true; // Libera se não configurado ou desligado
+
     const now = new Date();
-    // Obtém hora atual no fuso de São Paulo
-    const formatter = new Intl.DateTimeFormat('pt-BR', {
-        timeZone: 'America/Sao_Paulo',
-        hour: 'numeric',
-        hour12: false
-    });
-    const hourInBrazil = parseInt(formatter.format(now), 10);
-    // Permite resposta entre 08:00 (inclusive) e 20:00 (exclusive)
-    return hourInBrazil >= 8 && hourInBrazil < 20;
+    const tz = config.timezone || 'America/Sao_Paulo';
+    
+    try {
+        const formatter = new Intl.DateTimeFormat('en-US', {
+            timeZone: tz,
+            hour: 'numeric',
+            minute: 'numeric',
+            hour12: false
+        });
+        
+        const timeParts = formatter.format(now).split(':');
+        const currentHours = parseInt(timeParts[0], 10);
+        const h24 = currentHours === 24 ? 0 : currentHours;
+        const currentMinutes = (h24 * 60) + (parseInt(timeParts[1], 10) || 0);
+        
+        const parseTime = (timeStr) => {
+            const [h, m] = (timeStr || "00:00").split(':').map(n => parseInt(n, 10));
+            return (h * 60) + (m || 0);
+        };
+
+        const startMinutes = parseTime(config.start || "08:00");
+        const endMinutes = parseTime(config.end || "20:00");
+
+        if (startMinutes <= endMinutes) {
+             return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+        } else {
+             // Caso a janela cruze a meia noite (ex: 22h as 04h)
+             return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+        }
+    } catch(e) {
+        console.error("Erro no isWithinBusinessHours:", e);
+        return true; 
+    }
 };
 
 // --- DEFINIÇÃO DE TOOLS (SDK ESTÁVEL - COMPLETO) ---
@@ -226,12 +251,7 @@ const _internalProcessAI = async (messageData) => {
 
     console.log(`\n🔔 [RAIO-X SENTINEL] Processando:`, id);
 
-    // ⏰ [TIME GUARDIAN] Bloqueia respostas da IA fora do horário comercial (08h–20h BRT)
-    if (!isWithinBusinessHours()) {
-        const now = new Date().toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo' });
-        console.log(`   🌙 [TIME GUARDIAN] Bloqueio fora do horário comercial. Hora atual BRT: ${now}. IA não responde entre 20h e 08h.`);
-        return;
-    }
+    // O [TIME GUARDIAN] foi movido mais para baixo após sabermos qual agente deu match.
 
     // 🛡️ [ESTABILIDADE] Bloqueio de mensagens vazias ou não descriptografadas
     if (!content && !transcription) {
@@ -338,6 +358,13 @@ const _internalProcessAI = async (messageData) => {
         return;
     }
 
+    // ⏰ [TIME GUARDIAN] Verificação dinâmica de horário comercial
+    if (!isWithinBusinessHours(agent)) {
+        const now = new Date().toLocaleTimeString('pt-BR', { timeZone: agent?.flow_config?.business_hours?.timezone || 'America/Sao_Paulo' });
+        console.log(`   🌙 [TIME GUARDIAN] Bloqueio: Fora do horário configurado do Agente ${agent.name}. Hora atual: ${now}.`);
+        return;
+    }
+
     console.log(`   🚀 Agente Acionado: ${agent.name} (${reason})`);
     Logger.info('sentinel', `Agente: ${agent.name}`, { lead: phone, trigger: reason }, company_id);
 
@@ -410,9 +437,12 @@ const _internalProcessAI = async (messageData) => {
 
         // Libera as tools com base no nível do agente
         let toolsConfig = [];
-        if (agent.level === 'senior' || agent.level === 'pleno') {
+        if (agent.level === 'senior') {
             toolsConfig = [{ functionDeclarations: ALL_TOOLS }];
+        } else if (agent.level === 'pleno') {
+            toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => ['transfer_to_human', 'check_availability', 'schedule_meeting'].includes(t.name)) }];
         } else {
+            // Junior
             toolsConfig = [{ functionDeclarations: ALL_TOOLS.filter(t => t.name === 'transfer_to_human') }];
         }
 

@@ -176,12 +176,16 @@ export const buildSystemPrompt = (agent) => {
     }
 
     // --- LÓGICA CORE DE COMPORTAMENTO E HUMANIZAÇÃO ---
-    prompt += `\n${EMPATHY_AND_CONNECTION_INSTRUCTIONS}\n`;
-    prompt += `\n${RAPPORT_INSTRUCTIONS}\n`;
-    prompt += `\n${TRIAGE_INSTRUCTIONS}\n`;
-    prompt += `\n${SCHEDULING_INSTRUCTIONS}\n`;
+    const activeModules = f.modules || ['empathy', 'rapport', 'triage', 'scheduling', 'zero_friction']; // Fallback seguro
+    
+    if (activeModules.includes('empathy')) prompt += `\n${EMPATHY_AND_CONNECTION_INSTRUCTIONS}\n`;
+    if (activeModules.includes('rapport')) prompt += `\n${RAPPORT_INSTRUCTIONS}\n`;
+    if (activeModules.includes('triage')) prompt += `\n${TRIAGE_INSTRUCTIONS}\n`;
+    if (activeModules.includes('scheduling')) prompt += `\n${SCHEDULING_INSTRUCTIONS}\n`;
+    if (activeModules.includes('zero_friction')) prompt += `\n${ZERO_FRICTION_INSTRUCTIONS}\n`;
+    
+    // Regras Globais Essenciais da Engine de Comunicação
     prompt += `\n${FLOW_CONTROL_INSTRUCTIONS}\n`;
-    prompt += `\n${ZERO_FRICTION_INSTRUCTIONS}\n`;
     // ------------------------------------------------
 
     // 4. Fluxo de Conversa (Verbosity)
