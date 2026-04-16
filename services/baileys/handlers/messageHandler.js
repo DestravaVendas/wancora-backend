@@ -137,7 +137,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             // ── Camada 2: Soft Resolution via contacts.phone ─────────────
             if (!resolvedJid) {
                 const purePhone = jid.split('@')[0].replace(/\D/g, '');
-                if (purePhone.length >= 8) {
+                if (purePhone.length >= 8 && !jid.includes('@lid')) {
                     const { data: contact } = await supabase
                         .from('contacts')
                         .select('jid')
@@ -159,7 +159,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
                     p_lid:        jid,
                     p_phone:      resolvedJid,
                     p_company_id: companyId
-                }).then(() => {}).catch(() => {});
+                }).then(({ error }) => { if (error) console.error("❌ [HANDLER] RPC Error:", error.message); }).catch(() => {});
 
                 jid = resolvedJid;
                 console.log(`🔗 [LID] Resolvido: ${unwrapped.key.remoteJid} → ${jid}`);

@@ -147,7 +147,7 @@ export const upsertContact = async (jid, companyId, incomingName = null, profile
         if (lid) {
             const cleanLid = normalizeJid(lid);
             if (cleanLid !== cleanJid) {
-                supabase.rpc('link_identities', { p_lid: cleanLid, p_phone: cleanJid, p_company_id: companyId }).then(() => {});
+                supabase.rpc('link_identities', { p_lid: cleanLid, p_phone: cleanJid, p_company_id: companyId }).then(({ error }) => { if (error) console.error("❌ [SYNC] RPC Error:", error.message); }).catch(() => {});
             }
         }
     } catch (e) {}

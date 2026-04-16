@@ -55,6 +55,34 @@ export const markMessageAsRead = async (sessionId, jid, messageId) => {
     });
 };
 
+// 🛡️ NOVO: Função para marcar áudio como executado (Microfone Azul)
+export const markMessageAsPlayed = async (sessionId, jid, messageId) => {
+    return executeLocked(sessionId, async () => {
+        const session = sessions.get(sessionId);
+        if (!session || !session.sock?.sendReceipt) return;
+        try {
+            await session.sock.sendReceipt(jid, undefined, [messageId], 'played');
+        } catch (e) {
+            console.warn("[SENDER] Erro ao marcar como played (Seguro ignorar):", e.message);
+        }
+    });
+};
+
+// 🛡️ NOVO: Enviar reação a uma mensagem específica
+export const sendReaction = async (sessionId, jid, messageId, emoji) => {
+    return executeLocked(sessionId, async () => {
+        const session = sessions.get(sessionId);
+        if (!session || !session.sock) return;
+        try {
+            await session.sock.sendMessage(jid, {
+                react: { text: emoji, key: { remoteJid: jid, fromMe: false, id: messageId } }
+            });
+        } catch (e) {
+            console.error("[SENDER] Erro ao enviar a reação:", e.message);
+        }
+    });
+};
+
 // Helper para converter imagem em Sticker WebP (512x512) com Metadados EXIF
 const convertToSticker = async (url) => {
     const response = await axios.get(url, { responseType: 'arraybuffer', timeout: 10000 });

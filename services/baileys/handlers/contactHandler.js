@@ -92,7 +92,7 @@ export const handleContactsUpsert = async (contacts, companyId) => {
                     p_lid: normalizeJid(c.lid),
                     p_phone: jid,
                     p_company_id: companyId
-                }).then(() => {});
+                }).then(({ error }) => { if (error) console.error("❌ [CONTACT] RPC Error:", error.message); }).catch(() => {});
             }
 
             if (jid.includes('@lid')) continue;

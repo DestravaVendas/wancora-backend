@@ -59,7 +59,7 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                         p_lid: cleanLid, 
                         p_phone: cleanPhone, 
                         p_company_id: companyId 
-                    }).catch(() => {});
+                    }).then(({ error }) => { if (error) console.error("❌ [LISTENER] RPC Error:", error.message); }).catch(() => {});
                 }
             }
         } catch (e) {

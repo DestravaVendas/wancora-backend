@@ -340,30 +340,26 @@ export const startSession = async (sessionId, companyId) => {
 
                 if (isCryptoError && !isConflict) {
                     Logger.error('baileys', `Erro de Criptografia (Bad MAC/Signal). Tentando reparar...`, { sessionId, error: errorMsg }, companyId);
-                    // Não deletamos os dados, apenas matamos a instância na RAM e forçamos reconexão limpa
                     killSession(sessionId);
                     handleReconnect(sessionId, companyId, 5000);
                     return;
                 }
 
                 if (isConflict) {
-                     // Adiciona um jitter significativo para evitar que as duas sessões reconectem sincronizadas
-                     // Se for 515 (Stream Errored), o jitter pode ser menor pois geralmente é erro de rede, não conflito real.
                      const is515 = statusCode === 515;
                      const jitter = is515 
-                        ? Math.floor(Math.random() * (10000 - 5000 + 1) + 5000) // 5-10s para 515
-                        : Math.floor(Math.random() * (30000 - 15000 + 1) + 15000); // 15-30s para conflito real
+                        ? Math.floor(Math.random() * (10000 - 5000 + 1) + 5000) 
+                        : Math.floor(Math.random() * (30000 - 15000 + 1) + 15000); 
                      
                      Logger.warn('baileys', `Conflito/Erro de Stream (${statusCode}). Jitter: ${jitter}ms.`, { sessionId }, companyId);
                      
-                     // Mata esta instância para dar chance à outra (se for o caso)
                      killSession(sessionId); 
-                     
-                     // Tenta reconectar depois do jitter
                      handleReconnect(sessionId, companyId, jitter); 
                      return;
                 }
 
+                // FIX: Sempre libera a trava em memória e Redis antes de tentar reconectar
+                killSession(sessionId);
                 handleReconnect(sessionId, companyId, 0);
             }
 

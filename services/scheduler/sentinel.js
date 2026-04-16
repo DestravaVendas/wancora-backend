@@ -1,11 +1,11 @@
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI, Type } from "@google/genai";
-import { sendMessage, markMessageAsRead } from "../baileys/sender.js"; 
+import { sendMessage, markMessageAsRead, markMessageAsPlayed, sendReaction } from "../baileys/sender.js";
 import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport, checkAvailability, searchFiles, sendFile } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
-import { buildSystemPrompt } from "../../utils/promptBuilder.js"; 
-import { EventEmitter } from "events"; 
+import { buildSystemPrompt } from "../../utils/promptBuilder.js";
+import { EventEmitter } from "events";
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -87,12 +87,12 @@ const ALL_TOOLS = [
     },
     {
         name: "schedule_meeting",
-        description: "Agenda uma reunião no calendário após confirmar o horário com o cliente.",
+        description: "Agenda uma reunião no calendário após confirmar o horário com o cliente. OBRIGATÓRIO: Use apenas a propriedade 'dateISO'.",
         parameters: {
             type: Type.OBJECT,
             properties: {
                 title: { type: Type.STRING, description: "Título do evento." },
-                dateISO: { type: Type.STRING, description: "Data e hora exata acordada em formato ISO 8601 (YYYY-MM-DDTHH:mm:ss)." },
+                dateISO: { type: Type.STRING, description: "Data e hora exata acordada em formato ISO 8601 (ex: 2026-04-16T14:30:00). Nunca use propriedades 'date' e 'time' separadas." },
                 description: { type: Type.STRING, description: "Detalhes e pauta do agendamento." }
             },
             required: ["title", "dateISO"]
@@ -103,7 +103,7 @@ const ALL_TOOLS = [
 // Factory com tratamento de erro e Fallback Global
 const getAIClient = (apiKey) => {
     if (!apiKey || apiKey.trim().length < 10) return null;
-    
+
     if (!aiInstances.has(apiKey)) {
         try {
             const instance = new GoogleGenAI({ apiKey });
@@ -119,7 +119,7 @@ const getAIClient = (apiKey) => {
 const matchAgent = (content, lead, lastMsgDate, agents) => {
     if (!agents || agents.length === 0) return { agent: null, reason: 'no_agents_configured' };
     const cleanContent = content ? content.trim().toLowerCase() : '';
-    
+
     const exactMatch = agents.find(a => a.trigger_config?.type === 'keyword_exact' && a.trigger_config.keywords?.some(k => k.toLowerCase() === cleanContent));
     if (exactMatch) return { agent: exactMatch, reason: `keyword_exact: "${cleanContent}"` };
 
@@ -130,7 +130,7 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     if (stageMatch) return { agent: stageMatch, reason: `pipeline_stage: ${lead.pipeline_stage_id}` };
 
     const hasHistory = !!lastMsgDate;
-    
+
     if (!hasHistory) {
         const firstEver = agents.find(a => a.trigger_config?.type === 'first_message_ever');
         if (firstEver) return { agent: firstEver, reason: 'first_message_ever' };
@@ -157,7 +157,7 @@ const messageBuffers = new Map(); // 📥 Buffer para acumular mensagens (Deboun
 // 🛡️ ADAPTADO PARA RECEBER O PAYLOAD DIRETO DO EVENT BUS
 const processAIResponse = async (messageData) => {
     if (!messageData) return;
-    
+
     const { whatsapp_id: id, remote_jid, company_id, from_me, content } = messageData;
 
     if (from_me) return;
@@ -166,7 +166,7 @@ const processAIResponse = async (messageData) => {
     // --- LÓGICA DE ACUMULAÇÃO (DEBOUNCE) ---
     // Se o usuário mandar 3 mensagens seguidas, esperamos ele parar de digitar por 6s
     // para processar tudo de uma vez só, evitando respostas múltiplas e robóticas.
-    
+
     if (!messageBuffers.has(remote_jid)) {
         messageBuffers.set(remote_jid, {
             messages: [messageData],
@@ -179,11 +179,11 @@ const processAIResponse = async (messageData) => {
     }
 
     const buffer = messageBuffers.get(remote_jid);
-    
+
     buffer.timer = setTimeout(() => {
         const finalMessages = [...buffer.messages];
         messageBuffers.delete(remote_jid);
-        
+
         // Consolidamos o conteúdo de todas as mensagens acumuladas
         const combinedContent = finalMessages
             .map(m => m.content || m.transcription || "")
@@ -202,7 +202,7 @@ const processAIResponse = async (messageData) => {
         }
 
         const currentLock = conversationLocks.get(remote_jid);
-        
+
         const nextTask = currentLock.then(async () => {
             try {
                 await _internalProcessAI(consolidatedData);
@@ -223,7 +223,7 @@ const processAIResponse = async (messageData) => {
 
 const _internalProcessAI = async (messageData) => {
     const { whatsapp_id: id, content, remote_jid, company_id, from_me, message_type, transcription, created_at, session_id: msgSessionId } = messageData;
-    
+
     console.log(`\n🔔 [RAIO-X SENTINEL] Processando:`, id);
 
     // ⏰ [TIME GUARDIAN] Bloqueia respostas da IA fora do horário comercial (08h–20h BRT)
@@ -242,8 +242,8 @@ const _internalProcessAI = async (messageData) => {
     const msgTime = new Date(created_at).getTime();
     if ((Date.now() - msgTime) / 1000 > 180) {
         console.log(`   ❌ Bloqueio: Mensagem muito antiga.`);
-        return; 
-    } 
+        return;
+    }
 
     const lockKey = `${remote_jid}-${id}`;
     if (processingLock.has(lockKey)) {
@@ -277,7 +277,7 @@ const _internalProcessAI = async (messageData) => {
 
     if (!lead) {
         console.log(`   🆕 [SENTINEL] Lead não encontrado para ${phone}. Criando automaticamente...`);
-        
+
         // Busca o estágio inicial do funil
         const { data: stage } = await supabase.from('pipeline_stages')
             .select('id')
@@ -316,7 +316,7 @@ const _internalProcessAI = async (messageData) => {
     } else if (message_type === 'image') {
         userMessage = `[Imagem Enviada pelo Usuário]`;
     }
-    
+
     if (!userMessage) {
         console.log("   ❌ Bloqueio: Mensagem vazia ou não descriptografada.");
         return;
@@ -342,7 +342,7 @@ const _internalProcessAI = async (messageData) => {
     Logger.info('sentinel', `Agente: ${agent.name}`, { lead: phone, trigger: reason }, company_id);
 
     try {
-        let activeApiKey = companyConfig?.apiKey || process.env.API_KEY || process.env.GEMINI_API_KEY; 
+        let activeApiKey = companyConfig?.apiKey || process.env.API_KEY || process.env.GEMINI_API_KEY;
         if (!activeApiKey) {
             console.warn(`   ❌ Bloqueio: Nenhuma API Key configurada para empresa ${company_id}`);
             return;
@@ -367,7 +367,7 @@ const _internalProcessAI = async (messageData) => {
             .select('content, from_me, message_type, transcription')
             .eq('company_id', company_id)
             .eq('remote_jid', remote_jid)
-            .neq('whatsapp_id', id) 
+            .neq('whatsapp_id', id)
             .order('created_at', { ascending: false })
             .limit(contextLimit);
 
@@ -387,7 +387,7 @@ const _internalProcessAI = async (messageData) => {
 
             // Encontra o índice da primeira mensagem que é 'user'
             const firstUserIndex = rawHistory.findIndex(msg => msg.role === 'user');
-            
+
             // Só adiciona ao histórico a partir desse ponto (remove os 'model' soltos no início)
             if (firstUserIndex !== -1) {
                 chatHistory = rawHistory.slice(firstUserIndex);
@@ -396,18 +396,18 @@ const _internalProcessAI = async (messageData) => {
 
         let systemInstruction = buildSystemPrompt(agent);
         const filesKnowledge = agent.knowledge_config?.text_files?.map(f => `Arquivo: ${f.name} - Link: ${f.url}`).join('\n') || '';
-        
+
         // Consciência Temporal (Dia da semana + Data completa)
         const agora = new Date();
-        const dataCompleta = agora.toLocaleDateString('pt-BR', { 
-            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
+        const dataCompleta = agora.toLocaleDateString('pt-BR', {
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
         });
         const horaCompleta = agora.toLocaleTimeString('pt-BR');
-        
+
         // 🛡️ [ISOLAMENTO CRÍTICO] Instrução de Bolha: Garante que a IA saiba exatamente com quem fala
         systemInstruction += `\n\n[DIRETRIZ DE ISOLAMENTO]\nVocê está em uma conversa PRIVADA e ISOLADA com o cliente "${lead.name}".\nNUNCA mencione outros clientes ou misture contextos.\nTrate esta conversa como uma bolha única.`;
         systemInstruction += `\n[CONTEXTO ATUAL]\nCliente: ${lead.name}\nHoje é: ${dataCompleta} às ${horaCompleta}\n${filesKnowledge}`;
-        
+
         // Libera as tools com base no nível do agente
         let toolsConfig = [];
         if (agent.level === 'senior' || agent.level === 'pleno') {
@@ -418,7 +418,7 @@ const _internalProcessAI = async (messageData) => {
 
         // 🧠 IMPLEMENTAÇÃO SDK ESTÁVEL COM RETRY DUPLO (503 e 429)
         let contents = [...chatHistory, { role: 'user', parts: [{ text: userMessage }] }];
-        
+
         console.log(`   🧠 [GEMINI] Pensando (Model: ${activeModel})...`);
 
         // ⚡ BACKOFF EXPONENCIAL SEVERO: 503 = Sobrecarga do servidor, 429 = Rate Limit da API Key
@@ -445,7 +445,7 @@ const _internalProcessAI = async (messageData) => {
                     const waitTime = Math.pow(2, retryCount) * 3000;
                     console.warn(`   ⚠️ [GEMINI 503] Alta Demanda. Tentativa ${retryCount + 1}/5 em ${waitTime}ms...`);
                     await delay(waitTime);
-                    
+
                     // Na 3ª tentativa, downgrade para modelo mais leve
                     if (retryCount === 2) {
                         console.warn(`   🔄 [GEMINI] Downgrade para gemini-1.5-flash por sobrecarga persistente.`);
@@ -503,10 +503,24 @@ const _internalProcessAI = async (messageData) => {
 
                 try {
                     if (call.name === 'check_availability') {
-                        output = await checkAvailability(company_id, call.args.dateISO);
+                        const safeDateArgs = call.args.dateISO || call.args.date || call.args.date_iso;
+                        output = await checkAvailability(company_id, safeDateArgs);
                     }
                     else if (call.name === 'schedule_meeting') {
-                        output = await scheduleMeeting(company_id, lead.id, call.args.title, call.args.dateISO, call.args.description, lead.owner_id);
+                        let finalIso = call.args.dateISO;
+
+                        // Polyfill dinâmico caso a IA cometa o erro de desmembrar date e time
+                        if (!finalIso && call.args.date) {
+                            const t = call.args.time || "00:00:00";
+                            if (call.args.date.includes('T')) {
+                                finalIso = call.args.date;
+                            } else {
+                                finalIso = `${call.args.date}T${t}`;
+                                if (!finalIso.includes('-03:00') && !finalIso.includes('Z')) finalIso += '-03:00';
+                            }
+                        }
+
+                        output = await scheduleMeeting(company_id, lead.id, call.args.title, finalIso, call.args.description, lead.owner_id);
                     }
                     else if (call.name === 'transfer_to_human') {
                         const reportingPhones = agent.tools_config?.reporting_phones || [];
@@ -516,7 +530,7 @@ const _internalProcessAI = async (messageData) => {
                     }
                     else if (call.name === 'search_files') {
                         output = await searchFiles(company_id, call.args.query);
-                    } 
+                    }
                     else if (call.name === 'send_file') {
                         output = await sendFile(company_id, remote_jid, call.args.google_id);
                     }
@@ -548,7 +562,7 @@ const _internalProcessAI = async (messageData) => {
         // =========================================================================
         if (finalReply) {
             console.log(`   💬 Resposta final gerada. Iniciando comportamento humano...`);
-            
+
             // 🕒 CONFIGURAÇÃO DE TIMING (ANTI-BAN)
             const timing = agent.flow_config?.timing || { min_delay_seconds: 10, max_delay_seconds: 30 };
             const minDelay = (timing.min_delay_seconds || 10) * 1000;
@@ -556,11 +570,35 @@ const _internalProcessAI = async (messageData) => {
 
             // 🔥 CORREÇÃO: Usa o sessionId da mensagem original se disponível, senão busca o padrão
             const sessionId = msgSessionId || await getSessionId(company_id);
-            
+
             if (sessionId) {
                 // PASSO 1: Marcar como lida ("Visualizou")
-                await markMessageAsRead(sessionId, remote_jid, id); 
+                await markMessageAsRead(sessionId, remote_jid, id);
                 console.log(`   👀 Visto Azul enviado. Aguardando delay humano configurado...`);
+
+                // 🛡️ [HUMANIZAÇÃO] Extração de Reação (React)
+                let extractedEmoji = null;
+                const reactRegex = /\[REACT:\s*(.+?)\]/i;
+                const reactMatch = finalReply.match(reactRegex);
+                if (reactMatch) {
+                    extractedEmoji = reactMatch[1].trim();
+                    finalReply = finalReply.replace(reactRegex, '').trim();
+                    console.log(`   ❤️ Reação detectada: ${extractedEmoji}`);
+                    await sendReaction(sessionId, remote_jid, id, extractedEmoji);
+                }
+
+                // 🛡️ [HUMANIZAÇÃO] Atraso extra para escutar áudio + Microfone Azul
+                let listeningDelay = 0;
+                if (message_type === 'audio' || message_type === 'ptt') {
+                    if (transcription) {
+                        // Calcula o tempo que um humano levaria para ouvir o áudio (aproximado pela transcrição)
+                        listeningDelay = Math.min(Math.max(transcription.length * 60, 2000), 25000);
+                        console.log(`   🎧 Áudio recebido. Simulando escuta por ${Math.round(listeningDelay / 1000)}s...`);
+                        await delay(listeningDelay);
+                    }
+                    // Marca o audio como escutado (Microfone Azul)
+                    await markMessageAsPlayed(sessionId, remote_jid, id);
+                }
 
                 // PASSO 2: Ficar "olhando/pensando" por um tempo natural antes de começar a digitar
                 // O delay inicial respeita o min/max do agente
@@ -570,7 +608,7 @@ const _internalProcessAI = async (messageData) => {
                 // PASSO 3: Quebra Inteligente de Mensagem
                 // A IA agora envia a flag [SPLIT] quando ela mesma quer dividir a mensagem em balões diferentes
                 let rawChunks = finalReply.split(/\[SPLIT\]/i).map(c => c.trim()).filter(c => c.length > 0);
-                
+
                 // Fallback de segurança: Se a IA não obedeceu o SPLIT e gerou um bloco gigante de texto, forçamos a quebra por frase
                 if (rawChunks.length === 1 && finalReply.length > 300) {
                     rawChunks = finalReply.split(/\n\n+/).map(c => c.trim()).filter(c => c.length > 0);
@@ -580,7 +618,7 @@ const _internalProcessAI = async (messageData) => {
                 let chunks = [];
                 let tempStr = "";
                 for (const c of rawChunks) {
-                    if (tempStr.length + c.length < 150) { 
+                    if (tempStr.length + c.length < 150) {
                         tempStr += (tempStr.length > 0 ? "\n" : "") + c;
                     } else {
                         if (tempStr) chunks.push(tempStr);
@@ -588,8 +626,8 @@ const _internalProcessAI = async (messageData) => {
                     }
                 }
                 if (tempStr) chunks.push(tempStr);
-                
-                if (chunks.length === 0) chunks = [finalReply]; 
+
+                if (chunks.length === 0) chunks = [finalReply];
 
                 // Limite de sanidade: Máximo de 4 balões seguidos para evitar ser invasivo
                 if (chunks.length > 4) {
@@ -602,13 +640,13 @@ const _internalProcessAI = async (messageData) => {
                 // PASSO 4: Loop de Envio Fracionado
                 for (let i = 0; i < chunks.length; i++) {
                     const chunk = chunks[i];
-                    
+
                     // PASSO 5: Definir o tempo do "Digitando..."
                     // A primeira mensagem finge que está formulando a ideia
                     // As partes seguintes digitam mais rápido com base no peso
-                    let typingTime = randomDelay(5000, 8000); 
+                    let typingTime = randomDelay(5000, 8000);
                     if (i > 0) {
-                        typingTime = Math.min(Math.max(chunk.length * 35, 2500), 7000); 
+                        typingTime = Math.min(Math.max(chunk.length * 35, 2500), 7000);
                     }
 
                     try {
@@ -617,15 +655,15 @@ const _internalProcessAI = async (messageData) => {
                             to: remote_jid,
                             type: 'text',
                             content: chunk,
-                            timingConfig: { 
-                                override_typing_time: typingTime, 
-                                min_delay_seconds: timing.min_delay_seconds / 4, 
+                            timingConfig: {
+                                override_typing_time: typingTime,
+                                min_delay_seconds: timing.min_delay_seconds / 4,
                                 max_delay_seconds: timing.max_delay_seconds / 4
                             },
                             companyId: company_id
                         });
-                        console.log(`   ✅ Parte ${i+1}/${chunks.length} enviada! (Digitou por ${Math.round(typingTime/1000)}s)`);
-                        
+                        console.log(`   ✅ Parte ${i + 1}/${chunks.length} enviada! (Digitou por ${Math.round(typingTime / 1000)}s)`);
+
                         // PASSO 6: O "respiro" natural entre enviar uma parte e começar a digitar a próxima
                         if (i < chunks.length - 1) {
                             await delay(randomDelay(1500, 3500));
@@ -641,9 +679,9 @@ const _internalProcessAI = async (messageData) => {
 
     } catch (error) {
         console.error("\n   ❌ [ERRO CRÍTICO NA EXECUÇÃO DA IA]:", error);
-        
+
         if (error.message?.includes('404')) {
-             Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key inválida." }, company_id);
+            Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key inválida." }, company_id);
         } else if (!error.message?.includes('SAFETY')) {
             Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message }, company_id);
         }
@@ -653,9 +691,9 @@ const _internalProcessAI = async (messageData) => {
 // 🛡️ O FIM DOS TIMEOUTS. MOTOR LIGADO NA RAM.
 export const startSentinel = () => {
     console.log("🛡️ [SENTINEL] Preparando barramento de eventos locais (EventBus)...");
-    
+
     aiBus.removeAllListeners('new_message_arrived');
-    
+
     // Ouve a mensagem localmente.
     aiBus.on('new_message_arrived', (messageData) => {
         // Removemos o timeout fixo de 2.5s pois agora usamos a lógica de Debounce/Acumulação de 6s dentro de processAIResponse

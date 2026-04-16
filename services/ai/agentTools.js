@@ -102,14 +102,22 @@ export const sendFile = async (companyId, remoteJid, googleId) => {
  */
 export const scheduleMeeting = async (companyId, leadId, title, dateISO, description, userId) => {
     try {
+        const safeDate = new Date(dateISO);
+        if (!dateISO || isNaN(safeDate.getTime())) {
+            console.error("[TOOL] scheduleMeeting recebeu data inválida:", dateISO);
+            return { success: false, error: "A data informada no agendamento é inválida. Por favor, forneça o parâmetro 'dateISO' com uma data e hora válidas (ex: YYYY-MM-DDTHH:mm:ss)." };
+        }
+
+        const endTime = new Date(safeDate.getTime() + 30 * 60000);
+
         const { data, error } = await supabase.from('appointments').insert({
             company_id: companyId,
             user_id: userId, // Dono do lead ou admin
             lead_id: leadId,
             title: title || 'Reunião Agendada via IA',
             description: description || 'Agendamento automático.',
-            start_time: dateISO,
-            end_time: new Date(new Date(dateISO).getTime() + 30 * 60000).toISOString(), // Padrão 30min
+            start_time: safeDate.toISOString(),
+            end_time: endTime.toISOString(), // Padrão 30min
             status: 'confirmed',
             is_task: false,
             origin: 'ai_agent'
@@ -176,10 +184,15 @@ export const handoffAndReport = async (companyId, leadId, remoteJid, summary, re
  */
 export const checkAvailability = async (companyId, dateISO) => {
     try {
-        const startOfDay = new Date(dateISO);
+        const safeDate = new Date(dateISO);
+        if (!dateISO || isNaN(safeDate.getTime())) {
+            return { success: false, error: "Data inválida para checagem da agenda. Use o fomato ISO 8601 (ex: YYYY-MM-DD)." };
+        }
+
+        const startOfDay = new Date(safeDate);
         startOfDay.setHours(0, 0, 0, 0);
         
-        const endOfDay = new Date(dateISO);
+        const endOfDay = new Date(safeDate);
         endOfDay.setHours(23, 59, 59, 999);
 
         const { data, error } = await supabase

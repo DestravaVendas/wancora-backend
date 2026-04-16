@@ -90,7 +90,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             // Processa em série para evitar sobrecarga de RPC no Supabase
             for (const mapping of lidBatch) {
                 try {
-                    await supabase.rpc('link_identities', mapping);
+                    const { error } = await supabase.rpc('link_identities', mapping);
+                    if (error) throw error;
                 } catch (e) {
                     // Falha individual não aborta o lote — apenas loga
                     console.warn(`⚠️  [FASE 1] Falha ao mapear LID ${mapping.p_lid}:`, e.message);
@@ -128,11 +129,12 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
 
                         // Só persiste se o par faz sentido (PN deve ser @s.whatsapp.net)
                         if (finalPn.includes('@s.whatsapp.net') || finalPn.includes('@g.us')) {
-                            await supabase.rpc('link_identities', {
+                            const { error } = await supabase.rpc('link_identities', {
                                 p_lid: finalLid,
                                 p_phone: finalPn,
                                 p_company_id: companyId
                             });
+                            if (error) throw error;
                         }
                     } catch (e) {
                         console.warn(`⚠️  [FASE 1] Falha no LID embutido (${c.id}):`, e.message);

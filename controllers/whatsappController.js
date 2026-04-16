@@ -341,9 +341,22 @@ export const refreshContactPic = async (req, res) => {
     }
 
     try {
+        let targetJid = jid;
+        if (targetJid.includes('@lid')) {
+            const { data: mapData } = await supabase.from('identity_map')
+                .select('phone_jid')
+                .eq('lid_jid', targetJid)
+                .eq('company_id', companyId)
+                .maybeSingle();
+            
+            if (mapData?.phone_jid) {
+                targetJid = mapData.phone_jid;
+            }
+        }
+
         // 🛡️ TIMEOUT RACE: O WhatsApp pode demorar a responder se o alvo estiver offline.
         // Forçamos o cancelamento em 10 segundos para não prender a UI do cliente.
-        const fetchPicPromise = session.sock.profilePictureUrl(jid, 'image');
+        const fetchPicPromise = session.sock.profilePictureUrl(targetJid, 'image');
         const timeoutPromise = new Promise((_, reject) => 
             setTimeout(() => reject(new Error('TIMEOUT_BAILEYS')), 10000)
         );
