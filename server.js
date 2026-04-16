@@ -17,6 +17,7 @@ import { startSentinel } from './services/scheduler/sentinel.js';
 import { startAgendaWorker } from './workers/agendaWorker.js';
 import { startRetentionWorker } from './workers/retentionWorker.js';
 import { errorHandler } from './middleware/errorHandler.js'; // NOVO: Middleware
+import rateLimit from 'express-rate-limit'; // [SECURITY PATCH] Rate Limiter
 
 // --- CONSOLE HIJACKING (Interceptador Global de Logs) ---
 Logger.initConsoleHijack();
@@ -97,6 +98,16 @@ app.use(cors());
 app.use(compression()); 
 app.use(express.json({ limit: '50mb' })); 
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// --- RATE LIMIT GLOBAL (SECURITY PATCH) ---
+const apiLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 minuto
+    max: 200, // Limita a 200 requisições por minuto por IP (Proteção Anti-DDoS)
+    message: { error: 'Too Many Requests - Rate Limit Exceeded' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.use('/api', apiLimiter);
 
 // Montagem das Rotas
 app.use('/api/v1/session', sessionRoutes);

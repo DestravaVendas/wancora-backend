@@ -247,8 +247,8 @@ export const startSession = async (sessionId, companyId) => {
                     await redis.del(`retry:${sessionId}:${key}`);
                 }
             } : undefined,
-            // ANTI-BAN: Simula navegador Desktop real Ubuntu/Chrome (§2.1 + §12)
-            browser: Browsers.ubuntu("Chrome"), 
+            // ANTI-BAN: Simula navegador Desktop real (Mandatório macOS para stealth) (§2.1 + §18)
+            browser: Browsers.macOS("Desktop"), 
             syncFullHistory: true, 
             // ANTI-BAN: Comportamento humano — aparece online ao conectar (§2.1)
             markOnlineOnConnect: true,
