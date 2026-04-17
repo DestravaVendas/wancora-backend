@@ -3,8 +3,9 @@ import { handlePresenceUpdate, handleContactsUpsert } from './handlers/contactHa
 import { handleReceiptUpdate, handleMessageUpdate, handleReaction } from './handlers/messageHandler.js';
 import { handleHistorySync, resetHistoryState } from './handlers/historyHandler.js'; // Import atualizado
 import { enqueueMessage, drainSessionQueue } from './messageQueue.js';
+import { createClient } from '@supabase/supabase-js';
 
-
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 export const setupListeners = ({ sock, sessionId, companyId }) => {
     
     // [CRÍTICO] Reset de Estado de Histórico
@@ -45,21 +46,20 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         
         // 2. 🛡️ [MAPA DE IDENTIDADE] O WhatsApp entrega a relação LID <-> Phone aqui
         try {
-            const { createClient } = await import('@supabase/supabase-js');
-            const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-
-            for (const contact of contacts) {
-                // Se o contato veio com o número de telefone E o código LID
-                if (contact.id && contact.lid) {
+            const batch = contacts.filter(c => c.id && c.lid);
+            if (batch.length > 0) {
+                // Execução sequencial para evitar 'TypeError: fetch failed' (Socket Exhaustion)
+                for (const contact of batch) {
                     const cleanPhone = contact.id.replace(/:[0-9]+@/, '@'); // Remove porta de dispositivo
                     const cleanLid = contact.lid.replace(/:[0-9]+@/, '@');
 
-                    // Executa a RPC silenciosamente para mapear no banco
-                    supabase.rpc('link_identities', { 
+                    await supabase.rpc('link_identities', { 
                         p_lid: cleanLid, 
                         p_phone: cleanPhone, 
                         p_company_id: companyId 
-                    }).then(({ error }) => { if (error) console.error("❌ [LISTENER] RPC Error:", error.message); }).catch(() => {});
+                    }).catch(err => {
+                        console.error("❌ [LISTENER] RPC Error:", err.message);
+                    });
                 }
             }
         } catch (e) {

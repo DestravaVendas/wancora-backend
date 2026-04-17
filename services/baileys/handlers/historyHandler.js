@@ -8,7 +8,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 // [AJUSTE] Reduzido para 10 para permitir download seguro de mídia
 const HISTORY_MSG_LIMIT = 10; 
-const HISTORY_MONTHS_LIMIT = 6;
+const HISTORY_MONTHS_LIMIT = 8;
 const processedHistoryChunks = new Set();
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -288,8 +288,20 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 chats[jid].push(clean);
             });
 
-            const chatJids = Object.keys(chats);
+            let chatJids = Object.keys(chats);
             console.log(`💬 [FASE 3] Processando ${chatJids.length} chats e suas mensagens...`);
+
+            // [NOVO] Limite de 200 conversas, priorizando as mais recentes
+            const HISTORY_CHAT_LIMIT = 200;
+            if (chatJids.length > HISTORY_CHAT_LIMIT) {
+                chatJids.sort((a, b) => {
+                    const topA = chats[a].reduce((max, msg) => Math.max(max, Number(msg.messageTimestamp) || 0), 0);
+                    const topB = chats[b].reduce((max, msg) => Math.max(max, Number(msg.messageTimestamp) || 0), 0);
+                    return topB - topA; // Decrescente (mais recente primeiro)
+                });
+                chatJids = chatJids.slice(0, HISTORY_CHAT_LIMIT);
+                console.log(`💬 [FASE 3] Limitado a ${HISTORY_CHAT_LIMIT} conversas mais recentes.`);
+            }
 
             for (const jid of chatJids) {
                 chats[jid].sort((a, b) => (Number(a.messageTimestamp) || 0) - (Number(b.messageTimestamp) || 0)); 

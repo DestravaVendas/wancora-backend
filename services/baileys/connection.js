@@ -324,7 +324,7 @@ export const startSession = async (sessionId, companyId) => {
                 resetHistoryState(sessionId);
 
                 const isCryptoError = errorMsg.includes('authenticate data') || errorMsg.includes('Signal') || errorMsg.includes('Bad MAC');
-                const isConflict = errorMsg.includes('Stream Errored (conflict)') || statusCode === 440 || statusCode === 515;
+                const isConflict = errorMsg.includes('Stream Errored (conflict)') || statusCode === 440 || statusCode === 515 || statusCode === 428;
                 const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 403;
 
                 // [REPARO] Se for erro de criptografia mas não for logout real, tentamos apenas reconectar
@@ -346,8 +346,8 @@ export const startSession = async (sessionId, companyId) => {
                 }
 
                 if (isConflict) {
-                     const is515 = statusCode === 515;
-                     const jitter = is515 
+                     const isShortJitter = statusCode === 515 || statusCode === 428;
+                     const jitter = isShortJitter 
                         ? Math.floor(Math.random() * (10000 - 5000 + 1) + 5000) 
                         : Math.floor(Math.random() * (30000 - 15000 + 1) + 15000); 
                      
