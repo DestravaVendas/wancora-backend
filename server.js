@@ -84,6 +84,7 @@ if (process.env.REDIS_URL) {
 }
 
 const app = express();
+app.set('trust proxy', 1); // [FIX] Ensina o Express a confiar no Load Balancer Cloud do Render
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
