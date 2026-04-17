@@ -1,5 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
-import { startSession as startService, deleteSession as deleteService, sessions } from '../services/baileys/connection.js';
+import { startSession as startService, deleteSession as deleteService, generatePairingCode as requestPairingBaileys, sessions } from '../services/baileys/connection.js';
 import { sendMessage as sendService, executeLocked } from '../services/baileys/sender.js';
 import { 
     createGroup as createGroupService, 
@@ -36,6 +36,21 @@ export const deleteSession = async (sessionId, companyId) => {
     } catch (error) {
         console.error(`[Controller] Erro ao deletar sessão:`, error);
         throw error;
+    }
+};
+
+export const requestPairingCode = async (req, res) => {
+    const { sessionId, phone } = req.body;
+    if (!sessionId || !phone) return res.status(400).json({ error: "SessionId e Phone são obrigatórios." });
+
+    try {
+        const code = await requestPairingBaileys(sessionId, phone);
+        // O Baileys retorna um código ex: "1234ABCD" ou formato 4x4.
+        const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+        res.json({ success: true, code: formattedCode });
+    } catch (error) {
+        console.error(`[Controller] Erro no Pairing Code:`, error);
+        res.status(500).json({ error: error.message });
     }
 };
 

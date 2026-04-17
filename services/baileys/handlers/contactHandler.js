@@ -95,8 +95,6 @@ export const handleContactsUpsert = async (contacts, companyId) => {
                 }).then(({ error }) => { if (error) console.error("❌ [CONTACT] RPC Error:", error.message); }).catch(() => {});
             }
 
-            if (jid.includes('@lid')) continue;
-
             const bestName = c.name || c.notify || c.verifiedName;
             const isFromBook = !!c.name;
 
@@ -109,7 +107,7 @@ export const handleContactsUpsert = async (contacts, companyId) => {
         
         for (const c of contacts) {
             const jid = normalizeJid(c.id);
-            if (!jid || jid.includes('@lid')) continue;
+            if (!jid) continue;
 
             const isFromBook = !!c.name;
             const bestName = c.name || c.notify || c.verifiedName;

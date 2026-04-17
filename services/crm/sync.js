@@ -159,13 +159,10 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     const cleanJid = normalizeJid(jid);
     if (!cleanJid) return null;
 
-    // 🛡️ GUARD LID: Se o JID chegou aqui ainda como @lid, significa que o LID Resolver
-    // do messageHandler não conseguiu translatear para um número real.
-    // Bloquear criação de lead com identidade LID evita leads duplicados e fantasmas.
-    if (cleanJid.includes('@lid')) {
-        console.warn(`[LEAD GUARD] @lid não resolvido ignorado: ${cleanJid}`);
-        return null;
-    }
+    // 🛡️ GUARD LID: O bloqueio de @lid foi removido para permitir a captura de Leads originários 
+    // de anúncios com sigilo de número. O 'pushName' salvará a experiência visual.
+    const isLid = cleanJid.includes('@lid');
+
 
     if (cleanJid.includes('@g.us') || cleanJid.includes('@newsletter') || cleanJid.includes('status@broadcast')) return null; 
     
@@ -175,7 +172,10 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
     }
 
     const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
-    if (purePhone.length < 8 || purePhone.length > 15) return null;
+    
+    // LIDs possuem numerações criptográficas acima de 15 dígitos. Telefones normais devem estar entre 8 e 15.
+    if (!isLid && (purePhone.length < 8 || purePhone.length > 15)) return null;
+
     
     // 🛡️ LOCK: Evita que duas mensagens do mesmo lead criem dois registros no Supabase
     const locked = await isLeadLocked(companyId, purePhone);

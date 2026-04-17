@@ -429,6 +429,21 @@ const handleReconnect = (sessionId, companyId, extraDelay = 0) => {
     setTimeout(() => startSession(sessionId, companyId), delayMs);
 };
 
+export const generatePairingCode = async (sessionId, phone) => {
+    const session = sessions.get(sessionId);
+    if (!session || !session.sock) throw new Error("Sessão não iniciada. Ligue a instância primeiro.");
+    
+    // Baileys exige que o telefone venha limpo, apenas código do país + numero
+    let cleanPhone = String(phone).replace(/[^0-9]/g, '');
+    
+    try {
+        const code = await session.sock.requestPairingCode(cleanPhone);
+        return code;
+    } catch (e) {
+        throw new Error(`Erro Baileys ao solicitar código: ${e.message}`);
+    }
+};
+
 /**
  * Encerra todas as sessões ativas (Graceful Shutdown)
  */

@@ -5,6 +5,8 @@ import { unwrapMessage } from '../../../utils/wppParsers.js';
 import mime from 'mime-types';
 import pino from 'pino';
 import sharp from 'sharp'; 
+import axios from 'axios';
+
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const logger = pino({ level: 'silent' });
@@ -26,15 +28,15 @@ export const handleMediaUpload = async (rawMsg, companyId) => {
             }
         };
 
-        // Download do Buffer
-        let buffer = await downloadMediaMessage(
+        // [ZERO BUFFER] Puxa a mídia como Stream de descriptografia direto do motor Baileys
+        let mediaStream = await downloadMediaMessage(
             msg,
-            'buffer',
+            'stream',
             downloadOptions,
             { logger, reuploadRequest: msg.updateMediaMessage }
         );
 
-        if (!buffer) return null;
+        if (!mediaStream) return null;
 
         // --- Detecção de Tipo ---
         let mimeType = 'application/octet-stream';
@@ -46,20 +48,21 @@ export const handleMediaUpload = async (rawMsg, companyId) => {
         else if (messageType === 'documentMessage') mimeType = msg.message.documentMessage?.mimetype || 'application/pdf';
         else if (messageType === 'stickerMessage') mimeType = 'image/webp';
 
-        // --- OTIMIZAÇÃO COM SHARP (Apenas Imagens) ---
-        // Se for imagem (exceto sticker que já vem otimizado ou gif animado), redimensiona
+        let uploadStream = mediaStream;
+
+        // --- OTIMIZAÇÃO COM SHARP ON-THE-FLY (Apenas Imagens) ---
         if (mimeType.startsWith('image/') && messageType !== 'stickerMessage' && !mimeType.includes('gif')) {
             try {
-                // Redimensiona para max 1280px de largura/altura (HD), converte para JPEG com qualidade 80
-                // Isso previne que fotos de 10MB travem o storage ou o frontend
-                buffer = await sharp(buffer)
+                // Instancia o transformador Sharp sem bufferizar
+                const sharpTransformer = sharp()
                     .resize(1280, 1280, { fit: 'inside', withoutEnlargement: true })
-                    .toFormat('jpeg', { quality: 80 })
-                    .toBuffer();
+                    .toFormat('jpeg', { quality: 80 });
                 
-                mimeType = 'image/jpeg'; // Força tipo para JPEG após conversão
+                uploadStream = mediaStream.pipe(sharpTransformer);
+                mimeType = 'image/jpeg'; 
             } catch (sharpError) {
-                console.warn("[MEDIA] Falha na otimização Sharp, usando original:", sharpError.message);
+                console.warn("[MEDIA] Falha no piping do Sharp, usando original:", sharpError.message);
+                uploadStream = mediaStream;
             }
         }
 
@@ -72,14 +75,22 @@ export const handleMediaUpload = async (rawMsg, companyId) => {
         const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
         const filePath = companyId ? `${companyId}/${fileName}` : fileName;
 
-        // Upload para Supabase Storage
-        const { error } = await supabase.storage
-            .from('chat-media')
-            .upload(filePath, buffer, { contentType: mimeType, upsert: false });
-
-        if (error) {
-            if (!error.message.includes('Duplicate')) {
-                 console.error("[MEDIA] Erro Upload Supabase:", error.message);
+        // Upload Direto Streaming POST (Bypass Buffer RAM)
+        const uploadUrl = `${process.env.SUPABASE_URL}/storage/v1/object/chat-media/${filePath}`;
+        
+        try {
+            await axios.post(uploadUrl, uploadStream, {
+                headers: {
+                    'Authorization': `Bearer ${process.env.SUPABASE_KEY}`,
+                    'Content-Type': mimeType
+                },
+                maxContentLength: Infinity,
+                maxBodyLength: Infinity,
+                timeout: 60000 // Segura o Stream por 60s
+            });
+        } catch (axiosError) {
+            if (!axiosError.message.includes('Duplicate')) {
+                 console.error("[MEDIA] Erro Axios Stream Upload:", axiosError.message);
             }
             return null;
         }

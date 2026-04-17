@@ -14,6 +14,7 @@ import axios from 'axios';
 import { createClient } from "@supabase/supabase-js";
 import { startSession, shutdownAllSessions } from './services/baileys/connection.js';
 import { startSentinel } from './services/scheduler/sentinel.js';
+import './services/scheduler/aiQueue.js'; // INICIALIZA O WORKER BULLMQ DA IA
 import { startAgendaWorker } from './workers/agendaWorker.js';
 import { startRetentionWorker } from './workers/retentionWorker.js';
 import { errorHandler } from './middleware/errorHandler.js'; // NOVO: Middleware
@@ -76,8 +77,11 @@ axios.interceptors.request.use(config => {
     return config;
 });
 
+// GESTÃO DE ROLES (Microservices)
+const role = process.env.SERVER_ROLE || 'monolith';
+
 // WORKERS DE CAMPANHA
-if (process.env.REDIS_URL) {
+if (process.env.REDIS_URL && (role === 'monolith' || role === 'worker')) {
     import('./workers/campaignWorker.js').catch(err => 
         Logger.error('worker', 'Falha ao carregar Campaign Worker', { error: err.message })
     );
@@ -110,7 +114,8 @@ const apiLimiter = rateLimit({
 });
 app.use('/api', apiLimiter);
 
-// Montagem das Rotas
+// Montagem das Rotas (Sempre montadas para compatibilidade, mas o tráfego 
+// deve ser roteado pelo Proxy apenas para máquinas da Role "web" ou "monolith")
 app.use('/api/v1/session', sessionRoutes);
 app.use('/api/v1/message', messageRoutes);
 app.use('/api/v1', automationRoutes); 
@@ -177,14 +182,19 @@ const restoreSessions = async () => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Wancora Backend v${pkg.version} rodando na porta ${PORT}`);
+    console.log(`🚀 Wancora Backend v${pkg.version} rodando na porta ${PORT} [ROLE: ${role.toUpperCase()}]`);
     
     // Pequeno delay para garantir que o health check do Render passe antes do boot pesado
     setTimeout(() => {
-        restoreSessions();     
-        startSentinel();       
-        startAgendaWorker();   
-        startRetentionWorker(); 
+        if (role === 'monolith' || role === 'baileys') {
+            restoreSessions();     
+        }
+        
+        if (role === 'monolith' || role === 'worker') {
+            startSentinel();       
+            startAgendaWorker();   
+            startRetentionWorker(); 
+        }
     }, 2000);
 });
 

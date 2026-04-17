@@ -2,7 +2,7 @@
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 // CHANGE: Importando do Controller validado para manter o padrão MVC
-import { startSession, deleteSession } from "../controllers/whatsappController.js";
+import { startSession, deleteSession, requestPairingCode } from "../controllers/whatsappController.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = express.Router();
@@ -28,6 +28,9 @@ router.post("/start", async (req, res) => {
   
   res.status(200).json({ message: "Processo de conexão iniciado." });
 });
+
+// Mobile Pairing Code Endpoint
+router.post("/pairing-code", requestPairingCode);
 
 // Logout / Desconectar
 router.post("/logout", async (req, res) => {

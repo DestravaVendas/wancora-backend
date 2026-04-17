@@ -11,7 +11,8 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-// 🛡️ EVENT BUS LOCAL: Comunicação instantânea na memória RAM
+// 🛡️ O antigo aiBus foi desativado em favor da Queue BullMQ (Redis)
+// Mantido caso outras partes locais necessitem, mas core agora usa aiQueue.js
 export const aiBus = new EventEmitter();
 
 const processingLock = new Set();
@@ -173,80 +174,9 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
     return { agent: null, reason: 'no_match_found' };
 };
 
-// 🛡️ [ESTABILIDADE] Fila de Conversação por Lead
-// Garante que a IA não responda múltiplas vezes ao mesmo tempo para o mesmo lead
-// e que as mensagens sejam processadas em ordem.
-const conversationLocks = new Map();
-const messageBuffers = new Map(); // 📥 Buffer para acumular mensagens (Debounce)
-
-// 🛡️ ADAPTADO PARA RECEBER O PAYLOAD DIRETO DO EVENT BUS
-const processAIResponse = async (messageData) => {
-    if (!messageData) return;
-
-    const { whatsapp_id: id, remote_jid, company_id, from_me, content } = messageData;
-
-    if (from_me) return;
-    if (remote_jid.includes('@g.us') || remote_jid.includes('@newsletter') || remote_jid === '0@s.whatsapp.net' || remote_jid === '12345678@broadcast') return;
-
-    // --- LÓGICA DE ACUMULAÇÃO (DEBOUNCE) ---
-    // Se o usuário mandar 3 mensagens seguidas, esperamos ele parar de digitar por 6s
-    // para processar tudo de uma vez só, evitando respostas múltiplas e robóticas.
-
-    if (!messageBuffers.has(remote_jid)) {
-        messageBuffers.set(remote_jid, {
-            messages: [messageData],
-            timer: null
-        });
-    } else {
-        const buffer = messageBuffers.get(remote_jid);
-        buffer.messages.push(messageData);
-        if (buffer.timer) clearTimeout(buffer.timer);
-    }
-
-    const buffer = messageBuffers.get(remote_jid);
-
-    buffer.timer = setTimeout(() => {
-        const finalMessages = [...buffer.messages];
-        messageBuffers.delete(remote_jid);
-
-        // Consolidamos o conteúdo de todas as mensagens acumuladas
-        const combinedContent = finalMessages
-            .map(m => m.content || m.transcription || "")
-            .filter(t => t.length > 0)
-            .join("\n");
-
-        if (!combinedContent) return;
-
-        // Usamos os metadados da ÚLTIMA mensagem, mas com o conteúdo combinado
-        const lastMsg = finalMessages[finalMessages.length - 1];
-        const consolidatedData = { ...lastMsg, content: combinedContent };
-
-        // [FILA POR CONVERSA]
-        if (!conversationLocks.has(remote_jid)) {
-            conversationLocks.set(remote_jid, Promise.resolve());
-        }
-
-        const currentLock = conversationLocks.get(remote_jid);
-
-        const nextTask = currentLock.then(async () => {
-            try {
-                await _internalProcessAI(consolidatedData);
-            } catch (e) {
-                console.error(`❌ [SENTINEL] Erro na fila de ${remote_jid}:`, e.message);
-            }
-        });
-
-        conversationLocks.set(remote_jid, nextTask);
-
-        nextTask.finally(() => {
-            if (conversationLocks.get(remote_jid) === nextTask) {
-                conversationLocks.delete(remote_jid);
-            }
-        });
-    }, 6000); // Aguarda 6 segundos de silêncio do usuário
-};
-
-const _internalProcessAI = async (messageData) => {
+// 🛡️ NOVO GATILHO DIRETO (Sem Memory-Limit)
+// Acionada exclusivamente pelo aiWorker (BullMQ) para processamento resiliente.
+export const internalProcessAI = async (messageData) => {
     const { whatsapp_id: id, content, remote_jid, company_id, from_me, message_type, transcription, created_at, session_id: msgSessionId } = messageData;
 
     console.log(`\n🔔 [RAIO-X SENTINEL] Processando:`, id);
@@ -718,17 +648,9 @@ const _internalProcessAI = async (messageData) => {
     }
 };
 
-// 🛡️ O FIM DOS TIMEOUTS. MOTOR LIGADO NA RAM.
+// 🛡️ O FIM DOS TIMEOUTS E MEMORY LOCKS
 export const startSentinel = () => {
-    console.log("🛡️ [SENTINEL] Preparando barramento de eventos locais (EventBus)...");
-
-    aiBus.removeAllListeners('new_message_arrived');
-
-    // Ouve a mensagem localmente.
-    aiBus.on('new_message_arrived', (messageData) => {
-        // Removemos o timeout fixo de 2.5s pois agora usamos a lógica de Debounce/Acumulação de 6s dentro de processAIResponse
-        processAIResponse(messageData).catch(e => console.error("Erro interno no Sentinel:", e));
-    });
-
-    console.log("🟢 [SENTINEL] IA Conectada na Memória RAM (Imune a quedas do Render e TIMED_OUT)!");
+    // startSentinel mantido por compatibilidade de boot do server.js
+    // Mas agora não escuta o EventBus (isso foi offloadado pra aiQueue.js via BullMQ/import em runtime)
+    console.log("🟢 [SENTINEL] Inteligência Artificial pronta e disponível (Modo Async Queue)!");
 };

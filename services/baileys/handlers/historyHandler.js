@@ -160,8 +160,8 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         if (contacts && contacts.length > 0) {
             for (const c of contacts) {
                 const jid = normalizeJid(c.id);
-                // JIDs de LID puro e status@broadcast são ignorados aqui
-                if (!jid || jid.includes('@lid') || jid === 'status@broadcast') continue;
+                // status@broadcast é ignorado aqui
+                if (!jid || jid === 'status@broadcast') continue;
 
                 const phoneName = c.name || c.notify || c.verifiedName;
                 const isFromBook = !!(c.name && c.name.trim().length > 0);

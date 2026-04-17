@@ -1,42 +1,15 @@
 import { getContentType, normalizeJid, unwrapMessage, getBody } from '../../../utils/wppParsers.js';
 import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 import { upsertMessage, ensureLeadExists, upsertContact } from '../../crm/sync.js';
-import { handleMediaUpload } from './mediaHandler.js';
 import { refreshContactInfo } from './contactHandler.js';
 import { dispatchWebhook } from '../../integrations/webhook.js';
-import { transcribeAudio } from '../../ai/transcriber.js';
 import { createClient } from '@supabase/supabase-js';
 import { Logger } from '../../../utils/logger.js';
-import axios from 'axios';
-import { aiBus } from '../../scheduler/sentinel.js';
+import { enqueueAIAfterDebounce } from '../../scheduler/aiQueue.js';
 import getRedisClient from '../../redisClient.js';
+import { identityResolver } from '../pipelines/identityPipeline.js';
+import { mediaPipeline } from '../pipelines/mediaPipeline.js';
 
-// =============================================================================
-// TIMEOUTS DE OPERAÇÕES PESADAS
-//
-// Operações de I/O de longa duração (download de mídia, transcrição por IA)
-// rodam dentro de um slot do messageQueue. Se não tiverem timeout, um único
-// serviço externo travado pode prender o worker indefinidamente.
-//
-// Estes timeouts são um "último recurso" — o timeout primário fica no messageQueue.
-// Aqui servem para retornar null graciosamente e não propagar exceção.
-// =============================================================================
-const MEDIA_DOWNLOAD_TIMEOUT_MS = 60_000;  // 60s para download + upload ao Supabase Storage
-const TRANSCRIPTION_TIMEOUT_MS  = 45_000;  // 45s para chamada à IA de transcrição
-
-/**
- * Wrapper de timeout para Promises — retorna fallback em vez de rejeitar.
- * @template T
- * @param {Promise<T>} promise
- * @param {number} ms
- * @param {T} fallback - Valor retornado ao expirar
- * @returns {Promise<T>}
- */
-const withTimeout = (promise, ms, fallback = null) =>
-    Promise.race([
-        promise,
-        new Promise(resolve => setTimeout(() => resolve(fallback), ms))
-    ]);
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
@@ -110,64 +83,10 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         if (!body && !isMedia && type !== 'stickerMessage') return;
 
         // =================================================================
-        // LID RESOLVER — 3 CAMADAS (Hard Rule #1 do MANUAL_BAILEYS.md)
-        //
-        // Camada 1: Hard  → identity_map    (dado confiável, já mapeado)
-        // Camada 2: Soft  → contacts.phone  (match por número puro)
-        // Camada 3: Learn → salva mapeamento assim que resolve com sucesso
-        //
-        // Se nenhuma camada resolver, jid permanece @lid.
-        // O guard em ensureLeadExists impedirá criação de lead fantasma.
+        // LID RESOLVER — PIPELINE CACHEADA
         // =================================================================
-        if (jid.includes('@lid')) {
-            let resolvedJid = null;
+        jid = await identityResolver.resolveIdentity(jid, companyId);
 
-            // ── Camada 1: Hard Resolution via identity_map ──────────────
-            const { data: mapping } = await supabase
-                .from('identity_map')
-                .select('phone_jid')
-                .eq('lid_jid', jid)
-                .eq('company_id', companyId)
-                .maybeSingle();
-
-            if (mapping?.phone_jid) {
-                resolvedJid = mapping.phone_jid;
-            }
-
-            // ── Camada 2: Soft Resolution via contacts.phone ─────────────
-            if (!resolvedJid) {
-                const purePhone = jid.split('@')[0].replace(/\D/g, '');
-                if (purePhone.length >= 8 && !jid.includes('@lid')) {
-                    const { data: contact } = await supabase
-                        .from('contacts')
-                        .select('jid')
-                        .eq('company_id', companyId)
-                        .eq('phone', purePhone)
-                        .like('jid', '%@s.whatsapp.net')
-                        .maybeSingle();
-
-                    if (contact?.jid) {
-                        resolvedJid = contact.jid;
-                    }
-                }
-            }
-
-            // ── Camada 3: Learning — persiste mapeamento para próximas vezes ─
-            if (resolvedJid) {
-                // Fire-and-forget: não bloqueia o processamento da mensagem
-                supabase.rpc('link_identities', {
-                    p_lid:        jid,
-                    p_phone:      resolvedJid,
-                    p_company_id: companyId
-                }).then(({ error }) => { if (error) console.error("❌ [HANDLER] RPC Error:", error.message); }).catch(() => {});
-
-                jid = resolvedJid;
-                console.log(`🔗 [LID] Resolvido: ${unwrapped.key.remoteJid} → ${jid}`);
-            } else {
-                // LID não resolvido — guard em sync.js impedirá lead fantasma
-                console.warn(`⚠️ [LID] Não resolvido: ${jid}. Aguardando sync de contatos.`);
-            }
-        }
 
 
         // --- CORREÇÃO CRÍTICA: GARANTIA DE CONTATO ---
@@ -207,56 +126,13 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // DOWNLOAD DE MÍDIA (com timeout blindado)
-        //
-        // handleMediaUpload envolve: download do CDN do WA + upload Supabase Storage.
-        // É a operação mais pesada do handler. O timeout de 60s libera o slot
-        // da fila caso o CDN do WhatsApp esteja lento, sem travar outros usuários.
+        // PIPELINE DE MÍDIA (Isolada, Sem Bloquear o Event Loop)
         // ─────────────────────────────────────────────────────────────────────
         let mediaUrl = null;
-        if (isMedia && (isRealtime || downloadMedia)) {
-            mediaUrl = await withTimeout(
-                handleMediaUpload(unwrapped, companyId),
-                MEDIA_DOWNLOAD_TIMEOUT_MS
-            );
-            if (!mediaUrl) {
-                Logger.error('baileys', `[HANDLER] Timeout no download de mídia (msg ${unwrapped.key?.id})`, {}, companyId);
-            }
+        if (isMedia) {
+            mediaUrl = await mediaPipeline.processMedia(msgId, unwrapped, type, companyId, isRealtime, downloadMedia);
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // TRANSCRIÇÃO DE ÁUDIO (fire-and-forget — NÃO bloqueia o slot da fila)
-        //
-        // A transcrição pode levar 10-30s (modelo de IA externo). Bloquear o
-        // worker esperando ela significa que NENHUMA outra mensagem da mesma
-        // sessão pode ser processada nesse slot durante esse tempo.
-        //
-        // Solução: lançamos a transcrição em background e salvamos o resultado
-        // no banco via update quando ela terminar — sem travar o fluxo principal.
-        // ─────────────────────────────────────────────────────────────────────
-        if (isRealtime && mediaUrl && type === 'audioMessage') {
-            const msgIdForTranscription = unwrapped.key.id;
-            const companyIdForTranscription = companyId;
-
-            // 🚀 FIRE-AND-FORGET: não bloqueia o slot da fila
-            withTimeout(
-                axios.get(mediaUrl, { responseType: 'arraybuffer' })
-                    .then(response => transcribeAudio(Buffer.from(response.data), 'audio/ogg', companyIdForTranscription)),
-                TRANSCRIPTION_TIMEOUT_MS
-            ).then(transcriptionText => {
-                if (transcriptionText) {
-                    // Update assíncrono — salva a transcrição quando a IA responder
-                    supabase.from('messages')
-                        .update({ transcription: transcriptionText })
-                        .eq('whatsapp_id', msgIdForTranscription)
-                        .eq('company_id', companyIdForTranscription)
-                        .then(() => {})
-                        .catch(err => Logger.error('baileys', `[HANDLER] Falha ao salvar transcrição ${msgIdForTranscription}`, { error: err.message }, companyIdForTranscription));
-                }
-            }).catch(err => {
-                Logger.error('baileys', `[HANDLER] Erro na transcrição de áudio ${msgIdForTranscription}`, { error: err.message }, companyIdForTranscription);
-            });
-        }
 
         const messageData = {
             company_id: companyId,
@@ -304,9 +180,9 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         await upsertMessage(messageData);
 
-        // 🛡️ O GATILHO NATIVO: Dispara o aviso para o Sentinel instantaneamente, na RAM!
+        // 🛡️ O GATILHO DA I.A: Entrega a mensagem processada direto para a fila de Debounce do BullMQ!
         if (isRealtime && !fromMe && !isGroup) {
-            aiBus.emit('new_message_arrived', messageData);
+            enqueueAIAfterDebounce(messageData);
         }
 
         if (isRealtime) {
