@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
-import getRedisClient from '../../../redisClient.js';
+import getRedisClient from '../../redisClient.js'; // ✅ services/redisClient.js (corrigido: era ../../../)
 import { Logger } from '../../../utils/logger.js';
+
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
