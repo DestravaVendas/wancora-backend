@@ -80,25 +80,44 @@ class IdentityResolver {
                 resolvedJid = mapping.phone_jid;
             }
 
-            // ── Camada 2: Soft Resolution via contacts.phone ─────────────
-            if (!resolvedJid) {
-                const purePhone = jid.split('@')[0].replace(/\D/g, '');
-                // Busca de segurança: o telefone do LID costuma vir na máscara inicial, mas sem os 2 primeiros dígitos de país.
-                // Mas as vezes ele não é formatável.
-                if (purePhone.length >= 8 && !jid.includes('@lid')) {
-                    const { data: contact } = await supabase
-                        .from('contacts')
-                        .select('jid')
-                        .eq('company_id', companyId)
-                        .eq('phone', purePhone)
-                        .like('jid', '%@s.whatsapp.net')
-                        .maybeSingle();
 
-                    if (contact?.jid) {
-                        resolvedJid = contact.jid;
+            // ── Camada 2: Busca o @lid diretamente na tabela contacts com phone ──
+            // O historyHandler pode ter salvo o contato com jid = @lid e phone preenchido.
+            // Essa é a rota mais rápida quando identity_map ainda não foi populado.
+            if (!resolvedJid) {
+                const { data: contactByLid } = await supabase
+                    .from('contacts')
+                    .select('phone')
+                    .eq('company_id', companyId)
+                    .eq('jid', jid)          // busca o @lid como JID direto
+                    .not('phone', 'is', null)
+                    .maybeSingle();
+
+                if (contactByLid?.phone) {
+                    const cleanPhone = contactByLid.phone.replace(/\D/g, '');
+                    if (cleanPhone.length >= 8) {
+                        resolvedJid = `${cleanPhone}@s.whatsapp.net`;
                     }
                 }
             }
+
+            // ── Camada 3: Busca em messages um canonical_jid já resolvido para este @lid ──
+            // Garante que conversas com histórico parcial não percam o vínculo.
+            if (!resolvedJid) {
+                const { data: existingMsg } = await supabase
+                    .from('messages')
+                    .select('canonical_jid')
+                    .eq('company_id', companyId)
+                    .eq('remote_jid', jid)
+                    .not('canonical_jid', 'is', null)
+                    .limit(1)
+                    .maybeSingle();
+
+                if (existingMsg?.canonical_jid) {
+                    resolvedJid = existingMsg.canonical_jid;
+                }
+            }
+
 
             // ── Persistência de Descoberta ─────────────
             if (resolvedJid) {

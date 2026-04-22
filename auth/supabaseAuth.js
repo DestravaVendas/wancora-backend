@@ -130,6 +130,63 @@ export const clearSessionCache = (sessionId) => {
     sessionCaches.delete(sessionId);
 };
 
+// =============================================================================
+// 🔐 CHAVES CRÍTICAS DO RATCHET SIGNAL (MessageCounterError Prevention)
+// =============================================================================
+// Estas chaves são usadas no handshake criptográfico do Signal Protocol.
+// Se perdidas entre o set() e o flush de 500ms (ex: deploy do Render),
+// a próxima conexão lança: 'Key used already or never filled' (MessageCounterError).
+// A solução: persistência imediata e atômica para esses tipos específicos.
+const CRITICAL_KEY_TYPES = new Set([
+    'session',              // Estado do ratchet por contato — a mais crítica
+    'pre-key',              // Chave pública para novos handshakes
+    'sender-key-record',    // Grupos: derivado da sender key de cada membro
+    'app-state-sync-key',   // Sincronização de estado do app
+]);
+
+/**
+ * Grava chaves críticas do Ratchet diretamente no banco de forma atômica.
+ * Chamado fire-and-forget no set() — não bloqueia o Baileys.
+ * Em caso de falha, o flushToDB convencional de 500ms age como backup.
+ *
+ * @param {string} sessionId
+ * @param {Array<{type:string, id:string, value:*}>} criticalWrites
+ */
+const flushCriticalToDB = async (sessionId, criticalWrites) => {
+    try {
+        const rowsToUpsert = criticalWrites
+            .map(({ type, id, value }) => {
+                const stringified = JSON.stringify(value, BufferJSON.replacer);
+                const payload     = JSON.parse(stringified);
+                if (!payload || Object.keys(payload).length === 0) return null;
+                return {
+                    session_id: sessionId,
+                    data_type:  type,
+                    key_id:     id,
+                    payload:    payload,
+                    updated_at: new Date()
+                };
+            })
+            .filter(Boolean);
+
+        if (rowsToUpsert.length === 0) return;
+
+        const { error } = await supabase
+            .from('baileys_auth_state')
+            .upsert(rowsToUpsert, {
+                onConflict:        'session_id,data_type,key_id',
+                ignoreDuplicates:  false
+            });
+
+        if (error) {
+            // Não lança — o flushToDB de 500ms age como backup
+            console.error(`❌ [AUTH CRITICAL] Flush crítico falhou para ${sessionId}:`, error.message);
+        }
+    } catch (e) {
+        console.error(`❌ [AUTH CRITICAL] Exceção no flush crítico (${sessionId}):`, e.message);
+    }
+};
+
 export const useSupabaseAuthState = async (sessionId) => {
     const cache = getSessionCache(sessionId);
 
@@ -195,14 +252,21 @@ export const useSupabaseAuthState = async (sessionId) => {
                 },
                 set: async (data) => {
                     // 1. Grava TUDO na memória RAM instantaneamente (O Baileys não trava)
+                    const criticalBatch = [];
+
                     for (const type in data) {
                         for (const id in data[type]) {
-                            const value = data[type][id];
+                            const value    = data[type][id];
                             const cacheKey = `${type}::${id}`;
                             
                             if (value) {
                                 cache.keys.set(cacheKey, value);
                                 cache.writes.set(cacheKey, value);
+
+                                // 🔐 Detecta chaves críticas do Ratchet Signal
+                                if (CRITICAL_KEY_TYPES.has(type)) {
+                                    criticalBatch.push({ type, id, value });
+                                }
                             } else {
                                 cache.keys.delete(cacheKey);
                                 cache.writes.set(cacheKey, null); // Marca para deleção
@@ -210,7 +274,14 @@ export const useSupabaseAuthState = async (sessionId) => {
                         }
                     }
 
-                    // 2. Aciona o gravador de fundo (só salva na nuvem a cada 500ms)
+                    // 2. 🔐 [ANTI-MessageCounterError] Persiste chaves críticas IMEDIATAMENTE
+                    // Fire-and-forget: não bloqueia o Event Loop do Baileys.
+                    // Se falhar, o flushToDB de 500ms atua como backup.
+                    if (criticalBatch.length > 0) {
+                        flushCriticalToDB(sessionId, criticalBatch).catch(() => {});
+                    }
+
+                    // 3. Aciona o gravador de fundo (só salva na nuvem a cada 500ms)
                     if (!cache.isFlushing) {
                         setTimeout(() => flushToDB(sessionId), 500);
                     }

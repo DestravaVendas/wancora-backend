@@ -263,6 +263,35 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
             cutoffDate.setMonth(cutoffDate.getMonth() - HISTORY_MONTHS_LIMIT);
             const cutoffTimestamp = Math.floor(cutoffDate.getTime() / 1000);
 
+            // 🛡️ [LID RESOLVER LOCAL] Mapa de resolução construído a partir dos dados
+            // já em memória das Fases 1 e 2 — zero custo de rede adicional.
+            // Garante que mensagens históricas sejam agrupadas sob o phone JID canônico
+            // desde o início, evitando split de conversa com mensagens em tempo real.
+            const localLidMap = new Map();
+            if (lidPnMappings && lidPnMappings.length > 0) {
+                for (const m of lidPnMappings) {
+                    if (m.lid && m.pn) {
+                        const normLid = normalizeJid(m.lid);
+                        const normPn  = normalizeJid(m.pn);
+                        if (normLid && normPn) localLidMap.set(normLid, normPn);
+                    }
+                }
+            }
+            // Complementa com contacts que trazem .lid embutido (duplo-sentido)
+            if (contacts && contacts.length > 0) {
+                for (const c of contacts) {
+                    if (!c.id || !c.lid) continue;
+                    const idNorm  = normalizeJid(c.id);
+                    const lidNorm = normalizeJid(c.lid);
+                    if (!idNorm || !lidNorm) continue;
+                    if (idNorm.includes('@lid'))  localLidMap.set(idNorm,  lidNorm);
+                    else if (lidNorm.includes('@lid')) localLidMap.set(lidNorm, idNorm);
+                }
+            }
+            if (localLidMap.size > 0) {
+                console.log(`🗺️  [FASE 3] LID Map local pronto: ${localLidMap.size} mapeamentos em memória.`);
+            }
+
             const chats = {}; 
             
             messages.forEach(msg => {
@@ -274,13 +303,19 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 const msgTs = Number(clean.messageTimestamp);
                 if (msgTs < cutoffTimestamp) return;
 
-                const jid = normalizeJid(clean.key.remoteJid);
+                let jid = normalizeJid(clean.key.remoteJid);
                 if (!jid || jid === 'status@broadcast') return;
+
+                // 🛡️ [LID RESOLVER] Resolve @lid → phone JID usando o mapa local (sem query)
+                if (jid.includes('@lid') && localLidMap.has(jid)) {
+                    jid = localLidMap.get(jid);
+                }
 
                 if (!chats[jid]) chats[jid] = [];
                 
                 // Injeta nome resolvido — contactsMap já populado pela Fase 2, acesso seguro
-                const knownContact = contactsMap.get(jid);
+                // Testa tanto o jid resolvido quanto o original (fallback)
+                const knownContact = contactsMap.get(jid) || contactsMap.get(normalizeJid(clean.key.remoteJid));
                 clean._forcedName = knownContact?.isFromBook 
                     ? knownContact.name 
                     : (knownContact?.name || clean.pushName);

@@ -17,6 +17,8 @@ import { startSentinel } from './services/scheduler/sentinel.js';
 import './services/scheduler/aiQueue.js'; // INICIALIZA O WORKER BULLMQ DA IA
 import { startAgendaWorker } from './workers/agendaWorker.js';
 import { startRetentionWorker } from './workers/retentionWorker.js';
+import { startRecoveryWatchdog } from './workers/recoveryWorker.js';
+import { startSupervisorWorker } from './workers/supervisorWorker.js';
 import { errorHandler } from './middleware/errorHandler.js'; // NOVO: Middleware
 import rateLimit from 'express-rate-limit'; // [SECURITY PATCH] Rate Limiter
 
@@ -194,6 +196,8 @@ app.listen(PORT, '0.0.0.0', () => {
             startSentinel();       
             startAgendaWorker();   
             startRetentionWorker(); 
+            startRecoveryWatchdog(); // 🛡️ Anti-Vácuo: detecta e recupera mensagens perdidas
+            startSupervisorWorker(); // 🤖 Relatórios de status via WhatsApp para o admin
         }
     }, 2000);
 });

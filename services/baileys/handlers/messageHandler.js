@@ -153,9 +153,18 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         
         if (!isGroup && !fromMe) {
              const purePhone = jid.split('@')[0].replace(/\D/g, '');
-             const { data: lead } = await supabase.from('leads').select('id').eq('phone', purePhone).eq('company_id', companyId).maybeSingle();
+             let { data: lead } = await supabase.from('leads').select('id').eq('phone', purePhone).eq('company_id', companyId).maybeSingle();
+             
+             // 🛡️ Fallback DDI: tenta sem código de país (55 Brasil) se não achou com o número completo
+             if (!lead && purePhone.startsWith('55') && purePhone.length > 10) {
+                 const phoneWithoutDDI = purePhone.substring(2);
+                 const { data: fallbackLead } = await supabase.from('leads').select('id').eq('phone', phoneWithoutDDI).eq('company_id', companyId).maybeSingle();
+                 lead = fallbackLead;
+             }
+             
              if (lead) messageData.lead_id = lead.id;
         }
+
 
         // Tratamento de Tipos Especiais
         if (type === 'pollCreationMessage' || type === 'pollCreationMessageV3') {

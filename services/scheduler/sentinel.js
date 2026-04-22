@@ -263,6 +263,12 @@ export const internalProcessAI = async (messageData) => {
     let userMessage = content;
     if ((message_type === 'audio' || message_type === 'ptt') && transcription) {
         userMessage = `[Áudio Transcrito]: ${transcription}`;
+    } else if ((message_type === 'audio' || message_type === 'ptt') && !transcription) {
+        // 🛡️ [ANTI-VÁCUO DE ÁUDIO] Transcrição ainda não chegou (race condition com pipeline async)
+        // ou o Vertex/Gemini estava com rate limit. A IA recebe um placeholder e responde
+        // com empatia em vez de deixar o lead sem resposta.
+        userMessage = `[O cliente enviou um áudio. A transcrição não está disponível no momento. Responda empaticamente pedindo que reenvie ou explique por texto.]`;
+        console.log(`   🎙️ [SENTINEL] Áudio sem transcrição (msg ${id}). Usando placeholder empático.`);
     } else if (message_type === 'image') {
         userMessage = `[Imagem Enviada pelo Usuário]`;
     }
@@ -441,9 +447,18 @@ export const internalProcessAI = async (messageData) => {
 
         // 🛡️ Guarda de segurança: Se generateWithRetry retornou null (ex: 429 esgotado), aborta silenciosamente.
         if (!result) {
-            console.warn(`   ⚠️ [SENTINEL] Resultado nulo (provável Rate Limit esgotado). Abortando sem quebrar a fila.`);
+            console.warn(`   ⚠️ [SENTINEL] Resultado nulo (Rate Limit esgotado). Marcando ai_error para rastreabilidade.`);
+            // 🛡️ [RASTREABILIDADE] Persiste o erro no banco para o Recovery Watchdog (Missão D) detectar
+            // e re-enfileirar a mensagem após o rate limit se recuperar.
+            supabase.from('messages')
+                .update({ ai_processed: false, ai_error: 'RATE_LIMIT_429' })
+                .eq('whatsapp_id', id)
+                .eq('company_id', company_id)
+                .then()
+                .catch(() => {});
             return;
         }
+
 
         let response = result;
         let functionCalls = response.functionCalls;
@@ -515,7 +530,7 @@ export const internalProcessAI = async (messageData) => {
             functionCalls = response.functionCalls;
         }
 
-        const finalReply = response.text;
+        let finalReply = response.text;
 
         // =========================================================================
         // 🧠 FLUXO DE COMPORTAMENTO HUMANO AVANÇADO (VISUALIZAR, PENSAR, DIGITAR E QUEBRAR)
@@ -632,10 +647,21 @@ export const internalProcessAI = async (messageData) => {
                         console.error("   ❌ [ERRO AO ENVIAR PARTE]:", sendError.message);
                     }
                 }
+
+                // ✅ [RASTREABILIDADE] Marca como processado com sucesso para o Recovery Watchdog
+                // Fire-and-forget: não bloqueia o Event Loop.
+                supabase.from('messages')
+                    .update({ ai_processed: true, ai_error: null })
+                    .eq('whatsapp_id', id)
+                    .eq('company_id', company_id)
+                    .then()
+                    .catch(() => {});
+
             } else {
                 console.log("   ❌ ERRO: Sessão não encontrada.");
             }
         }
+
 
     } catch (error) {
         console.error("\n   ❌ [ERRO CRÍTICO NA EXECUÇÃO DA IA]:", error);

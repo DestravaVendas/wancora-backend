@@ -40,8 +40,9 @@ class MediaPipeline {
                 }
             }
 
-            // Fire-and-forget: Transcrição em Audio (não bloqueia o pipeline)
-            if (isRealtime && mediaUrl && type === 'audioMessage') {
+            // Fire-and-forget: Transcrição de Áudio (não bloqueia o pipeline)
+            // 🛡️ Cobre AMBOS os tipos: 'audioMessage' (gravado) e 'pttMessage' (Push-To-Talk)
+            if (isRealtime && mediaUrl && (type === 'audioMessage' || type === 'pttMessage')) {
                 this._transcribeAndSave(mediaUrl, msgId, companyId);
             }
 

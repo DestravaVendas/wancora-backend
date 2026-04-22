@@ -53,13 +53,14 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
                     const cleanPhone = contact.id.replace(/:[0-9]+@/, '@'); // Remove porta de dispositivo
                     const cleanLid = contact.lid.replace(/:[0-9]+@/, '@');
 
-                    await supabase.rpc('link_identities', { 
-                        p_lid: cleanLid, 
-                        p_phone: cleanPhone, 
-                        p_company_id: companyId 
-                    }).catch(err => {
-                        console.error("❌ [LISTENER] RPC Error:", err.message);
-                    });
+                    const { error: rpcError } = await supabase.rpc('link_identities', { 
+                            p_lid: cleanLid, 
+                            p_phone: cleanPhone, 
+                            p_company_id: companyId 
+                        });
+                        if (rpcError) {
+                            console.error("❌ [LISTENER] RPC Error:", rpcError.message);
+                        }
                 }
             }
         } catch (e) {
