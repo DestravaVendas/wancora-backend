@@ -387,6 +387,7 @@ export const startSession = async (sessionId, companyId) => {
                 const updatePayload = {
                     status: 'connected',
                     qrcode_url: null,
+                    name: sock.user?.name || sock.user?.verifiedName || null,
                     profile_pic_url: sock.user?.imgUrl || null,
                     is_business_account: isBiz
                 };

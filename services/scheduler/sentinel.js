@@ -5,6 +5,7 @@ import { getSessionId } from "../../controllers/whatsappController.js";
 import { scheduleMeeting, handoffAndReport, checkAvailability, searchFiles, sendFile } from "../ai/agentTools.js";
 import { Logger } from "../../utils/logger.js";
 import { buildSystemPrompt } from "../../utils/promptBuilder.js";
+import { ensureLeadExists } from "../crm/sync.js";
 import { EventEmitter } from "events";
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -190,9 +191,16 @@ export const internalProcessAI = async (messageData) => {
     }
 
     const msgTime = new Date(created_at).getTime();
-    if ((Date.now() - msgTime) / 1000 > 180) {
-        console.log(`   ❌ Bloqueio: Mensagem muito antiga.`);
-        return;
+    const msgAgeSeconds = (Date.now() - msgTime) / 1000;
+    // 🛡️ [FIX BUG 1] O guard de 180s bloqueava TODOS os jobs do Recovery Watchdog.
+    // Jobs marcados com is_recovery=true já aguardaram 3-15min — bypass obrigatório.
+    // Limite ampliado para 1h para conversas reais que podem demorar (ex: histórico recente).
+    const maxAgeSeconds = messageData.is_recovery ? (60 * 60) : 180; // 1h para recovery, 3min para realtime
+    if (msgAgeSeconds > maxAgeSeconds) {
+        if (!messageData.is_recovery) {
+            console.log(`   ❌ Bloqueio: Mensagem muito antiga (${Math.round(msgAgeSeconds)}s > ${maxAgeSeconds}s).`);
+            return;
+        }
     }
 
     const lockKey = `${remote_jid}-${id}`;
@@ -226,31 +234,22 @@ export const internalProcessAI = async (messageData) => {
     }
 
     if (!lead) {
-        console.log(`   🆕 [SENTINEL] Lead não encontrado para ${phone}. Criando automaticamente...`);
-
-        // Busca o estágio inicial do funil
-        const { data: stage } = await supabase.from('pipeline_stages')
-            .select('id')
-            .eq('company_id', company_id)
-            .order('position', { ascending: true })
-            .limit(1)
-            .maybeSingle();
-
-        const { data: newLead, error: createError } = await supabase.from('leads').insert({
-            company_id: company_id,
-            phone: phone,
-            name: `Novo Lead (${phone})`,
-            status: 'new',
-            bot_status: 'active',
-            pipeline_stage_id: stage?.id,
-            position: Date.now()
-        }).select('id, name, bot_status, owner_id, pipeline_stage_id').single();
-
-        if (createError) {
-            console.error(`   ❌ [SENTINEL] Erro ao criar lead automático:`, createError.message);
-            return;
+        console.log(`   🆕 [SENTINEL] Lead não encontrado para ${phone}. Sincronizando de forma segura...`);
+        // Chama a função central do Wancora que possui a trava Anti-Race Condition
+        const leadId = await ensureLeadExists(`${phone}@s.whatsapp.net`, company_id, content || 'Novo Contato', remote_jid);
+        
+        if (leadId) {
+            const { data: syncedLead } = await supabase.from('leads')
+                .select('id, name, bot_status, owner_id, pipeline_stage_id')
+                .eq('id', leadId).eq('company_id', company_id).single();
+            lead = syncedLead;
         }
-        lead = newLead;
+
+        if (!lead) {
+            console.log(`   ❌ Bloqueio: Lead criado e lockado por outra thread (Sync). Aguardando liberação...`);
+            // Dispara um erro intencional para a fila reprocessar depois via BullMQ
+            throw new Error('Sync Lock Ativo: Reprocessar na próxima tentativa.');
+        }
     }
 
     if (lead.bot_status === 'off') {
@@ -305,11 +304,24 @@ export const internalProcessAI = async (messageData) => {
     Logger.info('sentinel', `Agente: ${agent.name}`, { lead: phone, trigger: reason }, company_id);
 
     try {
-        let activeApiKey = companyConfig?.apiKey || process.env.API_KEY || process.env.GEMINI_API_KEY;
+        // 🛡️ [KEY RESOLVER] Prioridade: DB (se preenchida) > API_KEY env > GEMINI_API_KEY env
+        // String vazia no banco é ignorada (tratada como não configurada)
+        const dbApiKey = (companyConfig?.apiKey || '').trim();
+        const envKey1  = (process.env.API_KEY || '').trim();
+        const envKey2  = (process.env.GEMINI_API_KEY || '').trim();
+
+        let activeApiKey = dbApiKey || envKey1 || envKey2;
+        
+        // 🔍 [DIAGNÓSTICO] Log de qual chave está sendo usada (não expõe a chave completa)
+        const keySource = dbApiKey ? 'DB (ai_config)' : envKey1 ? 'ENV: API_KEY' : envKey2 ? 'ENV: GEMINI_API_KEY' : 'NENHUMA';
+        const keyPreview = activeApiKey ? `${activeApiKey.slice(0, 6)}...${activeApiKey.slice(-4)}` : 'N/A';
+        console.log(`   🔑 [KEY] Fonte: ${keySource} | Preview: ${keyPreview}`);
+
         if (!activeApiKey) {
             console.warn(`   ❌ Bloqueio: Nenhuma API Key configurada para empresa ${company_id}`);
             return;
         }
+
 
         // 🛡️ MODEL SELECTOR: Usa modelo configurado pela empresa, com fallback para o
         // modelo estável de produção. Modelos -preview são PROIBIDOS em produção.
@@ -432,10 +444,17 @@ export const internalProcessAI = async (messageData) => {
                 }
 
                 if (is429) {
-                    // Esgotou todas as tentativas de 429: retorna null silenciosamente.
-                    // A fila continua viva para o próximo lead/mensagem.
-                    console.error(`   ❌ [GEMINI 429] Rate Limit persistente após 3 tentativas. Abortando resposta sem derrubar a fila.`);
-                    Logger.error?.('sentinel', `Rate Limit 429 Fatal`, { aviso: 'Resposta abortada silenciosamente.' }, company_id);
+                    // Esgotou todas as tentativas de 429: tenta fallback para gemini-1.5-flash (quota separada).
+                    // Se também falhar, aborta silenciosamente para não derrubar a fila.
+                    if (activeModel !== 'gemini-1.5-flash') {
+                        console.warn(`   🔄 [GEMINI 429] Tentando fallback para gemini-1.5-flash (quota separada)...`);
+                        activeModel = 'gemini-1.5-flash';
+                        await delay(5000); // Pausa curta antes de tentar o modelo alternativo
+                        return generateWithRetry(currentContents, 0); // Reinicia contagem de retries com novo modelo
+                    }
+                    // Se já está em gemini-1.5-flash e ainda está em 429, desiste:
+                    console.error(`   ❌ [GEMINI 429] Rate Limit persistente em ambos os modelos. Abortando sem derrubar a fila.`);
+                    Logger.error?.('sentinel', `Rate Limit 429 Fatal (ambos modelos)`, { aviso: 'Resposta abortada silenciosamente.' }, company_id);
                     return null;
                 }
 

@@ -43,44 +43,66 @@ const requeueMessage = async (msg) => {
     const jobId = `recovery:${msg.company_id}:${msg.whatsapp_id}`;
 
     try {
+        // 🛡️ [FIX BUG 2] Resolve @lid para phone JID antes de enfileirar.
+        // Sem isso, o Sentinel recebe '215001885323481@lid' e falha na busca do lead.
+        let resolvedJid = msg.remote_jid;
+        if (resolvedJid.includes('@lid')) {
+            const { data: mapping } = await supabase
+                .from('identity_map')
+                .select('phone_jid')
+                .eq('lid_jid', resolvedJid)
+                .eq('company_id', msg.company_id)
+                .maybeSingle();
+
+            if (mapping?.phone_jid) {
+                resolvedJid = mapping.phone_jid;
+                console.log(`🔗 [WATCHDOG] LID resolvido: ${msg.remote_jid} → ${resolvedJid}`);
+            } else {
+                // Tenta via contacts.phone
+                const { data: contact } = await supabase
+                    .from('contacts')
+                    .select('phone')
+                    .eq('jid', resolvedJid)
+                    .eq('company_id', msg.company_id)
+                    .not('phone', 'is', null)
+                    .maybeSingle();
+                if (contact?.phone) {
+                    resolvedJid = `${contact.phone.replace(/\D/g, '')}@s.whatsapp.net`;
+                }
+            }
+        }
+
+        const payload = {
+            whatsapp_id:  msg.whatsapp_id,
+            content:      msg.content,
+            remote_jid:   resolvedJid, // JID resolvido (nunca @lid)
+            company_id:   msg.company_id,
+            from_me:      false,
+            message_type: msg.message_type,
+            transcription: msg.transcription || null,
+            created_at:   msg.created_at,
+            session_id:   msg.session_id,
+            is_recovery:  true  // 🛡️ [FIX BUG 1] Bypassa o guard de 180s no sentinel
+        };
+
         if (aiQueue) {
-            // Adiciona diretamente na fila BullMQ (sem debounce — esta já aguardou bastante)
-            await aiQueue.add('process_ai', {
-                whatsapp_id:  msg.whatsapp_id,
-                content:      msg.content,
-                remote_jid:   msg.remote_jid,
-                company_id:   msg.company_id,
-                from_me:      false,
-                message_type: msg.message_type,
-                transcription: msg.transcription || null,
-                created_at:   msg.created_at,
-                session_id:   msg.session_id
-            }, {
+            await aiQueue.add('process_ai', payload, {
                 jobId,            // idempotente: BullMQ ignora se job com mesmo ID já existe
                 attempts: 1,      // 1 tentativa — o sentinel tem sua própria lógica de retry
                 removeOnComplete: true,
                 removeOnFail: false
             });
-            console.log(`🔄 [WATCHDOG] Re-enfileirado: ${msg.whatsapp_id} (${msg.remote_jid})`);
+            console.log(`🔄 [WATCHDOG] Re-enfileirado: ${msg.whatsapp_id} (${resolvedJid})`);
         } else {
             // Fallback: sem Redis, executa direto (raro em produção)
             console.warn(`⚠️ [WATCHDOG] Sem Redis. Executando recovery de ${msg.whatsapp_id} na RAM.`);
-            await internalProcessAI({
-                whatsapp_id:  msg.whatsapp_id,
-                content:      msg.content,
-                remote_jid:   msg.remote_jid,
-                company_id:   msg.company_id,
-                from_me:      false,
-                message_type: msg.message_type,
-                transcription: msg.transcription || null,
-                created_at:   msg.created_at,
-                session_id:   msg.session_id
-            });
+            await internalProcessAI(payload);
         }
     } catch (e) {
         Logger.error('watchdog', `Falha ao re-enfileirar msg ${msg.whatsapp_id}`, { error: e.message }, msg.company_id);
     }
 };
+
 
 /**
  * Marca o lead com a tag FALHA_ATENDIMENTO e registra em system_logs.
@@ -119,7 +141,8 @@ const markAsFailure = async (msg) => {
         const updatedTags = [...currentTags, FAILURE_TAG];
         await supabase.from('leads')
             .update({ tags: updatedTags })
-            .eq('id', lead.id);
+            .eq('id', lead.id)
+            .eq('company_id', msg.company_id);
 
         // Marca a mensagem como erro definitivo para não ser processada de novo
         await supabase.from('messages')
@@ -155,9 +178,10 @@ const runRecoveryCheck = async () => {
         // --- QUERY 1: Mensagens para RE-ENFILEIRAR (3 a 15 min atrás, com erro explícito OU processadas = false) ---
         const { data: pendingMessages, error: pendingError } = await supabase
             .from('messages')
-            .select('whatsapp_id, company_id, remote_jid, content, message_type, transcription, session_id, created_at, ai_error')
+            .select('whatsapp_id, company_id, remote_jid, content, message_type, transcription, session_id, created_at, ai_error, leads!inner(bot_status)')
             .eq('from_me', false)
             .eq('ai_processed', false)
+            .neq('leads.bot_status', 'off')             // 🛡️ [ANTI-LOOP] Ignora leads com bot desligado
             .not('remote_jid', 'like', '%@g.us')        // Ignora grupos
             .not('remote_jid', 'like', '%@newsletter')  // Ignora newsletters
             .lte('created_at', threeMinAgo)              // Mais de 3 min (fora do debounce)
@@ -176,9 +200,10 @@ const runRecoveryCheck = async () => {
         // --- QUERY 2: Mensagens para FALHA_ATENDIMENTO (> 15 min, ainda com ai_processed = false) ---
         const { data: failedMessages, error: failedError } = await supabase
             .from('messages')
-            .select('whatsapp_id, company_id, remote_jid, content, message_type, session_id, created_at')
+            .select('whatsapp_id, company_id, remote_jid, content, message_type, session_id, created_at, leads!inner(bot_status)')
             .eq('from_me', false)
             .eq('ai_processed', false)
+            .neq('leads.bot_status', 'off')             // 🛡️ [ANTI-LOOP] Ignora leads com bot desligado
             .not('remote_jid', 'like', '%@g.us')
             .not('remote_jid', 'like', '%@newsletter')
             .lt('created_at', fifteenMinAgo)   // Mais de 15 min (passou da janela de recovery)

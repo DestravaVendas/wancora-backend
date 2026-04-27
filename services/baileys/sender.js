@@ -325,7 +325,7 @@ export const sendMessage = async ({
                             if (companyId) {
                                 transcribeAudio(buffer, 'audio/ogg', companyId).then(text => {
                                     if (text && sentMsg.key.id) {
-                                        supabase.from('messages').update({ transcription: text }).eq('whatsapp_id', sentMsg.key.id).then();
+                                        supabase.from('messages').update({ transcription: text }).eq('whatsapp_id', sentMsg.key.id).eq('company_id', companyId).then();
                                     }
                                 });
                             }

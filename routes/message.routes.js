@@ -25,6 +25,19 @@ router.post("/send", async (req, res) => {
       return res.status(400).json({ error: "SessionId e Destinatário são obrigatórios" });
   }
 
+  // 🛡️ [SECURITY] Prevenção contra Exploit Multi-tenant
+  // Garante que o sessionId disparando a mensagem realmente pertence ao companyId autorizado
+  const { data: validInstance } = await supabase.from('instances')
+      .select('id')
+      .eq('session_id', sessionId)
+      .eq('company_id', companyId)
+      .maybeSingle();
+
+  if (!validInstance) {
+      console.warn(`🚨 [SECURITY] Tentativa de hijack de sessão detectada! Session: ${sessionId} | Company: ${companyId}`);
+      return res.status(403).json({ error: "Sessão não autorizada ou inexistente para esta empresa." });
+  }
+
   try {
     const cleanTo = normalizeJid(to);
     

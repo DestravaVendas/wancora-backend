@@ -137,7 +137,7 @@ export const scheduleMeeting = async (companyId, leadId, title, dateISO, descrip
 export const handoffAndReport = async (companyId, leadId, remoteJid, summary, reason, reportingPhones) => {
     try {
         // 1. Pausa o Bot
-        await supabase.from('leads').update({ bot_status: 'paused' }).eq('id', leadId);
+        await supabase.from('leads').update({ bot_status: 'paused' }).eq('id', leadId).eq('company_id', companyId);
 
         // 2. Notifica o Cliente
         const sessionId = await getSessionId(companyId);

@@ -268,7 +268,8 @@ export const upsertMessage = async (msgData) => {
                 company_id: msgData.company_id,
                 phone: phone,
                 last_message_at: msgData.created_at || new Date()
-            }, { onConflict: 'jid, company_id' });
+            }, { onConflict: 'company_id, jid' }); // ✅ Ordem correta do índice contacts_company_jid_idx
+
         });
     } catch (e) {
         console.error(`❌ [SYNC] Erro upsertMessage:`, e.message);

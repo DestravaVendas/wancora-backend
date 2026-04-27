@@ -53,7 +53,16 @@ router.post("/logout", async (req, res) => {
 // Status
 router.get("/status/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
-  const { data, error } = await supabase.from("instances").select("*").eq("session_id", sessionId).maybeSingle();
+  const companyId = req.headers['x-company-id'];
+  
+  if (!companyId) return res.status(400).json({ error: "x-company-id header é obrigatório" });
+
+  const { data, error } = await supabase.from("instances")
+      .select("*")
+      .eq("session_id", sessionId)
+      .eq("company_id", companyId)
+      .maybeSingle();
+      
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ status: "not_found" });
   res.json(data);
