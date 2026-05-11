@@ -203,7 +203,7 @@ export const internalProcessAI = async (messageData) => {
         }
     }
 
-    const lockKey = `${remote_jid}-${id}`;
+    const lockKey = `${company_id}:${remote_jid}:${id}`;
     if (processingLock.has(lockKey)) {
         console.log("   ❌ Bloqueio: Em processamento.");
         return;

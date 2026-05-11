@@ -334,7 +334,7 @@ export const startSession = async (sessionId, companyId) => {
                     // 🔴 [ANTI-BAN] Marca como banida ANTES de deletar para bloquear o Watchdog (Hard Rule §12.3)
                     bannedSessions.add(sessionId);
                     retries.delete(sessionId); // Zera retries para não tentar reconectar
-                    await deleteSession(sessionId, companyId);
+                    await deleteSessionData(sessionId, companyId);
                     return; 
                 }
 

@@ -2,6 +2,7 @@ import { updateSyncStatus } from '../crm/sync.js';
 import { handlePresenceUpdate, handleContactsUpsert } from './handlers/contactHandler.js';
 import { handleReceiptUpdate, handleMessageUpdate, handleReaction } from './handlers/messageHandler.js';
 import { handleHistorySync, resetHistoryState } from './handlers/historyHandler.js'; // Import atualizado
+import { handleGroupsUpsert } from './handlers/groupHandler.js'; // [NOVO] Handler de Comunidades
 import { enqueueMessage, drainSessionQueue } from './messageQueue.js';
 import { createClient } from '@supabase/supabase-js';
 
@@ -79,7 +80,16 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     // 3. MENSAGENS (FILA)
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         const isRealtime = type === 'notify';
+        const nowSecs = Math.floor(Date.now() / 1000);
+
         for (const msg of messages) {
+            // [PROTEÇÃO ETAPA 3] Se for 'append' (sincronização do celular) e for mais antiga que 7 dias, descarta.
+            // Isso previne que o Baileys injete lixo histórico na fila de tempo real.
+            const msgTs = Number(msg.messageTimestamp);
+            if (!isRealtime && msgTs && (nowSecs - msgTs > 604800)) {
+                continue;
+            }
+            
             enqueueMessage(msg, sock, companyId, sessionId, isRealtime);
         }
     });
@@ -88,7 +98,12 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     sock.ev.on('message-receipt.update', (events) => handleReceiptUpdate(events, companyId));
     sock.ev.on('messages.reaction', (reactions) => handleReaction(reactions, sock, companyId));
 
-    // 4. HISTÓRICO (SYNC) — Barreira de Sincronização de 3 Fases
+    // 4. GRUPOS E COMUNIDADES [NOVO]
+    // Responsável por captar hierarquias quando o motor puxa dados da Meta
+    sock.ev.on('groups.upsert', (groups) => handleGroupsUpsert(groups, companyId));
+    sock.ev.on('groups.update', (groups) => handleGroupsUpsert(groups, companyId));
+
+    // 5. HISTÓRICO (SYNC) — Barreira de Sincronização de 3 Fases
     //
     // CRÍTICO: O handler é enfileirado em vez de chamado diretamente.
     // O Baileys dispara o evento 'messaging-history.set' múltiplas vezes

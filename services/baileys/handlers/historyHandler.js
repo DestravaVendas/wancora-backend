@@ -342,30 +342,20 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 chats[jid].sort((a, b) => (Number(a.messageTimestamp) || 0) - (Number(b.messageTimestamp) || 0)); 
                 const topMessages = chats[jid].slice(-HISTORY_MSG_LIMIT);
                 
-                const latestMsg = topMessages[topMessages.length - 1];
+                const latestMsg = chats[jid][chats[jid].length - 1];
                 if (latestMsg && latestMsg.messageTimestamp) {
                     const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
-                    // Fire-and-forget: atualiza last_message_at sem bloquear o loop
+                    // OTIMIZAÇÃO EXTREMA: Atualiza apenas a data da última mensagem para ordenar o Frontend
+                    // e DESCARTA baixar as mensagens antigas para evitar colisão e bloqueio de fila.
                     supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
                 }
 
-                for (const msg of topMessages) {
-                    try {
-                        const options = { 
-                            // [ATIVAÇÃO] Download de mídia ativado para histórico RECENTE
-                            downloadMedia: true, 
-                            fetchProfilePic: false, 
-                            createLead: true 
-                        };
-                        
-                        await handleMessage(msg, sock, companyId, sessionId, false, msg._forcedName, options);
-                    } catch (msgError) {
-                        // Falha individual de mensagem não aborta o lote do chat
-                        console.warn(`⚠️  [FASE 3] Falha ao processar msg do chat ${jid}:`, msgError.message);
-                    }
-                }
-                // [OTIMIZAÇÃO] Delay entre chats para dar tempo ao download de mídia
-                await sleep(50); 
+                // [AMPUTADO CIRURGICAMENTE]
+                // Loop de "handleMessage" histórico foi removido. 
+                // Nenhuma mensagem passada será salva no banco.
+                
+                // [OTIMIZAÇÃO] Delay mínimo mantido apenas para segurança do banco (rate limit local)
+                await sleep(10); 
             }
             console.log(`✅ [FASE 3] Chats e mensagens processados.`);
         }

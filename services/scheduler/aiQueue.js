@@ -23,24 +23,25 @@ export const enqueueAIAfterDebounce = (messageData) => {
         return;
     }
 
-    const { remote_jid } = messageData;
+    const { remote_jid, company_id } = messageData;
+    const cacheKey = `${company_id}:${remote_jid}`;
 
-    if (!messageBuffers.has(remote_jid)) {
-        messageBuffers.set(remote_jid, {
+    if (!messageBuffers.has(cacheKey)) {
+        messageBuffers.set(cacheKey, {
             messages: [messageData],
             timer: null
         });
     } else {
-        const buffer = messageBuffers.get(remote_jid);
+        const buffer = messageBuffers.get(cacheKey);
         buffer.messages.push(messageData);
         if (buffer.timer) clearTimeout(buffer.timer);
     }
 
-    const buffer = messageBuffers.get(remote_jid);
+    const buffer = messageBuffers.get(cacheKey);
 
     buffer.timer = setTimeout(async () => {
         const finalMessages = [...buffer.messages];
-        messageBuffers.delete(remote_jid);
+        messageBuffers.delete(cacheKey);
 
         const combinedContent = finalMessages
             .map(m => m.content || m.transcription || "")
@@ -107,18 +108,20 @@ if (redisConnection && shouldRunWorker) {
 
 // Fallback caso REDIS não esteja online
 const processDebounceInMemory = (messageData) => {
-    const { remote_jid } = messageData;
-    if (!messageBuffers.has(remote_jid)) {
-        messageBuffers.set(remote_jid, { messages: [messageData], timer: null });
+    const { remote_jid, company_id } = messageData;
+    const cacheKey = `${company_id}:${remote_jid}`;
+
+    if (!messageBuffers.has(cacheKey)) {
+        messageBuffers.set(cacheKey, { messages: [messageData], timer: null });
     } else {
-        const buffer = messageBuffers.get(remote_jid);
+        const buffer = messageBuffers.get(cacheKey);
         buffer.messages.push(messageData);
         if (buffer.timer) clearTimeout(buffer.timer);
     }
-    const buffer = messageBuffers.get(remote_jid);
+    const buffer = messageBuffers.get(cacheKey);
     buffer.timer = setTimeout(async () => {
         const finalMessages = [...buffer.messages];
-        messageBuffers.delete(remote_jid);
+        messageBuffers.delete(cacheKey);
         const combinedContent = finalMessages.map(m => m.content || m.transcription || "").filter(t => t.length > 0).join("\n");
         if (!combinedContent) return;
         const lastMsg = finalMessages[finalMessages.length - 1];

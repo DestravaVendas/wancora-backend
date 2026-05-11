@@ -96,9 +96,12 @@ const processNext = async (sessionId) => {
 /**
  * Adiciona uma mensagem à fila de processamento da sessão correspondente.
  *
- * 🚀 PRIORIZAÇÃO: Mensagens em tempo real (isRealtime=true, type='notify') são inseridas
- * no início da fila (unshift), deslocando mensagens de histórico mais antigas para o final.
- * Isso garante que uma mensagem nova do usuário não espere atrás de 500 msgs de histórico.
+ * 🚀 ORDENAÇÃO CRONOLÓGICA (ETAPA 3):
+ * Como o Wancora agora opera com Zero Bottleneck (lixo histórico foi amputado),
+ * todas as mensagens são enfileiradas via .push() para garantir que a IA (Sentinel)
+ * e o CRM leiam a conversa na ordem exata em que o lead digitou.
+ * 
+ * O antigo 'unshift' foi removido pois invertia a ordem de mensagens em rajadas rápidas.
  *
  * @param {object} msg - Objeto mensagem do Baileys
  * @param {object} sock - Socket da conexão
@@ -110,13 +113,8 @@ export const enqueueMessage = (msg, sock, companyId, sessionId, isRealtime) => {
     const state = getSessionState(sessionId);
     const task = { msg, sock, companyId, sessionId, isRealtime };
 
-    if (isRealtime) {
-        // Prioridade ALTA: mensagem nova vai para o início da fila
-        state.queue.unshift(task);
-    } else {
-        // Prioridade NORMAL: histórico vai para o final
-        state.queue.push(task);
-    }
+    // Fila estrita e cronológica
+    state.queue.push(task);
 
     // Tenta iniciar processamento (non-blocking — não aguarda a Promise aqui)
     processNext(sessionId);
