@@ -30,8 +30,9 @@ export const searchFiles = async (companyId, query) => {
         const drive = await getDriveClient(companyId);
         if (!drive) return { success: false, error: "Integração com Google Drive não configurada ou expirada." };
 
+        const safeQuery = query.replace(/'/g, "\\'");
         const res = await drive.files.list({
-            q: `name contains '${query}' and trashed = false`,
+            q: `name contains '${safeQuery}' and trashed = false`,
             fields: 'files(id, name, mimeType, webViewLink)',
             pageSize: 5
         });

@@ -3,22 +3,24 @@ import express from "express";
 import { createClient } from "@supabase/supabase-js";
 // CHANGE: Importando do Controller validado para manter o padrão MVC
 import { startSession, deleteSession, requestPairingCode } from "../controllers/whatsappController.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAuth, requireSessionTenant } from "../middleware/auth.js";
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
 
-// Middleware de Auth
+// Middleware de Auth Geral e Isolamento de Sessão por Empresa
 router.use(requireAuth);
+router.use(requireSessionTenant);
 
 // Iniciar Conexão / Gerar QR Code
 router.post("/start", async (req, res) => {
-  const { sessionId, companyId } = req.body;
+  const { sessionId } = req.body;
+  const companyId = req.user.companyId;
   
-  if (!sessionId || !companyId) {
-    return res.status(400).json({ error: "Dados incompletos (sessionId/companyId faltando)" });
+  if (!sessionId) {
+    return res.status(400).json({ error: "Dados incompletos (sessionId faltando)" });
   }
 
   // Fire and Forget: O Controller gerencia o log e o início
@@ -34,7 +36,8 @@ router.post("/pairing-code", requestPairingCode);
 
 // Logout / Desconectar
 router.post("/logout", async (req, res) => {
-  const { sessionId, companyId } = req.body;
+  const { sessionId } = req.body;
+  const companyId = req.user.companyId;
   try {
     await deleteSession(sessionId, companyId);
     
@@ -53,9 +56,7 @@ router.post("/logout", async (req, res) => {
 // Status
 router.get("/status/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
-  const companyId = req.headers['x-company-id'];
-  
-  if (!companyId) return res.status(400).json({ error: "x-company-id header é obrigatório" });
+  const companyId = req.user.companyId;
 
   const { data, error } = await supabase.from("instances")
       .select("*")

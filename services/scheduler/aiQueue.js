@@ -7,71 +7,58 @@ const redisConnection = getRedisClient();
 
 export const aiQueue = redisConnection ? new Queue('ai_processing_queue', { connection: redisConnection }) : null;
 
-// Mapa local para debouncing
+// Mapa local para debouncing RAM (Fallback)
 const messageBuffers = new Map();
 
 /**
- * Entreda principal para o motor de IA.
+ * Entrada principal para o motor de IA.
  * Acumula mensagens de um mesmo remetente (Debounce) e só envia para a Fila Redis
- * após 6 segundos de silêncio, consolidando o texto.
+ * após 6 segundos de silêncio, consolidando o texto de forma stateless.
  */
-export const enqueueAIAfterDebounce = (messageData) => {
-    if (!aiQueue) {
-        // Fallback para execução direta se não houver Redis
+export const enqueueAIAfterDebounce = async (messageData) => {
+    if (!aiQueue || !redisConnection) {
         console.warn("⚠️ [SENTINEL] Fallback: Sem Redis. Processando IA na RAM.");
         processDebounceInMemory(messageData);
         return;
     }
 
     const { remote_jid, company_id } = messageData;
-    const cacheKey = `${company_id}:${remote_jid}`;
+    const listKey = `ai_buffer_list:${company_id}:${remote_jid}`;
+    const timeKey = `ai_buffer_time:${company_id}:${remote_jid}`;
+    const now = Date.now();
 
-    if (!messageBuffers.has(cacheKey)) {
-        messageBuffers.set(cacheKey, {
-            messages: [messageData],
-            timer: null
+    try {
+        // Enfileira mensagem e atualiza o timestamp da última mensagem no Redis
+        await redisConnection.rpush(listKey, JSON.stringify(messageData));
+        await redisConnection.set(timeKey, now.toString());
+
+        // Agenda a verificação de debounce daqui a 6 segundos no BullMQ
+        await aiQueue.add('check_debounce', { 
+            listKey, 
+            timeKey, 
+            remote_jid, 
+            company_id, 
+            timestamp: now 
+        }, {
+            delay: 6000,
+            removeOnComplete: true,
+            removeOnFail: true,
+            jobId: `debounce:${remote_jid}-${now}`
         });
-    } else {
-        const buffer = messageBuffers.get(cacheKey);
-        buffer.messages.push(messageData);
-        if (buffer.timer) clearTimeout(buffer.timer);
+
+        console.log(`📥 [AI DEBOUNCE] Mensagem adicionada ao buffer Redis para ${remote_jid}`);
+    } catch (e) {
+        Logger.error('sentinel', `Falha ao gerenciar debounce no Redis: ${e.message}`, {}, company_id);
+        // Fallback local na RAM
+        processDebounceInMemory(messageData);
     }
-
-    const buffer = messageBuffers.get(cacheKey);
-
-    buffer.timer = setTimeout(async () => {
-        const finalMessages = [...buffer.messages];
-        messageBuffers.delete(cacheKey);
-
-        const combinedContent = finalMessages
-            .map(m => m.content || m.transcription || "")
-            .filter(t => t.length > 0)
-            .join("\n");
-
-        if (!combinedContent) return;
-
-        const lastMsg = finalMessages[finalMessages.length - 1];
-        const consolidatedData = { ...lastMsg, content: combinedContent };
-
-        try {
-            await aiQueue.add('process_ai', consolidatedData, {
-                attempts: 2,
-                backoff: { type: 'exponential', delay: 10000 },
-                removeOnComplete: true,
-                removeOnFail: false,
-                jobId: `${remote_jid}-${Date.now()}` // Dá rastreabilidade ao Job
-            });
-            console.log(`📥 [AI QUEUE] Job de IA enfileirado para ${remote_jid}`);
-        } catch (e) {
-            Logger.error('sentinel', `Falha ao enfileirar job de IA: ${e.message}`, {}, consolidatedData.company_id);
-        }
-    }, 6000); // 6s de Debounce
 };
 
 /**
  * =========================================================================
  * WORKER BULLMQ
  * Processa as requisições de IA tirando-as do Redis assincronamente.
+ * Diferencia entre verificação de debounce e execução do process_ai.
  * =========================================================================
  */
 let aiWorker = null;
@@ -81,16 +68,61 @@ const shouldRunWorker = serverRole === 'monolith' || serverRole === 'worker';
 
 if (redisConnection && shouldRunWorker) {
     aiWorker = new Worker('ai_processing_queue', async (job) => {
+        // --- CASO A: Verificação de Silêncio do Debounce ---
+        if (job.name === 'check_debounce') {
+            const { listKey, timeKey, remote_jid, company_id, timestamp } = job.data;
+            
+            try {
+                const lastTimeStr = await redisConnection.get(timeKey);
+                if (!lastTimeStr) return;
+
+                const lastTime = parseInt(lastTimeStr, 10);
+                if (timestamp < lastTime) {
+                    // Outra mensagem chegou depois e estendeu o debounce. Este job caducou.
+                    return;
+                }
+
+                // O tempo de silêncio de 6s foi respeitado. Consolidamos as mensagens.
+                const rawMsgs = await redisConnection.lrange(listKey, 0, -1);
+                await redisConnection.del(listKey, timeKey);
+
+                if (!rawMsgs || rawMsgs.length === 0) return;
+
+                const finalMessages = rawMsgs.map(m => JSON.parse(m));
+                const combinedContent = finalMessages
+                    .map(m => m.content || m.transcription || "")
+                    .filter(t => t.length > 0)
+                    .join("\n");
+
+                if (!combinedContent) return;
+
+                const lastMsg = finalMessages[finalMessages.length - 1];
+                const consolidatedData = { ...lastMsg, content: combinedContent };
+
+                // Adiciona o job definitivo para a IA responder
+                await aiQueue.add('process_ai', consolidatedData, {
+                    attempts: 2,
+                    backoff: { type: 'exponential', delay: 10000 },
+                    removeOnComplete: true,
+                    removeOnFail: false,
+                    jobId: `ai:${remote_jid}-${Date.now()}`
+                });
+                console.log(`📥 [AI DEBOUNCE] Debounce finalizado para ${remote_jid}. Job process_ai enfileirado.`);
+
+            } catch (err) {
+                console.error(`❌ [AI WORKER] Erro no check_debounce para ${remote_jid}:`, err.message);
+            }
+            return;
+        }
+
+        // --- CASO B: Processamento do Sentinel ---
         const messageData = job.data;
         console.log(`⚙️ [AI WORKER] Processando Job ${job.id} para ${messageData.remote_jid}`);
-        
-        // internalProcessAI (a antiga _internalProcessAI) agora faz o trabalho pesado
-        // sem precisar gerenciar a trava local (o BullMQ com concurrency ajustada faz o controle de fluxo).
         await internalProcessAI(messageData);
         
     }, { 
         connection: redisConnection,
-        concurrency: 5, // Processa no máximo 5 leads simultâneos por nó para poupar API Key do Gemini
+        concurrency: 5, // Processa no máximo 5 leads simultâneos por nó para poupar a chave
         limiter: {
             max: 20, // max 20 jobs
             duration: 1000 // por segundo
@@ -98,7 +130,9 @@ if (redisConnection && shouldRunWorker) {
     });
 
     aiWorker.on('completed', (job) => {
-        console.log(`✅ [AI WORKER] Job ${job.id} concluído com sucesso.`);
+        if (job.name === 'process_ai') {
+            console.log(`✅ [AI WORKER] Job ${job.id} concluído com sucesso.`);
+        }
     });
 
     aiWorker.on('failed', (job, err) => {

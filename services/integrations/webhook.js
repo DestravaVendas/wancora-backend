@@ -2,6 +2,11 @@
 import axios from 'axios';
 import crypto from 'crypto';
 import { createClient } from "@supabase/supabase-js";
+import http from 'http';
+import https from 'https';
+
+const httpAgent = new http.Agent({ keepAlive: true });
+const httpsAgent = new https.Agent({ keepAlive: true });
 
 // Cliente Supabase Service Role para logs
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -57,7 +62,12 @@ export const dispatchWebhook = async (url, event, data, instanceId) => {
     try {
         // Envia o body já serializado (string) para garantir consistência com a assinatura
         // Timeout curto (3s) para não travar o processamento do Baileys
-        const res = await axios.post(url, payloadString, { headers, timeout: 3000 });
+        const res = await axios.post(url, payloadString, { 
+            headers, 
+            timeout: 3000,
+            httpAgent,
+            httpsAgent
+        });
         status = res.status;
         responseBody = JSON.stringify(res.data).substring(0, 1000); // Trunca para economizar espaço
 

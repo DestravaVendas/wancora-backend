@@ -9,9 +9,8 @@ import { Logger } from "../utils/logger.js"; // IMPORT LOGGER
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 export const connectDrive = async (req, res) => {
-    const { companyId } = req.body; 
+    const companyId = req.user.companyId;
     console.log(`🔌 [CLOUD] Iniciando conexão Drive para empresa: ${companyId}`);
-    if (!companyId) return res.status(400).json({ error: "Company ID é obrigatório para conectar." });
     try {
         const url = generateAuthUrl(companyId);
         res.json({ url });
@@ -38,7 +37,7 @@ export const callbackDrive = async (req, res) => {
 };
 
 export const listFiles = async (req, res) => {
-    const { companyId } = req.body;
+    const companyId = req.user.companyId;
     const { folderId, isTrash } = req.query; 
 
     try {
@@ -85,7 +84,8 @@ export const listFiles = async (req, res) => {
 };
 
 export const searchDrive = async (req, res) => {
-    const { companyId, query } = req.body;
+    const { query } = req.body;
+    const companyId = req.user.companyId;
     if (!query) return res.status(400).json({ error: "Query vazia." });
     try {
         const files = await searchLiveFiles(companyId, query);
@@ -97,7 +97,8 @@ export const searchDrive = async (req, res) => {
 };
 
 export const listRemoteFiles = async (req, res) => {
-    const { companyId, folderId } = req.body;
+    const { folderId } = req.body;
+    const companyId = req.user.companyId;
     try {
         const files = await listRemoteFolder(companyId, folderId);
         res.json({ files });
@@ -108,7 +109,8 @@ export const listRemoteFiles = async (req, res) => {
 };
 
 export const importDriveFiles = async (req, res) => {
-    const { companyId, files, currentFolderId } = req.body; 
+    const { files, currentFolderId } = req.body; 
+    const companyId = req.user.companyId;
     
     try {
         const count = await importFilesToCache(companyId, files, currentFolderId);
@@ -120,7 +122,8 @@ export const importDriveFiles = async (req, res) => {
 };
 
 export const convertDocument = async (req, res) => {
-    const { companyId, fileId } = req.body;
+    const { fileId } = req.body;
+    const companyId = req.user.companyId;
     try {
         const result = await convertDocxToHtml(companyId, fileId);
         res.json({ success: true, ...result });
@@ -131,7 +134,8 @@ export const convertDocument = async (req, res) => {
 };
 
 export const downloadFileContent = async (req, res) => {
-    const { companyId, fileId } = req.body;
+    const { fileId } = req.body;
+    const companyId = req.user.companyId;
     try {
         // Reutiliza getFileBuffer que já trata conversão de Google Sheets para XLSX
         const fileData = await getFileBuffer(companyId, fileId);
@@ -156,7 +160,7 @@ export const downloadFileContent = async (req, res) => {
 };
 
 export const syncNow = async (req, res) => {
-    const { companyId } = req.body;
+    const companyId = req.user.companyId;
     try {
         const files = await syncDriveFiles(companyId);
         res.json({ success: true, count: files.length });
@@ -164,9 +168,10 @@ export const syncNow = async (req, res) => {
 };
 
 export const uploadFileToDrive = async (req, res) => {
-    const { companyId, name, folderId } = req.body;
+    const { name, folderId } = req.body;
+    const companyId = req.user.companyId;
     const file = req.file;
-    if (!companyId || !file) return res.status(400).json({ error: "Arquivo ou CompanyId ausentes." });
+    if (!file) return res.status(400).json({ error: "Arquivo ausente." });
 
     try {
         const fileData = await uploadFile(companyId, file.buffer, name || file.originalname, file.mimetype, folderId === 'null' ? null : folderId);
@@ -178,7 +183,7 @@ export const uploadFileToDrive = async (req, res) => {
 };
 
 export const getQuota = async (req, res) => {
-    const { companyId } = req.body;
+    const companyId = req.user.companyId;
     try {
         const quota = await getStorageQuota(companyId);
         res.json({ success: true, quota });
@@ -186,7 +191,8 @@ export const getQuota = async (req, res) => {
 };
 
 export const createNewFolder = async (req, res) => {
-    const { companyId, name, parentId } = req.body;
+    const { name, parentId } = req.body;
+    const companyId = req.user.companyId;
     try {
         const folder = await createFolder(companyId, name, parentId);
         res.json({ success: true, folder });
@@ -194,7 +200,8 @@ export const createNewFolder = async (req, res) => {
 };
 
 export const deleteItems = async (req, res) => {
-    const { companyId, fileIds } = req.body;
+    const { fileIds } = req.body;
+    const companyId = req.user.companyId;
     try {
         await deleteFiles(companyId, fileIds);
         res.json({ success: true });
@@ -202,7 +209,8 @@ export const deleteItems = async (req, res) => {
 };
 
 export const removeImportedFiles = async (req, res) => {
-    const { companyId, fileIds } = req.body;
+    const { fileIds } = req.body;
+    const companyId = req.user.companyId;
     try {
         await removeFilesFromCache(companyId, fileIds);
         res.json({ success: true });
@@ -210,7 +218,7 @@ export const removeImportedFiles = async (req, res) => {
 };
 
 export const emptyTrashItems = async (req, res) => {
-    const { companyId } = req.body;
+    const companyId = req.user.companyId;
     try {
         await emptyTrash(companyId);
         res.json({ success: true });
@@ -218,7 +226,8 @@ export const emptyTrashItems = async (req, res) => {
 };
 
 export const sendFileToContact = async (req, res) => {
-    const { companyId, fileId, to, caption } = req.body;
+    const { fileId, to, caption } = req.body;
+    const companyId = req.user.companyId;
     if (!fileId || !to) return res.status(400).json({ error: "FileId e Destinatário obrigatórios" });
 
     try {

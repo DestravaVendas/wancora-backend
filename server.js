@@ -20,7 +20,7 @@ import { startRetentionWorker } from './workers/retentionWorker.js';
 import { startRecoveryWatchdog } from './workers/recoveryWorker.js';
 import { startSupervisorWorker } from './workers/supervisorWorker.js';
 import { errorHandler } from './middleware/errorHandler.js'; // NOVO: Middleware
-import rateLimit from 'express-rate-limit'; // [SECURITY PATCH] Rate Limiter
+import { apiLimiter as redisApiLimiter } from './middleware/limiter.js'; // [SECURITY PATCH] Redis Rate Limiter
 
 // --- CONSOLE HIJACKING (Interceptador Global de Logs) ---
 Logger.initConsoleHijack();
@@ -97,24 +97,44 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 // --- MIDDLEWARES & SEGURANÇA ---
 app.use(helmet({
-    crossOriginResourcePolicy: false,
-    contentSecurityPolicy: false
+    // Mantém as diretivas básicas restritas, bloqueando injeções
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            connectSrc: ["'self'", process.env.SUPABASE_URL || "*"],
+            scriptSrc: ["'self'", "'unsafe-inline'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", "data:", "https:"]
+        }
+    },
+    crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
-app.use(cors());
-app.use(compression()); 
-app.use(express.json({ limit: '50mb' })); 
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// Configuração do CORS Restrito
+const allowedOrigins = [
+    process.env.FRONTEND_URL || 'https://wancora-crm.netlify.app',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000'
+];
 
-// --- RATE LIMIT GLOBAL (SECURITY PATCH) ---
-const apiLimiter = rateLimit({
-    windowMs: 1 * 60 * 1000, // 1 minuto
-    max: 200, // Limita a 200 requisições por minuto por IP (Proteção Anti-DDoS)
-    message: { error: 'Too Many Requests - Rate Limit Exceeded' },
-    standardHeaders: true,
-    legacyHeaders: false,
-});
-app.use('/api', apiLimiter);
+app.use(cors({
+    origin: (origin, callback) => {
+        // Permite requisições sem origem (como aplicativos mobile, curl ou conexões locais do servidor)
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.includes(origin) || allowedOrigins.some(o => origin.startsWith(o))) {
+            return callback(null, true);
+        }
+        return callback(new Error('Bloqueado por política de CORS: Origem não permitida.'));
+    },
+    credentials: true
+}));
+
+app.use(compression()); 
+app.use(express.json({ limit: '2mb' })); // Proteção contra DoS reduzindo o limite do payload JSON para 2MB
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+
+// --- RATE LIMIT GLOBAL (SECURITY PATCH: REDIS EXPOSITION PROGRESSIVE) ---
+app.use('/api', redisApiLimiter);
 
 // Montagem das Rotas (Sempre montadas para compatibilidade, mas o tráfego 
 // deve ser roteado pelo Proxy apenas para máquinas da Role "web" ou "monolith")

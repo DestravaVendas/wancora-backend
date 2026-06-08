@@ -59,7 +59,8 @@ export const sendMessage = async (payload) => sendService(payload);
 // --- COMUNIDADES & GRUPOS ---
 
 export const createGroup = async (req, res) => {
-    const { sessionId, companyId, subject, participants } = req.body;
+    const { sessionId, subject, participants } = req.body;
+    const companyId = req.user.companyId;
     try {
         const group = await createGroupService(sessionId, companyId, subject, participants);
         res.json({ success: true, group });
@@ -102,7 +103,8 @@ export const getGroupMetadata = async (req, res) => {
 };
 
 export const createCommunity = async (req, res) => {
-    const { sessionId, companyId, subject, description } = req.body;
+    const { sessionId, subject, description } = req.body;
+    const companyId = req.user.companyId;
     try {
         const community = await createCommunityService(sessionId, companyId, subject, description);
         res.json({ success: true, community });
@@ -111,7 +113,8 @@ export const createCommunity = async (req, res) => {
 
 // --- CATÁLOGO ---
 export const syncCatalog = async (req, res) => {
-    const { sessionId, companyId } = req.body;
+    const { sessionId } = req.body;
+    const companyId = req.user.companyId;
     try {
         const result = await fetchCatalog(sessionId, companyId);
         res.json({ success: true, result });
@@ -322,7 +325,8 @@ export const subscribeToPresence = async (sessionId, remoteJid) => {
 
 // --- TESTES DE STRESS E IA ---
 export const triggerStressTest = async (req, res) => {
-    const { companyId, count } = req.body;
+    const { count } = req.body;
+    const companyId = req.user.companyId;
     try {
         const result = await runCampaignStress(companyId, count);
         res.json(result);
@@ -332,7 +336,8 @@ export const triggerStressTest = async (req, res) => {
 };
 
 export const triggerAITest = async (req, res) => {
-    const { companyId, leadId, iterations } = req.body;
+    const { leadId, iterations } = req.body;
+    const companyId = req.user.companyId;
     try {
         const result = await runAIStress(companyId, leadId, iterations);
         res.json(result);
@@ -344,10 +349,11 @@ export const triggerAITest = async (req, res) => {
 // 🛡️ [FEATURE] Atualiza/Baixa a foto de perfil de um contato sob demanda.
 // Trata erros de timeout e privacidade de forma graciosa.
 export const refreshContactPic = async (req, res) => {
-    const { jid, sessionId, companyId } = req.body;
+    const { jid, sessionId } = req.body;
+    const companyId = req.user.companyId;
     
-    if (!jid || !sessionId || !companyId) {
-        return res.status(400).json({ error: "JID, SessionID e CompanyID são obrigatórios" });
+    if (!jid || !sessionId) {
+        return res.status(400).json({ error: "JID e SessionID são obrigatórios" });
     }
 
     const session = sessions.get(sessionId);

@@ -178,10 +178,9 @@ const runRecoveryCheck = async () => {
         // --- QUERY 1: Mensagens para RE-ENFILEIRAR (3 a 15 min atrás, com erro explícito OU processadas = false) ---
         const { data: pendingMessages, error: pendingError } = await supabase
             .from('messages')
-            .select('whatsapp_id, company_id, remote_jid, content, message_type, transcription, session_id, created_at, ai_error, leads!inner(bot_status)')
+            .select('whatsapp_id, company_id, remote_jid, content, message_type, transcription, session_id, created_at, ai_error, leads(bot_status)')
             .eq('from_me', false)
             .eq('ai_processed', false)
-            .neq('leads.bot_status', 'off')             // 🛡️ [ANTI-LOOP] Ignora leads com bot desligado
             .not('remote_jid', 'like', '%@g.us')        // Ignora grupos
             .not('remote_jid', 'like', '%@newsletter')  // Ignora newsletters
             .lte('created_at', threeMinAgo)              // Mais de 3 min (fora do debounce)
@@ -191,19 +190,25 @@ const runRecoveryCheck = async () => {
         if (pendingError) {
             Logger.error('watchdog', 'Erro na query de mensagens pendentes', { error: pendingError.message });
         } else if (pendingMessages && pendingMessages.length > 0) {
-            console.log(`🔄 [WATCHDOG] ${pendingMessages.length} mensagem(ns) pendente(s) detectadas. Re-enfileirando...`);
-            for (const msg of pendingMessages) {
-                await requeueMessage(msg);
+            const filteredPending = pendingMessages.filter(msg => {
+                const leadData = Array.isArray(msg.leads) ? msg.leads[0] : msg.leads;
+                return !leadData || leadData.bot_status !== 'off';
+            });
+
+            if (filteredPending.length > 0) {
+                console.log(`🔄 [WATCHDOG] ${filteredPending.length} de ${pendingMessages.length} mensagem(ns) pendente(s) válidas detectadas. Re-enfileirando...`);
+                for (const msg of filteredPending) {
+                    await requeueMessage(msg);
+                }
             }
         }
 
         // --- QUERY 2: Mensagens para FALHA_ATENDIMENTO (> 15 min, ainda com ai_processed = false) ---
         const { data: failedMessages, error: failedError } = await supabase
             .from('messages')
-            .select('whatsapp_id, company_id, remote_jid, content, message_type, session_id, created_at, leads!inner(bot_status)')
+            .select('whatsapp_id, company_id, remote_jid, content, message_type, session_id, created_at, leads(bot_status)')
             .eq('from_me', false)
             .eq('ai_processed', false)
-            .neq('leads.bot_status', 'off')             // 🛡️ [ANTI-LOOP] Ignora leads com bot desligado
             .not('remote_jid', 'like', '%@g.us')
             .not('remote_jid', 'like', '%@newsletter')
             .lt('created_at', fifteenMinAgo)   // Mais de 15 min (passou da janela de recovery)
@@ -213,9 +218,16 @@ const runRecoveryCheck = async () => {
         if (failedError) {
             Logger.error('watchdog', 'Erro na query de mensagens com falha', { error: failedError.message });
         } else if (failedMessages && failedMessages.length > 0) {
-            console.log(`🚨 [WATCHDOG] ${failedMessages.length} mensagem(ns) com falha de atendimento (>15min).`);
-            for (const msg of failedMessages) {
-                await markAsFailure(msg);
+            const filteredFailed = failedMessages.filter(msg => {
+                const leadData = Array.isArray(msg.leads) ? msg.leads[0] : msg.leads;
+                return !leadData || leadData.bot_status !== 'off';
+            });
+
+            if (filteredFailed.length > 0) {
+                console.log(`🚨 [WATCHDOG] ${filteredFailed.length} de ${failedMessages.length} mensagem(ns) com falha de atendimento detectadas (>15min).`);
+                for (const msg of filteredFailed) {
+                    await markAsFailure(msg);
+                }
             }
         }
 

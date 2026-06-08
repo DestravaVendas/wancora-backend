@@ -2,7 +2,7 @@
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import { sendMessage, sendPollVote, sendReaction, deleteMessage, markChatAsRead, subscribeToPresence, refreshContactPic } from "../controllers/whatsappController.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAuth, requireSessionTenant } from "../middleware/auth.js";
 import { apiLimiter } from "../middleware/limiter.js";
 import { normalizeJid } from "../utils/wppParsers.js";
 
@@ -13,29 +13,19 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 router.use(requireAuth);
 router.use(apiLimiter);
+router.use(requireSessionTenant);
 
 // Enviar Mensagem (Com Salvamento Otimista)
 router.post("/send", async (req, res) => {
   const { 
       sessionId, to, text, type, url, caption, 
-      poll, location, contact, ptt, mimetype, fileName, companyId 
+      poll, location, contact, ptt, mimetype, fileName
   } = req.body;
+  
+  const companyId = req.user.companyId;
   
   if (!sessionId || !to) {
       return res.status(400).json({ error: "SessionId e Destinatário são obrigatórios" });
-  }
-
-  // 🛡️ [SECURITY] Prevenção contra Exploit Multi-tenant
-  // Garante que o sessionId disparando a mensagem realmente pertence ao companyId autorizado
-  const { data: validInstance } = await supabase.from('instances')
-      .select('id')
-      .eq('session_id', sessionId)
-      .eq('company_id', companyId)
-      .maybeSingle();
-
-  if (!validInstance) {
-      console.warn(`🚨 [SECURITY] Tentativa de hijack de sessão detectada! Session: ${sessionId} | Company: ${companyId}`);
-      return res.status(403).json({ error: "Sessão não autorizada ou inexistente para esta empresa." });
   }
 
   try {
@@ -47,7 +37,8 @@ router.post("/send", async (req, res) => {
         to: cleanTo,
         type: type || 'text',
         content: text,
-        url, caption, poll, location, contact, ptt, mimetype, fileName
+        url, caption, poll, location, contact, ptt, mimetype, fileName,
+        companyId
     };
 
     // 1. Envio via Controller/Service
@@ -93,7 +84,8 @@ router.post("/send", async (req, res) => {
 
 // Votar em Enquete
 router.post("/vote", async (req, res) => {
-    const { companyId, sessionId, remoteJid, pollId, optionId } = req.body;
+    const { sessionId, remoteJid, pollId, optionId } = req.body;
+    const companyId = req.user.companyId;
     
     if(!pollId || optionId === undefined) {
         return res.status(400).json({ error: "PollId e OptionId obrigatórios" });
@@ -110,7 +102,8 @@ router.post("/vote", async (req, res) => {
 
 // Reagir
 router.post("/react", async (req, res) => {
-    const { sessionId, companyId, remoteJid, msgId, reaction } = req.body;
+    const { sessionId, remoteJid, msgId, reaction } = req.body;
+    const companyId = req.user.companyId;
     try {
         await sendReaction(sessionId, companyId, remoteJid, msgId, reaction);
         res.json({ success: true });
@@ -121,7 +114,8 @@ router.post("/react", async (req, res) => {
 
 // Deletar Mensagem
 router.post("/delete", async (req, res) => {
-    const { sessionId, companyId, remoteJid, msgId, everyone } = req.body;
+    const { sessionId, remoteJid, msgId, everyone } = req.body;
+    const companyId = req.user.companyId;
     try {
         await deleteMessage(sessionId, companyId, remoteJid, msgId, everyone);
         res.json({ success: true });
@@ -132,7 +126,8 @@ router.post("/delete", async (req, res) => {
 
 // Marcar como Lido & Presença
 router.post("/read", async (req, res) => {
-    const { sessionId, companyId, remoteJid } = req.body;
+    const { sessionId, remoteJid } = req.body;
+    const companyId = req.user.companyId;
     try {
         await markChatAsRead(sessionId, companyId, remoteJid);
         res.json({ success: true });
@@ -155,8 +150,6 @@ router.post("/presence", async (req, res) => {
 });
 
 // 📸 Foto de perfil on-demand (Gatilho em Tempo Real)
-// Chamado pelo Frontend ao abrir um chat ou painel lateral de contato.
-// Executa sock.profilePictureUrl() imediatamente e persiste no banco.
 router.post("/contacts/refresh-pic", refreshContactPic);
 
 export default router;

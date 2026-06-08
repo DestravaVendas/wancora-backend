@@ -32,30 +32,67 @@ export const requireAuth = async (req, res, next) => {
         // 2. Anexa o usuário à requisição
         req.user = user;
 
-        // 3. Validação de Multi-Tenant (RBAC)
-        // Se a rota exige um companyId, verificamos se o usuário pertence a ela
-        const requestCompanyId = req.body.companyId || req.headers['x-company-id'];
+        // 3. Validação de Multi-Tenant (RBAC) - Fail-Closed
+        // Busca sempre o perfil do usuário diretamente no banco de dados para segurança máxima
+        const { data: profile, error: profileError } = await supabase
+            .from('profiles')
+            .select('company_id, role')
+            .eq('id', user.id)
+            .maybeSingle();
 
-        if (requestCompanyId) {
-            const { data: profile } = await supabase
-                .from('profiles')
-                .select('company_id, role')
-                .eq('id', user.id)
-                .single();
+        if (profileError || !profile || !profile.company_id) {
+            console.warn(`🚨 [SECURITY] Usuário sem organização associada ou perfil não encontrado! User: ${user.id}`);
+            return res.status(403).json({ error: "Acesso negado. Usuário sem organização vinculada." });
+        }
 
-            // Regra de Ouro: Usuário só mexe na própria empresa
-            if (!profile || profile.company_id !== requestCompanyId) {
-                console.warn(`🚨 [SECURITY] Tentativa de acesso cruzado! User: ${user.id} -> Company: ${requestCompanyId}`);
-                return res.status(403).json({ error: "Acesso negado a esta organização." });
-            }
-            
-            // Injeta role para uso futuro nos controllers
-            req.user.role = profile.role;
+        // Injeta empresa e role confiáveis do banco na requisição
+        req.user.companyId = profile.company_id;
+        req.user.role = profile.role;
+
+        // Se o cliente forneceu companyId, este DEVE ser idêntico ao do perfil associado
+        const clientCompanyId = req.body.companyId || req.query.companyId || req.headers['x-company-id'];
+        if (clientCompanyId && clientCompanyId !== profile.company_id) {
+            console.warn(`🚨 [SECURITY] Tentativa de acesso cruzado! User: ${user.id} -> Tentou acessar: ${clientCompanyId} | Empresa Real: ${profile.company_id}`);
+            return res.status(403).json({ error: "Acesso negado a esta organização." });
         }
 
         next();
     } catch (e) {
         console.error("❌ [AUTH MIDDLEWARE] Erro:", e);
         return res.status(500).json({ error: "Erro interno de autenticação." });
+    }
+};
+
+export const requireSessionTenant = async (req, res, next) => {
+    const sessionId = req.body.sessionId || req.params.sessionId || req.query.sessionId;
+    
+    if (!sessionId) {
+        return res.status(400).json({ error: "O parâmetro sessionId é obrigatório para esta rota." });
+    }
+
+    try {
+        const companyId = req.user.companyId;
+
+        // Verifica no banco de dados se a sessão pertence à empresa do usuário
+        const { data: instance, error } = await supabase
+            .from('instances')
+            .select('company_id')
+            .eq('session_id', sessionId)
+            .maybeSingle();
+
+        if (error || !instance) {
+            console.warn(`🚨 [SECURITY] Tentativa de acesso a sessão inexistente ou inválida! User: ${req.user.id} -> Session: ${sessionId}`);
+            return res.status(403).json({ error: "Sessão não autorizada ou inexistente para esta empresa." });
+        }
+
+        if (instance.company_id !== companyId) {
+            console.warn(`🚨 [SECURITY] Tentativa de hijacking de sessão! User: ${req.user.id} (Empresa: ${companyId}) -> Tentou acessar Session: ${sessionId} (Empresa: ${instance.company_id})`);
+            return res.status(403).json({ error: "Acesso negado. Esta sessão não pertence à sua organização." });
+        }
+
+        next();
+    } catch (e) {
+        console.error("❌ [SESSION TENANT MIDDLEWARE] Erro:", e);
+        return res.status(500).json({ error: "Erro interno ao validar tenant da sessão." });
     }
 };

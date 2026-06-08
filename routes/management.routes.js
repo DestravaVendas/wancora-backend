@@ -8,11 +8,12 @@ import {
     triggerAITest,
     refreshContactPic
 } from "../controllers/whatsappController.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAuth, requireSessionTenant } from "../middleware/auth.js";
 
 const router = express.Router();
 
 router.use(requireAuth);
+router.use(requireSessionTenant);
 
 // Grupos
 router.post("/group/create", createGroup);
@@ -25,9 +26,15 @@ router.post("/community/create", createCommunity);
 // Catálogo
 router.post("/catalog/sync", syncCatalog);
 
-// Testes de Stress e IA
-router.post("/stress/campaign", triggerStressTest);
-router.post("/stress/ai", triggerAITest);
+// Testes de Stress e IA (Apenas Donos/Admins)
+const requireAdminRole = (req, res, next) => {
+    if (!['owner', 'admin'].includes(req.user?.role)) {
+        return res.status(403).json({ error: "Acesso negado. Apenas administradores podem executar testes de estresse." });
+    }
+    next();
+};
+router.post("/stress/campaign", requireAdminRole, triggerStressTest);
+router.post("/stress/ai", requireAdminRole, triggerAITest);
 
 // ⚠️ [STUB] getSyncStatus não implementado no controller — rota reservada para futura implementação
 router.get('/instances/:sessionId/sync-status', (req, res) => {

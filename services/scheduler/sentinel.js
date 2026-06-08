@@ -260,9 +260,29 @@ export const internalProcessAI = async (messageData) => {
     console.log(`   ✅ Lead Validado: ${lead.name}`);
 
     let userMessage = content;
-    if ((message_type === 'audio' || message_type === 'ptt') && transcription) {
-        userMessage = `[Áudio Transcrito]: ${transcription}`;
-    } else if ((message_type === 'audio' || message_type === 'ptt') && !transcription) {
+    let activeTranscription = transcription;
+
+    if ((message_type === 'audio' || message_type === 'ptt') && !activeTranscription) {
+        console.log(`   🎙️ [SENTINEL] Áudio sem transcrição no payload. Consultando banco para verificar transcrição recente de ${id}...`);
+        try {
+            const { data: currentMsg } = await supabase
+                .from('messages')
+                .select('transcription')
+                .eq('whatsapp_id', id)
+                .eq('company_id', company_id)
+                .maybeSingle();
+            if (currentMsg?.transcription) {
+                activeTranscription = currentMsg.transcription;
+                console.log(`   🎙️ [SENTINEL] Transcrição recente encontrada no banco de dados: "${activeTranscription}"`);
+            }
+        } catch (dbErr) {
+            console.error(`   ❌ [SENTINEL] Erro ao consultar transcrição recente no banco:`, dbErr.message);
+        }
+    }
+
+    if ((message_type === 'audio' || message_type === 'ptt') && activeTranscription) {
+        userMessage = `[Áudio Transcrito]: ${activeTranscription}`;
+    } else if ((message_type === 'audio' || message_type === 'ptt') && !activeTranscription) {
         // 🛡️ [ANTI-VÁCUO DE ÁUDIO] Transcrição ainda não chegou (race condition com pipeline async)
         // ou o Vertex/Gemini estava com rate limit. A IA recebe um placeholder e responde
         // com empatia em vez de deixar o lead sem resposta.
@@ -685,10 +705,29 @@ export const internalProcessAI = async (messageData) => {
     } catch (error) {
         console.error("\n   ❌ [ERRO CRÍTICO NA EXECUÇÃO DA IA]:", error);
 
-        if (error.message?.includes('404')) {
-            Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key inválida." }, company_id);
-        } else if (!error.message?.includes('SAFETY')) {
-            Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message }, company_id);
+        const isAuthError = error.message?.includes('API key') || error.message?.includes('API_KEY_INVALID') || error.status === 400 || error.status === 403;
+        if (isAuthError) {
+            console.error(`   ❌ [SENTINEL] Erro de autenticação crítico (API Key inválida). Pausando robôs e marcando mensagem com erro INVALID_API_KEY para empresa ${company_id}.`);
+            try {
+                await Promise.all([
+                    supabase.from('messages')
+                        .update({ ai_processed: true, ai_error: 'INVALID_API_KEY' })
+                        .eq('whatsapp_id', id)
+                        .eq('company_id', company_id),
+                    supabase.from('leads')
+                        .update({ bot_status: 'off' })
+                        .eq('company_id', company_id)
+                ]);
+                Logger.error('sentinel', `Erro Fatal IA: API Key Inválida/Expirada. Robôs pausados.`, { error: error.message }, company_id);
+            } catch (dbErr) {
+                console.error(`   ❌ [SENTINEL] Falha ao desativar bot/atualizar status no erro de API Key:`, dbErr.message);
+            }
+        } else {
+            if (error.message?.includes('404')) {
+                Logger.error('sentinel', `Erro Fatal IA: Modelo Inexistente`, { details: "API Key inválida." }, company_id);
+            } else if (!error.message?.includes('SAFETY')) {
+                Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message }, company_id);
+            }
         }
     }
 };

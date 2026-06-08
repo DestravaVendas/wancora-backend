@@ -45,23 +45,27 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
         // 1. Mantém a rotina original de salvar contatos
         handleContactsUpsert(contacts, companyId);
         
-        // 2. 🛡️ [MAPA DE IDENTIDADE] O WhatsApp entrega a relação LID <-> Phone aqui
+        // 2. 🛡️ [MAPA DE IDENTIDADE] O WhatsApp entrega a relação LID <-> Phone aqui (Bulk Upsert)
         try {
             const batch = contacts.filter(c => c.id && c.lid);
             if (batch.length > 0) {
-                // Execução sequencial para evitar 'TypeError: fetch failed' (Socket Exhaustion)
-                for (const contact of batch) {
+                const upsertData = batch.map(contact => {
                     const cleanPhone = contact.id.replace(/:[0-9]+@/, '@'); // Remove porta de dispositivo
                     const cleanLid = contact.lid.replace(/:[0-9]+@/, '@');
+                    return {
+                        lid_jid: cleanLid,
+                        phone_jid: cleanPhone,
+                        company_id: companyId
+                    };
+                });
 
-                    const { error: rpcError } = await supabase.rpc('link_identities', { 
-                            p_lid: cleanLid, 
-                            p_phone: cleanPhone, 
-                            p_company_id: companyId 
-                        });
-                        if (rpcError) {
-                            console.error("❌ [LISTENER] RPC Error:", rpcError.message);
-                        }
+                console.log(`🔗 [LISTENER] Gravando Bulk de LID mappings: ${upsertData.length} itens...`);
+                const { error: upsertError } = await supabase
+                    .from('identity_map')
+                    .upsert(upsertData, { onConflict: 'lid_jid, company_id' });
+
+                if (upsertError) {
+                    console.error("❌ [LISTENER] Bulk Upsert identity_map Error:", upsertError.message);
                 }
             }
         } catch (e) {

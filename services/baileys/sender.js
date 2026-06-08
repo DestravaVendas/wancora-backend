@@ -29,16 +29,26 @@ export const executeLocked = async (sessionId, task) => {
     }
 
     const currentLock = sendLocks.get(sessionId);
+    let promiseToStore;
+
     const nextTask = currentLock.then(async () => {
         try {
             return await task();
         } catch (e) {
             console.error(`❌ [SENDER] Erro em tarefa travada (${sessionId}):`, e.message);
             throw e;
+        } finally {
+            // Executa no final da fila da microtask
+            process.nextTick(() => {
+                if (sendLocks.get(sessionId) === promiseToStore) {
+                    sendLocks.delete(sessionId);
+                }
+            });
         }
     });
 
-    sendLocks.set(sessionId, nextTask.catch(() => {}));
+    promiseToStore = nextTask.catch(() => {});
+    sendLocks.set(sessionId, promiseToStore);
     return nextTask;
 };
 

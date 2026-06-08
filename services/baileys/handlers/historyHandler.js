@@ -76,71 +76,72 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         // =====================================================================
 
         // Fonte 1: lidPnMappings nativos entregues pelo Baileys no evento
+        // Fonte 1: lidPnMappings nativos entregues pelo Baileys no evento (Bulk Upsert)
         if (lidPnMappings && lidPnMappings.length > 0) {
-            console.log(`🗺️  [FASE 1] Processando ${lidPnMappings.length} mapeamentos LID-PN nativos...`);
+            console.log(`🗺️  [FASE 1] Processando ${lidPnMappings.length} mapeamentos LID-PN nativos (Bulk Upsert)...`);
             
             const lidBatch = lidPnMappings
                 .filter(m => m.lid && m.pn)  // garante que ambos existem
                 .map(m => ({
-                    p_lid: normalizeJid(m.lid),
-                    p_phone: normalizeJid(m.pn),
-                    p_company_id: companyId
+                    lid_jid: normalizeJid(m.lid),
+                    phone_jid: normalizeJid(m.pn),
+                    company_id: companyId
                 }));
 
-            // Processa em série para evitar sobrecarga de RPC no Supabase
-            for (const mapping of lidBatch) {
+            if (lidBatch.length > 0) {
                 try {
-                    const { error } = await supabase.rpc('link_identities', mapping);
+                    const { error } = await supabase
+                        .from('identity_map')
+                        .upsert(lidBatch, { onConflict: 'lid_jid, company_id' });
                     if (error) throw error;
+                    console.log(`✅ [FASE 1] ${lidBatch.length} mapeamentos LID-PN nativos processados via Bulk.`);
                 } catch (e) {
-                    // Falha individual não aborta o lote — apenas loga
-                    console.warn(`⚠️  [FASE 1] Falha ao mapear LID ${mapping.p_lid}:`, e.message);
+                    console.error(`❌ [FASE 1] Falha no Bulk Upsert LID-PN nativos:`, e.message);
                 }
             }
-            console.log(`✅ [FASE 1] ${lidBatch.length} mapeamentos LID-PN nativos processados.`);
         }
 
-        // Fonte 2: contacts que trazem .lid embutido (complementar ao lidPnMappings)
-        // 🛡️ RESGATE AGRESSIVO: O Baileys pode enviar c.id como PN e c.lid como LID,
-        // OU c.id como LID e c.lid como PN dependendo da versão do protocolo.
-        // Testamos AMBOS os sentidos para garantir que identity_map seja populada.
+        // Fonte 2: contacts que trazem .lid embutido (complementar ao lidPnMappings - Bulk Upsert)
         if (contacts && contacts.length > 0) {
             const contactsWithLid = contacts.filter(c => c.id && c.lid);
             if (contactsWithLid.length > 0) {
-                console.log(`🗺️  [FASE 1] Processando ${contactsWithLid.length} mapeamentos LID embutidos (resgate duplo-sentido)...`);
+                console.log(`🗺️  [FASE 1] Processando ${contactsWithLid.length} mapeamentos LID embutidos (Bulk Upsert)...`);
+                
+                const lidBatch = [];
                 for (const c of contactsWithLid) {
-                    try {
-                        const idNorm  = normalizeJid(c.id);
-                        const lidNorm = normalizeJid(c.lid);
-                        if (!idNorm || !lidNorm) continue;
+                    const idNorm  = normalizeJid(c.id);
+                    const lidNorm = normalizeJid(c.lid);
+                    if (!idNorm || !lidNorm) continue;
 
-                        // Determina qual campo é o LID e qual é o número de telefone
-                        // baseado no sufixo do JID (regra de negócio: @lid = LID, @s.whatsapp.net = PN)
-                        let finalLid, finalPn;
-                        if (idNorm.includes('@lid')) {
-                            // Sentido A: c.id é o LID, c.lid é o número (menos comum)
-                            finalLid = idNorm;
-                            finalPn  = lidNorm;
-                        } else {
-                            // Sentido B (padrão): c.id é o número, c.lid é o LID
-                            finalPn  = idNorm;
-                            finalLid = lidNorm;
-                        }
+                    let finalLid, finalPn;
+                    if (idNorm.includes('@lid')) {
+                        finalLid = idNorm;
+                        finalPn  = lidNorm;
+                    } else {
+                        finalPn  = idNorm;
+                        finalLid = lidNorm;
+                    }
 
-                        // Só persiste se o par faz sentido (PN deve ser @s.whatsapp.net)
-                        if (finalPn.includes('@s.whatsapp.net') || finalPn.includes('@g.us')) {
-                            const { error } = await supabase.rpc('link_identities', {
-                                p_lid: finalLid,
-                                p_phone: finalPn,
-                                p_company_id: companyId
-                            });
-                            if (error) throw error;
-                        }
-                    } catch (e) {
-                        console.warn(`⚠️  [FASE 1] Falha no LID embutido (${c.id}):`, e.message);
+                    if (finalPn.includes('@s.whatsapp.net') || finalPn.includes('@g.us')) {
+                        lidBatch.push({
+                            lid_jid: finalLid,
+                            phone_jid: finalPn,
+                            company_id: companyId
+                        });
                     }
                 }
-                console.log(`✅ [FASE 1] ${contactsWithLid.length} mapeamentos LID embutidos processados.`);
+
+                if (lidBatch.length > 0) {
+                    try {
+                        const { error } = await supabase
+                            .from('identity_map')
+                            .upsert(lidBatch, { onConflict: 'lid_jid, company_id' });
+                        if (error) throw error;
+                        console.log(`✅ [FASE 1] ${lidBatch.length} mapeamentos LID embutidos processados via Bulk.`);
+                    } catch (e) {
+                        console.error(`❌ [FASE 1] Falha no Bulk Upsert LID embutidos:`, e.message);
+                    }
+                }
             }
         }
 
