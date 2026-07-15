@@ -203,7 +203,7 @@ export const internalProcessAI = async (messageData) => {
         }
     }
 
-    const lockKey = `${company_id}:${remote_jid}:${id}`;
+    const lockKey = `${company_id}:${msgSessionId}:${remote_jid}:${id}`;
     if (processingLock.has(lockKey)) {
         console.log("   ❌ Bloqueio: Em processamento.");
         return;
@@ -300,10 +300,14 @@ export const internalProcessAI = async (messageData) => {
     const [agentsRes, companyRes, historyRes] = await Promise.all([
         supabase.from('agents').select('*').eq('company_id', company_id).eq('is_active', true),
         supabase.from('companies').select('ai_config').eq('id', company_id).single(),
-        supabase.from('messages').select('content, from_me, message_type, transcription, created_at').eq('company_id', company_id).eq('remote_jid', remote_jid).eq('from_me', false).neq('whatsapp_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle()
+        supabase.from('messages').select('content, from_me, message_type, transcription, created_at').eq('company_id', company_id).eq('session_id', msgSessionId).eq('remote_jid', remote_jid).eq('from_me', false).neq('whatsapp_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
-    const activeAgents = agentsRes.data || [];
+    // 🛡️ Filtra agentes vinculados a instâncias específicas (se configurado), sem quebrar globais
+    const activeAgents = (agentsRes.data || []).filter(a => {
+        if (!a.instance_ids || a.instance_ids.length === 0) return true;
+        return a.instance_ids.includes(msgSessionId);
+    });
     const lastMsgDate = historyRes.data?.created_at || null;
     const companyConfig = companyRes.data?.ai_config;
 
@@ -361,6 +365,7 @@ export const internalProcessAI = async (messageData) => {
             .from('messages')
             .select('content, from_me, message_type, transcription')
             .eq('company_id', company_id)
+            .eq('session_id', msgSessionId)
             .eq('remote_jid', remote_jid)
             .neq('whatsapp_id', id)
             .order('created_at', { ascending: false })

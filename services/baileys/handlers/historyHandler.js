@@ -207,6 +207,26 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         // --- PERSISTÊNCIA DA FASE 2 (Upsert Massivo) ---
         const bulkPayload = [];
         
+        // 🛡️ SILENT SYNC: Consulta contatos existentes para evitar sobrescrever status de triagem
+        const jidsArray = Array.from(contactsMap.keys());
+        const BATCH_QUERY = 500;
+        const currentIgnoredMap = new Map();
+        
+        for (let i = 0; i < jidsArray.length; i += BATCH_QUERY) {
+             const chunk = jidsArray.slice(i, i + BATCH_QUERY);
+             try {
+                 const { data: dbContacts } = await supabase.from('contacts')
+                     .select('jid, is_ignored')
+                     .eq('company_id', companyId)
+                     .in('jid', chunk);
+                 if (dbContacts) {
+                     dbContacts.forEach(c => currentIgnoredMap.set(c.jid, c.is_ignored));
+                 }
+             } catch (err) {
+                 console.error("❌ Erro ao consultar is_ignored:", err.message);
+             }
+        }
+        
         for (const [jid, data] of contactsMap.entries()) {
              const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
              const contactData = {
@@ -215,6 +235,11 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 company_id: companyId,
                 updated_at: new Date()
             };
+
+            // SILENT SYNC: Se não existia no banco, inicia como ignorado para não poluir o ChatList
+            if (currentIgnoredMap.get(jid) === undefined) {
+                 contactData.is_ignored = true;
+            }
 
             if (data.isFromBook) {
                 contactData.name = data.name;
