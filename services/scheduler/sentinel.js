@@ -349,11 +349,14 @@ export const internalProcessAI = async (messageData) => {
 
         // 🛡️ MODEL SELECTOR: Usa modelo configurado pela empresa, com fallback para o
         // modelo estável de produção. Modelos -preview são PROIBIDOS em produção.
-        const STABLE_DEFAULT_MODEL = 'gemini-2.0-flash';
+        const STABLE_DEFAULT_MODEL = 'gemini-3.5-flash'; // Modelo atual de altíssima performance e velocidade
         const PREVIEW_PATTERN = /preview/i;
         let activeModel = STABLE_DEFAULT_MODEL;
+        
         if (companyConfig?.model && !PREVIEW_PATTERN.test(companyConfig.model)) {
-            activeModel = companyConfig.model;
+            // Fix backward compatibility: Migra automaticamente versões antigas descontinuadas (1.5, 2.0)
+            const oldModels = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-2.0-pro'];
+            activeModel = oldModels.includes(companyConfig.model) ? STABLE_DEFAULT_MODEL : companyConfig.model;
         }
 
         const ai = getAIClient(activeApiKey);
@@ -451,8 +454,8 @@ export const internalProcessAI = async (messageData) => {
 
                     // Na 3ª tentativa, downgrade para modelo mais leve
                     if (retryCount === 2) {
-                        console.warn(`   🔄 [GEMINI] Downgrade para gemini-1.5-flash por sobrecarga persistente.`);
-                        activeModel = 'gemini-1.5-flash';
+                        console.warn(`   🔄 [GEMINI] Downgrade para gemini-3.1-flash-lite por sobrecarga persistente.`);
+                        activeModel = 'gemini-3.1-flash-lite';
                     }
                     return generateWithRetry(currentContents, retryCount + 1);
                 }
@@ -469,15 +472,14 @@ export const internalProcessAI = async (messageData) => {
                 }
 
                 if (is429) {
-                    // Esgotou todas as tentativas de 429: tenta fallback para gemini-1.5-flash (quota separada).
-                    // Se também falhar, aborta silenciosamente para não derrubar a fila.
-                    if (activeModel !== 'gemini-1.5-flash') {
-                        console.warn(`   🔄 [GEMINI 429] Tentando fallback para gemini-1.5-flash (quota separada)...`);
-                        activeModel = 'gemini-1.5-flash';
+                    // Esgotou todas as tentativas de 429: tenta fallback para modelo Lite (quota separada).
+                    if (activeModel !== 'gemini-3.1-flash-lite') {
+                        console.warn(`   🔄 [GEMINI 429] Tentando fallback para gemini-3.1-flash-lite (quota separada)...`);
+                        activeModel = 'gemini-3.1-flash-lite';
                         await delay(5000); // Pausa curta antes de tentar o modelo alternativo
                         return generateWithRetry(currentContents, 0); // Reinicia contagem de retries com novo modelo
                     }
-                    // Se já está em gemini-1.5-flash e ainda está em 429, desiste:
+                    // Se já está no modelo Lite e ainda está em 429, desiste:
                     console.error(`   ❌ [GEMINI 429] Rate Limit persistente em ambos os modelos. Abortando sem derrubar a fila.`);
                     Logger.error?.('sentinel', `Rate Limit 429 Fatal (ambos modelos)`, { aviso: 'Resposta abortada silenciosamente.' }, company_id);
                     return null;
