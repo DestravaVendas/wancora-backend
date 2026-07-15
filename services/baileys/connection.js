@@ -247,8 +247,8 @@ export const startSession = async (sessionId, companyId) => {
                     await redis.del(`retry:${sessionId}:${key}`);
                 }
             } : undefined,
-            // ANTI-BAN: Simula navegador Desktop real (Mandatório macOS para stealth) (§2.1 + §18)
-            browser: Browsers.macOS("Desktop"), 
+            // ANTI-BAN: Atualizado para Ubuntu Chrome (Evita erro 428 de handshake do WhatsApp na v2.3000+)
+            browser: ['Ubuntu', 'Chrome', '20.0.04'], 
             syncFullHistory: true, 
             // ANTI-BAN: Comportamento humano — aparece online ao conectar (§2.1)
             markOnlineOnConnect: true,
