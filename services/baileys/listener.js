@@ -42,35 +42,8 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     sock.ev.on('presence.update', (update) => handlePresenceUpdate(update, companyId));
     
     sock.ev.on('contacts.upsert', async (contacts) => {
-        // 1. Mantém a rotina original de salvar contatos
+        // 1. Mantém a rotina original de salvar contatos (Que agora também gerencia LID internamente via upsertContact)
         handleContactsUpsert(contacts, companyId);
-        
-        // 2. 🛡️ [MAPA DE IDENTIDADE] O WhatsApp entrega a relação LID <-> Phone aqui (Bulk Upsert)
-        try {
-            const batch = contacts.filter(c => c.id && c.lid);
-            if (batch.length > 0) {
-                const upsertData = batch.map(contact => {
-                    const cleanPhone = contact.id.replace(/:[0-9]+@/, '@'); // Remove porta de dispositivo
-                    const cleanLid = contact.lid.replace(/:[0-9]+@/, '@');
-                    return {
-                        lid_jid: cleanLid,
-                        phone_jid: cleanPhone,
-                        company_id: companyId
-                    };
-                });
-
-                console.log(`🔗 [LISTENER] Gravando Bulk de LID mappings: ${upsertData.length} itens...`);
-                const { error: upsertError } = await supabase
-                    .from('identity_map')
-                    .upsert(upsertData, { onConflict: 'lid_jid, company_id' });
-
-                if (upsertError) {
-                    console.error("❌ [LISTENER] Bulk Upsert identity_map Error:", upsertError.message);
-                }
-            }
-        } catch (e) {
-            console.error("❌ [LISTENER] Erro no mapeamento de LID:", e.message);
-        }
     });
     
     sock.ev.on('contacts.update', async (updates) => {

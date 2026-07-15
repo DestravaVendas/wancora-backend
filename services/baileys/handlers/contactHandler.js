@@ -118,7 +118,8 @@ export const handleContactsUpsert = async (contacts, companyId) => {
                 jid: jid,
                 phone: purePhone,
                 company_id: companyId,
-                updated_at: new Date()
+                updated_at: new Date(),
+                is_ignored: true // 🛡️ SILENT SYNC: Força como ignorado no bulk inicial para a Triagem
             };
 
             if (isFromBook) contactData.name = bestName;
