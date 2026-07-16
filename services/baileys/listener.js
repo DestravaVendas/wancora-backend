@@ -104,9 +104,23 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
     });
 
     // 6. ETIQUETAS (LABELS) DO WHATSAPP BUSINESS
-    sock.ev.on('labels.edit', async (labelEvent) => {
-        console.log(`🏷️ [LISTENER] Evento de etiqueta recebido:`, labelEvent);
-        // Opcional: Pode-se criar uma tabela `wa_labels_metadata` para armazenar o nome/cor real da etiqueta.
+    sock.ev.on('labels.edit', async (label) => {
+        console.log(`🏷️ [LISTENER] Evento de etiqueta recebido:`, label);
+        try {
+            if (label.deleted) {
+                await supabase.from('wa_labels').delete().eq('company_id', companyId).eq('label_id', label.id);
+            } else {
+                await supabase.from('wa_labels').upsert({
+                    company_id: companyId,
+                    label_id: label.id,
+                    name: label.name,
+                    color: label.color,
+                    updated_at: new Date()
+                }, { onConflict: 'company_id, label_id' });
+            }
+        } catch (e) {
+            console.error("❌ Erro ao atualizar etiqueta:", e.message);
+        }
     });
 
     sock.ev.on('labels.association', async ({ type, association }) => {

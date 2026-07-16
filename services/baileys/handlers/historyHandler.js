@@ -51,14 +51,14 @@ const fetchProfilePicsInBackground = async (sock, contacts, companyId) => {
 //
 // Isso garante que nenhuma chave estrangeira (contact_jid) seja violada.
 // =============================================================================
-export const handleHistorySync = async ({ contacts, messages, isLatest, progress, lidPnMappings }, sock, sessionId, companyId, chunkCounter) => {
+export const handleHistorySync = async ({ contacts, messages, isLatest, progress, lidPnMappings, labels, labelAssociations }, sock, sessionId, companyId, chunkCounter) => {
     
     const chunkKey = `${sessionId}-chunk-${chunkCounter}`;
     if (processedHistoryChunks.has(chunkKey)) return;
     processedHistoryChunks.add(chunkKey);
 
     const estimatedProgress = progress || Math.min(10 + (chunkCounter * 2), 95);
-    console.log(`📚 [SYNC] Lote ${chunkCounter} | LID-PN Maps: ${lidPnMappings?.length || 0} | Contatos Brutos: ${contacts?.length || 0} | Msgs: ${messages?.length || 0}`);
+    console.log(`📚 [SYNC] Lote ${chunkCounter} | LID-PN Maps: ${lidPnMappings?.length || 0} | Contatos Brutos: ${contacts?.length || 0} | Msgs: ${messages?.length || 0} | Labels: ${labels?.length || 0} | Label Assocs: ${labelAssociations?.length || 0}`);
     
     await updateSyncStatus(sessionId, 'importing_contacts', estimatedProgress);
 
@@ -146,7 +146,59 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         }
 
         // =====================================================================
-        // FASE 2: UPSERT MASSIVO DE CONTACTS (Manual §11.1)
+        // FASE 1.5: LABELS E ASSOCIAÇÕES (WhatsApp Business)
+        // =====================================================================
+        if (labels && labels.length > 0) {
+            console.log(`🏷️  [FASE 1.5] Sincronizando ${labels.length} Etiquetas...`);
+            const labelBatch = labels.map(lbl => ({
+                company_id: companyId,
+                label_id: lbl.id,
+                name: lbl.name,
+                color: lbl.color,
+                updated_at: new Date()
+            }));
+            try {
+                await supabase.from('wa_labels').upsert(labelBatch, { onConflict: 'company_id, label_id' });
+            } catch (e) {
+                console.error("❌ Erro ao sincronizar Etiquetas:", e.message);
+            }
+        }
+
+        if (labelAssociations && labelAssociations.length > 0) {
+            console.log(`🏷️  [FASE 1.5] Sincronizando ${labelAssociations.length} Associações de Etiquetas...`);
+            
+            // Agrupar as associações por chat (JID)
+            const chatLabels = new Map();
+            for (const assoc of labelAssociations) {
+                if (assoc.type === 'chat' && assoc.chatId && assoc.labelId) {
+                    const jid = normalizeJid(assoc.chatId);
+                    if (!chatLabels.has(jid)) chatLabels.set(jid, new Set());
+                    chatLabels.get(jid).add(assoc.labelId);
+                }
+            }
+
+            for (const [jid, labelSet] of chatLabels.entries()) {
+                try {
+                    const { data } = await supabase.from('contacts').select('wa_labels').eq('jid', jid).eq('company_id', companyId).maybeSingle();
+                    let currentLabels = data?.wa_labels || [];
+                    let changed = false;
+                    for (const lbl of labelSet) {
+                        if (!currentLabels.includes(lbl)) {
+                            currentLabels.push(lbl);
+                            changed = true;
+                        }
+                    }
+                    if (changed) {
+                        await supabase.from('contacts').update({ wa_labels: currentLabels }).eq('jid', jid).eq('company_id', companyId);
+                    }
+                } catch (e) {
+                    console.error("❌ Erro ao associar etiqueta ao contato:", jid, e.message);
+                }
+            }
+        }
+
+        // =====================================================================
+        // FASE 2: IMPORTAÇÃO DE CONTATOS (Agenda e PushNames)
         //
         // Todos os contacts devem estar no banco ANTES de qualquer mensagem
         // ser processada. Inclui dois sub-passos:
