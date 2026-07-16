@@ -236,9 +236,13 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 updated_at: new Date()
             };
 
-            // SILENT SYNC: Se não existia no banco, inicia como ignorado para não poluir o ChatList
+            // SILENT SYNC: Se não existia no banco, inicia como ignorado para não poluir o ChatList (exceto grupos)
             if (currentIgnoredMap.get(jid) === undefined) {
-                 contactData.is_ignored = true;
+                 if (jid.includes('@g.us')) {
+                     contactData.is_ignored = false;
+                 } else {
+                     contactData.is_ignored = true;
+                 }
             }
 
             if (data.isFromBook) {

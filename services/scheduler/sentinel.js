@@ -120,7 +120,7 @@ const ALL_TOOLS = [
             properties: {
                 title: { type: Type.STRING, description: "Título do evento." },
                 dateISO: { type: Type.STRING, description: "Data e hora exata acordada em formato ISO 8601 (ex: 2026-04-16T14:30:00). Nunca use propriedades 'date' e 'time' separadas." },
-                description: { type: Type.STRING, description: "Detalhes e pauta do agendamento." }
+                description: { type: Type.STRING, description: "OBRIGATÓRIO: Crie um mini-dossiê/relatório rico. Inclua o problema relatado pelo cliente, dores identificadas, serviço desejado, nome da empresa (se houver) e o contexto que motivou o agendamento." }
             },
             required: ["title", "dateISO"]
         }
@@ -178,13 +178,26 @@ const matchAgent = (content, lead, lastMsgDate, agents) => {
 // 🛡️ NOVO GATILHO DIRETO (Sem Memory-Limit)
 // Acionada exclusivamente pelo aiWorker (BullMQ) para processamento resiliente.
 export const internalProcessAI = async (messageData) => {
-    const { whatsapp_id: id, content, remote_jid, company_id, from_me, message_type, transcription, created_at, session_id: msgSessionId } = messageData;
+    let { whatsapp_id: id, content, remote_jid, company_id, from_me, message_type, transcription, created_at, session_id: msgSessionId } = messageData;
 
     console.log(`\n🔔 [RAIO-X SENTINEL] Processando:`, id);
 
-    // O [TIME GUARDIAN] foi movido mais para baixo após sabermos qual agente deu match.
+    // 🛡️ [CONCURRENCY LOCK] Impede que a IA processe o mesmo lead ao mesmo tempo
+    if (processingLock.has(remote_jid)) {
+        console.warn(`   ⚠️ [SENTINEL LOCK] O lead ${remote_jid} já está sendo processado. Lançando erro para re-enfileirar no BullMQ.`);
+        throw new Error('CONCURRENCY_LOCK');
+    }
+    processingLock.add(remote_jid);
 
-    // 🛡️ [ESTABILIDADE] Bloqueio de mensagens vazias ou não descriptografadas
+    try {
+        // O [TIME GUARDIAN] foi movido mais para baixo após sabermos qual agente deu match.
+
+        // Tratamento de Mídias (Visão IA)
+        if (['image', 'video', 'document', 'sticker'].includes(message_type)) {
+            content = "[Mídia recebida. A IA não consegue visualizar este arquivo de mídia. Diga ao usuário de forma amigável e simpática que não consegue ver o que ele enviou, e peça para descrever em áudio ou texto]";
+        }
+
+        // 🛡️ [ESTABILIDADE] Bloqueio de mensagens vazias ou não descriptografadas
     if (!content && !transcription) {
         console.log(`   ⚠️ [SENTINEL] Mensagem ${id} sem conteúdo ou transcrição. Ignorando.`);
         return;
@@ -402,10 +415,11 @@ export const internalProcessAI = async (messageData) => {
 
         // Consciência Temporal (Dia da semana + Data completa)
         const agora = new Date();
+        const fusoHorario = agent?.flow_config?.business_hours?.timezone || 'America/Sao_Paulo';
         const dataCompleta = agora.toLocaleDateString('pt-BR', {
-            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+            timeZone: fusoHorario, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
         });
-        const horaCompleta = agora.toLocaleTimeString('pt-BR');
+        const horaCompleta = agora.toLocaleTimeString('pt-BR', { timeZone: fusoHorario });
 
         // 🛡️ [ISOLAMENTO CRÍTICO] Instrução de Bolha: Garante que a IA saiba exatamente com quem fala
         systemInstruction += `\n\n[DIRETRIZ DE ISOLAMENTO]\nVocê está em uma conversa PRIVADA e ISOLADA com o cliente "${lead.name}".\nNUNCA mencione outros clientes ou misture contextos.\nTrate esta conversa como uma bolha única.`;
@@ -736,6 +750,8 @@ export const internalProcessAI = async (messageData) => {
                 Logger.error('sentinel', `Erro Fatal na IA`, { error: error.message }, company_id);
             }
         }
+    } finally {
+        processingLock.delete(remote_jid);
     }
 };
 

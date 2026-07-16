@@ -38,7 +38,7 @@ const processNextRAM = async (sessionId) => {
 
     try {
         await withTimeout(
-            handleMessage(task.msg, task.sock, task.companyId, task.sessionId, task.isRealtime),
+            handleMessage(task.msg, task.sock, task.companyId, task.sessionId, task.isRealtime, null, { fetchProfilePic: task.isRealtime }),
             TASK_TIMEOUT_MS,
             `msg:${task.msg.key?.id}`
         );
@@ -107,7 +107,7 @@ if (redisConnection && shouldRunWorker) {
         }
 
         await withTimeout(
-            handleMessage(msg, session.sock, companyId, sessionId, isRealtime),
+            handleMessage(msg, session.sock, companyId, sessionId, isRealtime, null, { fetchProfilePic: isRealtime }),
             TASK_TIMEOUT_MS,
             `msg:${msg.key?.id}`
         );

@@ -119,7 +119,7 @@ export const handleContactsUpsert = async (contacts, companyId) => {
                 phone: purePhone,
                 company_id: companyId,
                 updated_at: new Date(),
-                is_ignored: true // 🛡️ SILENT SYNC: Força como ignorado no bulk inicial para a Triagem
+                is_ignored: !jid.includes('@g.us') // 🛡️ SILENT SYNC: Força como ignorado no bulk inicial para a Triagem (exceto grupos)
             };
 
             if (isFromBook) contactData.name = bestName;

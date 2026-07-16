@@ -102,4 +102,40 @@ export const setupListeners = ({ sock, sessionId, companyId }) => {
             console.error(`❌ [LISTENER] Falha no chunk ${currentChunk} da fila de histórico:`, err.message);
         });
     });
+
+    // 6. ETIQUETAS (LABELS) DO WHATSAPP BUSINESS
+    sock.ev.on('labels.edit', async (labelEvent) => {
+        console.log(`🏷️ [LISTENER] Evento de etiqueta recebido:`, labelEvent);
+        // Opcional: Pode-se criar uma tabela `wa_labels_metadata` para armazenar o nome/cor real da etiqueta.
+    });
+
+    sock.ev.on('labels.association', async ({ type, association }) => {
+        // Quando uma etiqueta é associada a um chat/mensagem no celular
+        console.log(`🏷️ [LISTENER] Associação de etiqueta:`, type, association);
+        if (type === 'chat' && association.chatId && association.labelId) {
+             try {
+                 // Busca os labels atuais
+                 const { data } = await supabase.from('contacts').select('wa_labels').eq('jid', association.chatId).eq('company_id', companyId).maybeSingle();
+                 let labels = data?.wa_labels || [];
+                 
+                 // Pode ser 'add' ou 'remove' (ou unassociated)
+                 const action = association.type || 'add'; 
+                 let changed = false;
+
+                 if (action === 'add' && !labels.includes(association.labelId)) {
+                     labels.push(association.labelId);
+                     changed = true;
+                 } else if (action === 'remove' && labels.includes(association.labelId)) {
+                     labels = labels.filter(id => id !== association.labelId);
+                     changed = true;
+                 }
+
+                 if (changed) {
+                     await supabase.from('contacts').update({ wa_labels: labels }).eq('jid', association.chatId).eq('company_id', companyId);
+                 }
+             } catch (e) {
+                 console.error("❌ Erro ao salvar associação de etiqueta:", e);
+             }
+        }
+    });
 };

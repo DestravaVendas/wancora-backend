@@ -150,37 +150,41 @@ const processReminders = async () => {
                 const recipients = [];
                 // 1. Lead Principal
                 if (app.leads?.phone) {
-                    recipients.push({ name: app.leads.name, phone: app.leads.phone });
+                    const { data: contactData } = await supabase.from('contacts').select('jid').eq('phone', app.leads.phone).eq('company_id', app.company_id).maybeSingle();
+                    recipients.push({ name: app.leads.name, phone: app.leads.phone, jid: contactData?.jid });
                 }
                 // 2. Convidados Manuais (JSONB)
                 if (app.guests && Array.isArray(app.guests)) {
-                    app.guests.forEach(g => {
+                    for (const g of app.guests) {
                         const p = cleanPhone(g.phone);
-                        // Evita duplicatas se o convidado for o próprio lead
                         if (p && !recipients.find(r => cleanPhone(r.phone) === p)) {
-                            recipients.push({ name: g.name, phone: g.phone });
+                            const { data: guestContact } = await supabase.from('contacts').select('jid').eq('phone', p).eq('company_id', app.company_id).maybeSingle();
+                            recipients.push({ name: g.name, phone: g.phone, jid: guestContact?.jid });
                         }
-                    });
+                    }
                 }
 
                 // D. Disparos
 
                 // --- 1. Para Clientes/Convidados (On Booking) ---
-                const leadTrigger = config.lead_notifications?.find(n => n.type === 'on_booking' && n.active);
-                if (leadTrigger && recipients.length > 0) {
-                     for (const r of recipients) {
-                         const phone = cleanPhone(r.phone);
-                         if(phone) {
-                             const msg = formatMessage(leadTrigger.template, app, ruleData, r.name, r.phone);
-                             await sendMessage({ 
-                                 sessionId, 
-                                 to: `${phone}@s.whatsapp.net`, 
-                                 type: 'text', 
-                                 content: msg, 
-                                 companyId: app.company_id 
-                             }).catch(e => console.error(`[Agenda] Falha envio para ${phone}:`, e.message));
+                if (app.origin === 'public_link') {
+                    const leadTrigger = config.lead_notifications?.find(n => n.type === 'on_booking' && n.active);
+                    if (leadTrigger && recipients.length > 0) {
+                         for (const r of recipients) {
+                             const phone = cleanPhone(r.phone);
+                             if(phone) {
+                                 const toJid = r.jid || `${phone}@s.whatsapp.net`;
+                                 const msg = formatMessage(leadTrigger.template, app, ruleData, r.name, r.phone);
+                                 await sendMessage({ 
+                                     sessionId, 
+                                     to: toJid, 
+                                     type: 'text', 
+                                     content: msg, 
+                                     companyId: app.company_id 
+                                 }).catch(e => console.error(`[Agenda] Falha envio para ${phone}:`, e.message));
+                             }
                          }
-                     }
+                    }
                 }
 
                 // --- 2. Para Admin (On Booking) ---
@@ -249,20 +253,27 @@ const processReminders = async () => {
                 }
 
                 const recipients = [];
-                if (app.leads?.phone) recipients.push({ name: app.leads.name, phone: app.leads.phone });
+                // 1. Lead Principal
+                if (app.leads?.phone) {
+                    const { data: contactData } = await supabase.from('contacts').select('jid').eq('phone', app.leads.phone).eq('company_id', app.company_id).maybeSingle();
+                    recipients.push({ name: app.leads.name, phone: app.leads.phone, jid: contactData?.jid });
+                }
+                // 2. Convidados Manuais
                 if (app.guests && Array.isArray(app.guests)) {
-                    app.guests.forEach(g => {
+                    for (const g of app.guests) {
                         const p = cleanPhone(g.phone);
                         if (p && !recipients.find(r => cleanPhone(r.phone) === p)) {
-                            recipients.push({ name: g.name, phone: g.phone });
+                            const { data: guestContact } = await supabase.from('contacts').select('jid').eq('phone', p).eq('company_id', app.company_id).maybeSingle();
+                            recipients.push({ name: g.name, phone: g.phone, jid: guestContact?.jid });
                         }
-                    });
+                    }
                 }
 
                 if (!config || !config.lead_notifications || recipients.length === 0) continue;
 
                 const leadReminders = config.lead_notifications.filter(n => n.type === 'before_event' && n.active);
-                if (leadReminders.length === 0) continue;
+                // Bloqueia Lembretes para Leads se a origem não for a página pública (Regra do Cliente)
+                if (leadReminders.length === 0 || app.origin !== 'public_link') continue;
 
                 // 🧠 STATE BAG: Lê quais IDs de regra já foram disparados neste agendamento.
                 // Persiste em custom_notification_config._sent_rule_ids (array de strings).
@@ -296,12 +307,13 @@ const processReminders = async () => {
                         for (const r of recipients) {
                             const leadPhone = cleanPhone(r.phone);
                             if (!leadPhone) continue;
-
+                            
+                            const toJid = r.jid || `${leadPhone}@s.whatsapp.net`;
                             const msg = formatMessage(rule.template, app, ruleData, r.name, r.phone);
                             try {
                                 await sendMessage({
                                     sessionId,
-                                    to: `${leadPhone}@s.whatsapp.net`,
+                                    to: toJid,
                                     type: 'text',
                                     content: msg,
                                     companyId: app.company_id

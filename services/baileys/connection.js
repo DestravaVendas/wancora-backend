@@ -380,17 +380,20 @@ export const startSession = async (sessionId, companyId) => {
                 
                 const { data: prev } = await supabase
                     .from('instances')
-                    .select('sync_status')
+                    .select('sync_status, name')
                     .eq('session_id', sessionId)
                     .single();
 
                 const updatePayload = {
                     status: 'connected',
                     qrcode_url: null,
-                    name: sock.user?.name || sock.user?.verifiedName || null,
                     profile_pic_url: sock.user?.imgUrl || null,
                     is_business_account: isBiz
                 };
+
+                if (!prev?.name || prev.name.trim() === '') {
+                    updatePayload.name = sock.user?.name || sock.user?.verifiedName || null;
+                }
 
                 // Se já estava completo, mantém. Se não, reseta para importar.
                 if (prev?.sync_status !== 'completed') {
