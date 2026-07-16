@@ -340,7 +340,6 @@ export const internalProcessAI = async (messageData) => {
     console.log(`   🚀 Agente Acionado: ${agent.name} (${reason})`);
     Logger.info('sentinel', `Agente: ${agent.name}`, { lead: phone, trigger: reason }, company_id);
 
-    try {
         // 🛡️ [KEY RESOLVER] Prioridade: DB (se preenchida) > API_KEY env > GEMINI_API_KEY env
         // String vazia no banco é ignorada (tratada como não configurada)
         const dbApiKey = (companyConfig?.apiKey || '').trim();
