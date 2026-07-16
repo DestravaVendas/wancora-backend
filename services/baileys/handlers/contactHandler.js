@@ -87,14 +87,6 @@ export const handleContactsUpsert = async (contacts, companyId) => {
             const jid = normalizeJid(c.id);
             if (!jid) continue;
 
-            if (c.lid) {
-                supabase.rpc('link_identities', {
-                    p_lid: normalizeJid(c.lid),
-                    p_phone: jid,
-                    p_company_id: companyId
-                }).then(({ error }) => { if (error) console.error("❌ [CONTACT] RPC Error:", error.message); }).catch(() => {});
-            }
-
             const bestName = c.name || c.notify || c.verifiedName;
             const isFromBook = !!c.name;
 
