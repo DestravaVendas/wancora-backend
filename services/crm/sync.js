@@ -171,10 +171,31 @@ export const ensureLeadExists = async (jid, companyId, pushName, myJid) => {
         if (cleanMyJid && cleanJid === cleanMyJid) return null;
     }
 
-    const purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
+    let purePhone = cleanJid.split('@')[0].replace(/\D/g, '');
     
-    // LIDs possuem numerações criptográficas acima de 15 dígitos. Telefones normais devem estar entre 8 e 15.
-    if (!isLid && (purePhone.length < 8 || purePhone.length > 15)) return null;
+    // 🛡️ CORREÇÃO DE LID: Tenta resolver o LID no banco antes de prosseguir
+    if (isLid) {
+        try {
+            const { data: idMap } = await supabase.from('identity_map')
+                .select('phone_jid')
+                .eq('company_id', companyId)
+                .eq('lid_jid', cleanJid)
+                .maybeSingle();
+            
+            if (idMap && idMap.phone_jid) {
+                purePhone = idMap.phone_jid.split('@')[0].replace(/\D/g, '');
+            } else {
+                // Se for um LID e não conseguimos mapear para um número real, não criamos um lead
+                // pois o CRM exige números de telefone reais.
+                return null;
+            }
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Telefones normais devem estar entre 8 e 15 dígitos.
+    if (purePhone.length < 8 || purePhone.length > 15) return null;
 
     
     // 🛡️ LOCK: Evita que duas mensagens do mesmo lead criem dois registros no Supabase

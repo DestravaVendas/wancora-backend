@@ -225,7 +225,27 @@ export const internalProcessAI = async (messageData) => {
     // 🛡️ Aumentamos a tranca para 60s, pois agora a IA vai "demorar" muito tempo agindo como humano
     setTimeout(() => processingLock.delete(lockKey), 60000);
 
-    const phone = remote_jid.split('@')[0].replace(/\D/g, '');
+    let searchPhone = remote_jid.split('@')[0].replace(/\D/g, '');
+    
+    // 🛡️ CORREÇÃO DE LID: Se for LID, busca o telefone real no identity_map
+    if (remote_jid.includes('@lid')) {
+        try {
+            const { data: idMap } = await supabase.from('identity_map')
+                .select('phone_jid')
+                .eq('company_id', company_id)
+                .eq('lid_jid', remote_jid)
+                .maybeSingle();
+                
+            if (idMap && idMap.phone_jid) {
+                searchPhone = idMap.phone_jid.split('@')[0].replace(/\D/g, '');
+                console.log(`   🗺️ LID Resolvido: ${remote_jid} -> ${searchPhone}`);
+            }
+        } catch (e) {
+            console.error("   ❌ Erro ao resolver LID no Sentinel:", e.message);
+        }
+    }
+
+    const phone = searchPhone;
     console.log(`   🔍 Buscando Lead: ${phone}...`);
 
     // 🛡️ [SEGURANÇA] Busca exata para evitar match parcial de números (Ex: 123 matching 55123)

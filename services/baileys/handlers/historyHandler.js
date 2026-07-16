@@ -228,13 +228,14 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         }
         
         for (const [jid, data] of contactsMap.entries()) {
-             const purePhone = jid.split('@')[0].replace(/\D/g, ''); 
+             const isRealPhone = jid.includes('@s.whatsapp.net');
+             const purePhone = isRealPhone ? jid.split('@')[0].replace(/\D/g, '') : null; 
              const contactData = {
                 jid: jid,
-                phone: purePhone,
                 company_id: companyId,
                 updated_at: new Date()
             };
+            if (purePhone) contactData.phone = purePhone;
 
             // SILENT SYNC: Se não existia no banco, inicia como ignorado para não poluir o ChatList (exceto grupos)
             if (currentIgnoredMap.get(jid) === undefined) {
@@ -249,6 +250,7 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
                 contactData.name = data.name;
             } else if (data.name) {
                 contactData.push_name = data.name;
+                contactData.name = data.name; // Prioriza push_name para não deixar nulo
             }
 
             if (data.imgUrl) {
