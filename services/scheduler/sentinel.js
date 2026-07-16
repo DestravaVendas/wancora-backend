@@ -720,8 +720,7 @@ export const internalProcessAI = async (messageData) => {
             } else {
                 console.log("   ❌ ERRO: Sessão não encontrada.");
             }
-        }
-
+        } // Fecha if (finalReply)
 
     } catch (error) {
         console.error("\n   ❌ [ERRO CRÍTICO NA EXECUÇÃO DA IA]:", error);
