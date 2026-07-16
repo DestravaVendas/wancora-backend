@@ -334,114 +334,18 @@ export const handleHistorySync = async ({ contacts, messages, isLatest, progress
         }
 
         // =====================================================================
-        // FASE 3: CHATS E MENSAGENS (Manual §11.1 — Só após Fase 2)
-        //
-        // Executada SOMENTE após os contacts estarem no banco.
-        // Isso garante que a FK (contact_jid → contacts.jid) nunca seja violada.
+        // FASE 3: CHATS E MENSAGENS (DESATIVADO)
+        // 
+        // [AMPUTADO CIRURGICAMENTE POR SOLICITAÇÃO DO USUÁRIO]
+        // Mensagens históricas não são mais baixadas nem processadas para
+        // acelerar absurdamente o login e impedir banimentos/quedas de rede (fetch failed/ETIMEDOUT).
+        // Apenas atualizamos a barrinha visual de sincronização.
         // =====================================================================
 
         if (messages && messages.length > 0) {
             await updateSyncStatus(sessionId, 'importing_messages', estimatedProgress + 2);
-            
-            const cutoffDate = new Date();
-            cutoffDate.setMonth(cutoffDate.getMonth() - HISTORY_MONTHS_LIMIT);
-            const cutoffTimestamp = Math.floor(cutoffDate.getTime() / 1000);
-
-            // 🛡️ [LID RESOLVER LOCAL] Mapa de resolução construído a partir dos dados
-            // já em memória das Fases 1 e 2 — zero custo de rede adicional.
-            // Garante que mensagens históricas sejam agrupadas sob o phone JID canônico
-            // desde o início, evitando split de conversa com mensagens em tempo real.
-            const localLidMap = new Map();
-            if (lidPnMappings && lidPnMappings.length > 0) {
-                for (const m of lidPnMappings) {
-                    if (m.lid && m.pn) {
-                        const normLid = normalizeJid(m.lid);
-                        const normPn  = normalizeJid(m.pn);
-                        if (normLid && normPn) localLidMap.set(normLid, normPn);
-                    }
-                }
-            }
-            // Complementa com contacts que trazem .lid embutido (duplo-sentido)
-            if (contacts && contacts.length > 0) {
-                for (const c of contacts) {
-                    if (!c.id || !c.lid) continue;
-                    const idNorm  = normalizeJid(c.id);
-                    const lidNorm = normalizeJid(c.lid);
-                    if (!idNorm || !lidNorm) continue;
-                    if (idNorm.includes('@lid'))  localLidMap.set(idNorm,  lidNorm);
-                    else if (lidNorm.includes('@lid')) localLidMap.set(lidNorm, idNorm);
-                }
-            }
-            if (localLidMap.size > 0) {
-                console.log(`🗺️  [FASE 3] LID Map local pronto: ${localLidMap.size} mapeamentos em memória.`);
-            }
-
-            const chats = {}; 
-            
-            messages.forEach(msg => {
-                let clean;
-                try { clean = unwrapMessage(msg); } catch(e) { return; } 
-
-                if (!clean.key?.remoteJid) return;
-                
-                const msgTs = Number(clean.messageTimestamp);
-                if (msgTs < cutoffTimestamp) return;
-
-                let jid = normalizeJid(clean.key.remoteJid);
-                if (!jid || jid === 'status@broadcast') return;
-
-                // 🛡️ [LID RESOLVER] Resolve @lid → phone JID usando o mapa local (sem query)
-                if (jid.includes('@lid') && localLidMap.has(jid)) {
-                    jid = localLidMap.get(jid);
-                }
-
-                if (!chats[jid]) chats[jid] = [];
-                
-                // Injeta nome resolvido — contactsMap já populado pela Fase 2, acesso seguro
-                // Testa tanto o jid resolvido quanto o original (fallback)
-                const knownContact = contactsMap.get(jid) || contactsMap.get(normalizeJid(clean.key.remoteJid));
-                clean._forcedName = knownContact?.isFromBook 
-                    ? knownContact.name 
-                    : (knownContact?.name || clean.pushName);
-                
-                chats[jid].push(clean);
-            });
-
-            let chatJids = Object.keys(chats);
-            console.log(`💬 [FASE 3] Processando ${chatJids.length} chats e suas mensagens...`);
-
-            // [NOVO] Limite de 200 conversas, priorizando as mais recentes
-            const HISTORY_CHAT_LIMIT = 200;
-            if (chatJids.length > HISTORY_CHAT_LIMIT) {
-                chatJids.sort((a, b) => {
-                    const topA = chats[a].reduce((max, msg) => Math.max(max, Number(msg.messageTimestamp) || 0), 0);
-                    const topB = chats[b].reduce((max, msg) => Math.max(max, Number(msg.messageTimestamp) || 0), 0);
-                    return topB - topA; // Decrescente (mais recente primeiro)
-                });
-                chatJids = chatJids.slice(0, HISTORY_CHAT_LIMIT);
-                console.log(`💬 [FASE 3] Limitado a ${HISTORY_CHAT_LIMIT} conversas mais recentes.`);
-            }
-
-            for (const jid of chatJids) {
-                chats[jid].sort((a, b) => (Number(a.messageTimestamp) || 0) - (Number(b.messageTimestamp) || 0)); 
-                const topMessages = chats[jid].slice(-HISTORY_MSG_LIMIT);
-                
-                const latestMsg = chats[jid][chats[jid].length - 1];
-                if (latestMsg && latestMsg.messageTimestamp) {
-                    const ts = new Date(Number(latestMsg.messageTimestamp) * 1000);
-                    // OTIMIZAÇÃO EXTREMA: Atualiza apenas a data da última mensagem para ordenar o Frontend
-                    // e DESCARTA baixar as mensagens antigas para evitar colisão e bloqueio de fila.
-                    supabase.from('contacts').update({ last_message_at: ts }).eq('company_id', companyId).eq('jid', jid).then();
-                }
-
-                // [AMPUTADO CIRURGICAMENTE]
-                // Loop de "handleMessage" histórico foi removido. 
-                // Nenhuma mensagem passada será salva no banco.
-                
-                // [OTIMIZAÇÃO] Delay mínimo mantido apenas para segurança do banco (rate limit local)
-                await sleep(10); 
-            }
-            console.log(`✅ [FASE 3] Chats e mensagens processados.`);
+            // Nenhum processamento de mensagens. O novo fluxo é Realtime (Apenas Novas Mensagens).
+            console.log(`💬 [FASE 3] Amputado: Ignorando ${messages.length} mensagens históricas a pedido do usuário.`);
         }
 
     } catch (e) {

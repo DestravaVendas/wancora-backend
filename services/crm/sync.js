@@ -102,6 +102,14 @@ export const upsertContactsBulk = async (contactsArray) => {
             if (error) throw error;
         });
     } catch (e) {
+        // Se for erro de rede crítico que nem o safeSupabaseCall salvou, não tenta 1 a 1 para não travar tudo
+        const msg = (e.message || '').toLowerCase();
+        if (msg.includes('fetch failed') || msg.includes('timeout') || msg.includes('socket')) {
+            console.error(`❌ [SYNC] Bulk upsert falhou por rede, abortando fallback para evitar loop. Erro:`, msg);
+            return;
+        }
+        
+        console.warn(`⚠️ [SYNC] Bulk upsert falhou (possível erro de constraint), tentando individual...`);
         for (const c of validContacts) {
              try {
                 await upsertContact(c.jid, c.company_id, c.name, c.profile_pic_url, !!c.name, null, c.is_business, c.verified_name, { push_name: c.push_name, is_ignored: c.is_ignored });
