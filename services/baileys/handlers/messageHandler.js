@@ -9,6 +9,7 @@ import { enqueueAIAfterDebounce } from '../../scheduler/aiQueue.js';
 import getRedisClient from '../../redisClient.js';
 import { identityResolver } from '../pipelines/identityPipeline.js';
 import { mediaPipeline } from '../pipelines/mediaPipeline.js';
+import { sessions } from '../connection.js';
 
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -146,7 +147,8 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
             status: fromMe ? 'sent' : 'delivered',
             created_at: new Date( (unwrapped.messageTimestamp || Date.now() / 1000) * 1000 ),
             participant: participantJid, 
-            lead_id: null // 🛡️ CORREÇÃO: Usar null em vez de undefined. Undefined destrói o fetch do Supabase.
+            lead_id: null,
+            ai_processed: fromMe ? true : false // 🛡️ EXPLICITO para o Recovery Watchdog
         };
 
         // [TRANSCRIÇÃO REMOVIDA DAQUI — agora é fire-and-forget no bloco acima]
@@ -188,6 +190,26 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
 
         await upsertMessage(messageData);
+
+        // 🛡️ Fire-and-forget: Atualização de Foto de Perfil em tempo real (Agenda)
+        if (isRealtime && !fromMe && !isGroup) {
+            const sock = sessions.get(sessionId);
+            if (sock) {
+                Promise.resolve().then(async () => {
+                    try {
+                        const url = await sock.profilePictureUrl(jid, 'image');
+                        if (url) {
+                            await supabase.from('contacts')
+                                .update({ profile_picture_url: url })
+                                .eq('jid', jid)
+                                .eq('company_id', companyId);
+                        }
+                    } catch (e) {
+                        // Ignora erro silenciosamente (contato sem foto ou privada)
+                    }
+                });
+            }
+        }
 
         // 🛡️ O GATILHO DA I.A: Entrega a mensagem processada direto para a fila de Debounce do BullMQ!
         if (isRealtime && !fromMe && !isGroup) {

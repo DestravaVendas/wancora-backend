@@ -18,7 +18,7 @@
 
 import { createClient } from '@supabase/supabase-js';
 import { Logger } from '../utils/logger.js';
-import { aiQueue } from '../services/scheduler/aiQueue.js';
+import { aiQueue, enqueueAIAfterDebounce } from '../services/scheduler/aiQueue.js';
 import { internalProcessAI } from '../services/scheduler/sentinel.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -86,13 +86,8 @@ const requeueMessage = async (msg) => {
         };
 
         if (aiQueue) {
-            await aiQueue.add('process_ai', payload, {
-                jobId,            // idempotente: BullMQ ignora se job com mesmo ID já existe
-                attempts: 1,      // 1 tentativa — o sentinel tem sua própria lógica de retry
-                removeOnComplete: true,
-                removeOnFail: false
-            });
-            console.log(`🔄 [WATCHDOG] Re-enfileirado: ${msg.whatsapp_id} (${resolvedJid})`);
+            await enqueueAIAfterDebounce(payload);
+            console.log(`🔄 [WATCHDOG] Re-enfileirado no Debounce: ${msg.whatsapp_id} (${resolvedJid})`);
         } else {
             // Fallback: sem Redis, executa direto (raro em produção)
             console.warn(`⚠️ [WATCHDOG] Sem Redis. Executando recovery de ${msg.whatsapp_id} na RAM.`);
@@ -180,7 +175,7 @@ const runRecoveryCheck = async () => {
             .from('messages')
             .select('whatsapp_id, company_id, remote_jid, content, message_type, transcription, session_id, created_at, ai_error, leads(bot_status)')
             .eq('from_me', false)
-            .eq('ai_processed', false)
+            .or('ai_processed.eq.false,ai_processed.is.null')
             .not('remote_jid', 'like', '%@g.us')        // Ignora grupos
             .not('remote_jid', 'like', '%@newsletter')  // Ignora newsletters
             .lte('created_at', threeMinAgo)              // Mais de 3 min (fora do debounce)
@@ -208,7 +203,7 @@ const runRecoveryCheck = async () => {
             .from('messages')
             .select('whatsapp_id, company_id, remote_jid, content, message_type, session_id, created_at, leads(bot_status)')
             .eq('from_me', false)
-            .eq('ai_processed', false)
+            .or('ai_processed.eq.false,ai_processed.is.null')
             .not('remote_jid', 'like', '%@g.us')
             .not('remote_jid', 'like', '%@newsletter')
             .lt('created_at', fifteenMinAgo)   // Mais de 15 min (passou da janela de recovery)
