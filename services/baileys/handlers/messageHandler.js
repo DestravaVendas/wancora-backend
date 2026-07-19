@@ -91,7 +91,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
 
         // --- CORREÇÃO CRÍTICA: GARANTIA DE CONTATO ---
-        if (!fromMe && !isGroup) {
+        if (!isGroup) {
             await upsertContact(jid, companyId, pushName, null, false, null, false, null, { 
                 push_name: pushName,
                 last_message_at: new Date()
@@ -110,7 +110,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
         }
         
         // --- LEAD GUARD ---
-        if (!fromMe && !isGroup) {
+        if (!isGroup) {
             const { data: contact } = await supabase.from('contacts').select('is_ignored').eq('jid', jid).eq('company_id', companyId).maybeSingle();
             if (contact?.is_ignored) {
                  // Logger.info('baileys', `[IGNORE] Msg de ${jid} ignorada (Blacklist).`, {}, companyId);
@@ -153,7 +153,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
 
         // [TRANSCRIÇÃO REMOVIDA DAQUI — agora é fire-and-forget no bloco acima]
         
-        if (!isGroup && !fromMe) {
+        if (!isGroup) {
              const purePhone = jid.split('@')[0].replace(/\D/g, '');
              let { data: lead } = await supabase.from('leads').select('id').eq('phone', purePhone).eq('company_id', companyId).maybeSingle();
              
@@ -200,7 +200,7 @@ export const handleMessage = async (msg, sock, companyId, sessionId, isRealtime 
                         const url = await sock.profilePictureUrl(jid, 'image');
                         if (url) {
                             await supabase.from('contacts')
-                                .update({ profile_picture_url: url })
+                                .update({ profile_pic_url: url })
                                 .eq('jid', jid)
                                 .eq('company_id', companyId);
                         }

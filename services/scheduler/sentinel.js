@@ -239,6 +239,8 @@ export const internalProcessAI = async (messageData) => {
             if (idMap && idMap.phone_jid) {
                 searchPhone = idMap.phone_jid.split('@')[0].replace(/\D/g, '');
                 console.log(`   🗺️ LID Resolvido: ${remote_jid} -> ${searchPhone}`);
+                // [FIX] Update remote_jid so we actually send to the real PN!
+                remote_jid = idMap.phone_jid;
             }
         } catch (e) {
             console.error("   ❌ Erro ao resolver LID no Sentinel:", e.message);
