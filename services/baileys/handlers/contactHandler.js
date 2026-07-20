@@ -1,9 +1,12 @@
 
 import { upsertContact, upsertContactsBulk, normalizeJid } from '../../crm/sync.js';
 import { createClient } from '@supabase/supabase-js';
+import getRedisClient from '../redisClient.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const presenceDebounce = new Map();
+global.aiTypingMap = global.aiTypingMap || new Map();
+const redis = getRedisClient();
 
 /**
  * Processa atualizações de presença (Online/Visto por ultimo)
@@ -33,8 +36,26 @@ export const handlePresenceUpdate = async (presenceUpdate, companyId) => {
     if (presences[presenceUpdate.id]) {
         const lastKnown = presences[presenceUpdate.id].lastKnownPresence;
         const isOnline = lastKnown === 'composing' || lastKnown === 'recording' || lastKnown === 'available';
+        const isTyping = lastKnown === 'composing' || lastKnown === 'recording';
         
-        // --- DEBOUNCE PARA EVITAR PISCAR ---
+        // --- ANTI-ATROPELAMENTO IA (TYPING DEBOUNCE) ---
+        const typingKey = `ai_typing:${companyId}:${jid}`;
+        if (isTyping) {
+            if (redis) {
+                // Seta flag de digitação com TTL de 15s (segurança)
+                redis.set(typingKey, '1', 'EX', 15).catch(() => {});
+            } else {
+                global.aiTypingMap.set(typingKey, Date.now() + 15000);
+            }
+        } else if (lastKnown === 'paused' || lastKnown === 'available' || lastKnown === 'unavailable') {
+            if (redis) {
+                redis.del(typingKey).catch(() => {});
+            } else {
+                global.aiTypingMap.delete(typingKey);
+            }
+        }
+        
+        // --- DEBOUNCE PARA EVITAR PISCAR (ONLINE/OFFLINE) ---
         // O WhatsApp as vezes manda 'unavailable' logo depois de 'available'.
         // Vamos segurar o 'unavailable' por 5 segundos. Se virar 'available' de novo, cancelamos.
         

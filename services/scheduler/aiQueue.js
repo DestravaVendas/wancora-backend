@@ -82,7 +82,31 @@ if (redisConnection && shouldRunWorker) {
                     return;
                 }
 
-                // O tempo de silêncio de 6s foi respeitado. Consolidamos as mensagens.
+                // --- ANTI-ATROPELAMENTO (TYPING DEBOUNCE) ---
+                const typingKey = `ai_typing:${company_id}:${remote_jid}`;
+                const isTyping = await redisConnection.get(typingKey);
+                
+                if (isTyping) {
+                    // O humano ainda está digitando. Adiamos a decisão por mais 5s.
+                    console.log(`⏳ [AI DEBOUNCE] Humano digitando (${remote_jid}). Reagendando envio...`);
+                    const newNow = Date.now();
+                    await redisConnection.set(timeKey, newNow.toString());
+                    await aiQueue.add('check_debounce', { 
+                        listKey, 
+                        timeKey, 
+                        remote_jid, 
+                        company_id, 
+                        timestamp: newNow 
+                    }, {
+                        delay: 5000,
+                        removeOnComplete: true,
+                        removeOnFail: true,
+                        jobId: `debounce:${remote_jid}-${newNow}`
+                    });
+                    return;
+                }
+
+                // O tempo de silêncio de 6s foi respeitado e o humano parou de digitar. Consolidamos as mensagens.
                 const rawMsgs = await redisConnection.lrange(listKey, 0, -1);
                 await redisConnection.del(listKey, timeKey);
 
@@ -153,7 +177,18 @@ const processDebounceInMemory = (messageData) => {
         if (buffer.timer) clearTimeout(buffer.timer);
     }
     const buffer = messageBuffers.get(cacheKey);
-    buffer.timer = setTimeout(async () => {
+    
+    const checkAndExecute = async () => {
+        // --- ANTI-ATROPELAMENTO RAM ---
+        const typingKey = `ai_typing:${company_id}:${remote_jid}`;
+        const typingExpireAt = global.aiTypingMap?.get(typingKey);
+        
+        if (typingExpireAt && Date.now() < typingExpireAt) {
+            console.log(`⏳ [AI DEBOUNCE RAM] Humano digitando (${remote_jid}). Adiando 5s...`);
+            buffer.timer = setTimeout(checkAndExecute, 5000);
+            return;
+        }
+
         const finalMessages = [...buffer.messages];
         messageBuffers.delete(cacheKey);
         const combinedContent = finalMessages.map(m => m.content || m.transcription || "").filter(t => t.length > 0).join("\n");
@@ -166,5 +201,7 @@ const processDebounceInMemory = (messageData) => {
         } catch (e) {
              console.error(`❌ [SENTINEL (RAM)] Erro na fila de ${remote_jid}:`, e.message);
         }
-    }, 6000);
+    };
+
+    buffer.timer = setTimeout(checkAndExecute, 6000);
 };
